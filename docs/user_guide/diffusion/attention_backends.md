@@ -20,6 +20,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
+| `FLASHINFER_SAGE_ATTN_EXPERIMENTAL` | Experimental SM100 backend using FlashInfer's TRT-LLM SageAttention cubin. Supports non-causal, head-dimension-128 attention with native GQA. Unsupported calls fall back to dense `FLASHINFER_ATTN`. |
 
 
 ## Configuration
@@ -273,6 +274,70 @@ DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN_3 python examples/offline_inference/text_t
     --tensor-parallel-size 2 \
     --output outputs/hv15_sage3.mp4
 ```
+
+### Experimental FlashInfer SageAttention on SM100
+
+`FLASHINFER_SAGE_ATTN_EXPERIMENTAL` uses the SageAttention mode of
+FlashInfer's `trtllm_ragged_attention_deepseek` kernel. It quantizes Q and K to
+INT8 and V to FP8 for each attention call; the model checkpoint remains BF16 or
+FP16 and does not need to be quantized.
+
+The tested configuration is:
+
+- NVIDIA B200 (`sm_100`)
+- FlashInfer 0.6.14 with the TRT-LLM ragged SageAttention cubin
+- head dimension 128
+- non-causal attention
+- BF16 or FP16 Q/K/V
+
+The backend retains native GQA and pads physical K/V storage to a multiple of
+16 while preserving the logical sequence length. Causal attention, explicit
+masks, unsupported head dimensions, and other GPU architectures fall back to
+dense `FLASHINFER_ATTN` unless strict mode is enabled.
+
+Select the conservative PyTorch preprocessing path globally:
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASHINFER_SAGE_ATTN_EXPERIMENTAL \
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model <model> --prompt <prompt> --output output.mp4
+```
+
+Enable the faster Triton preprocessing through structured backend options:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model <model> --prompt <prompt> --output output.mp4 \
+    --diffusion-attention-config \
+    '{"default":{"backend":"FLASHINFER_SAGE_ATTN_EXPERIMENTAL","extra":{"preprocess":"triton","workspace_reset":"always"}}}'
+```
+
+Supported backend options are:
+
+| Option | Values | Default | Notes |
+|---|---|---|---|
+| `preprocess` | `torch`, `triton`, `auto` | `torch` | `auto` selects Triton when its module imports successfully. |
+| `workspace_reset` | `always`, `counter`, `once` | `always` | `always` is safest. `once` is experimental and assumes successful launches restore workspace counters. |
+| `strict` | boolean | `false` | Raise instead of falling back for unsupported calls. |
+| `diagnostics` | boolean | `false` | Compare Sage output with the dense fallback and log finite/error metrics. |
+| `require_tested_flashinfer_version` | boolean | `false` | Reject versions outside the backend's tested version set. |
+
+The same controls have environment-variable forms:
+
+```bash
+export VLLM_OMNI_FLASHINFER_SAGE_PREPROCESS=triton
+export VLLM_OMNI_FLASHINFER_SAGE_WORKSPACE_RESET=always
+export VLLM_OMNI_FLASHINFER_SAGE_STRICT=1
+export VLLM_OMNI_FLASHINFER_SAGE_REQUIRE_TESTED_VERSION=1
+```
+
+On a synthetic Cosmos-sized non-causal attention shape
+(`Q=92000`, `KV=92059`, `Hq=32`, `Hkv=8`, `D=128`), Triton preprocessing
+reduced preprocessing from 8.14 ms to 2.68 ms and reduced preprocessing plus
+SageAttention from 96.60 ms to 92.37 ms. A small odd-length GQA test produced
+cosine similarity 0.99919 and MAE 0.0163 against BF16 SDPA. These are
+kernel-level measurements, not guarantees of end-to-end speed or video
+quality; validate the target model, shape, prompt, and seed before deployment.
 
 ### Mixed backends across roles
 
