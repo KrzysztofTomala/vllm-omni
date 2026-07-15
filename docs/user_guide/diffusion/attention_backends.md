@@ -17,6 +17,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `FLASH_ATTN` | Wraps FlashAttention 2. Default on Hopper / Ada / Ampere when `flash-attn` is installed. |
 | `CUDNN_ATTN` | Pins `sdpa_kernel([CUDNN_ATTENTION])`. Default on Blackwell (sm_10x / sm_12x) with cuDNN ≥ 9.5. Wins on mask-heavy DiTs (HunyuanVideo-1.5: 2× e2e vs SDPA). |
 | `FLASHINFER_ATTN` | Calls FlashInfer's dense `single_prefill_with_kv_cache` directly with `custom_mask` for non-causal masked attention. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer`. |
+| `FLASHINFER_SAGE_ATTN_EXPERIMENTAL` | Narrow experimental path for FlashInfer's SM100/SM103 SageAttention cubins. It supports contiguous non-causal FP16/BF16 attention with head dimension 128 and falls back to `FLASHINFER_ATTN` otherwise. |
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
@@ -273,6 +274,26 @@ DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN_3 python examples/offline_inference/text_t
     --tensor-parallel-size 2 \
     --output outputs/hv15_sage3.mp4
 ```
+
+### Experimental FlashInfer SageAttention
+
+The FlashInfer Sage path quantizes activations for each attention call; it does
+not require a quantized checkpoint. It is intentionally opt-in and has no
+backend-specific tuning knobs:
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASHINFER_SAGE_ATTN_EXPERIMENTAL \
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model <model> --prompt <prompt> --output output.mp4
+```
+
+The fast path requires an SM100 or SM103 GPU, FlashInfer's
+`trtllm_ragged_attention_deepseek` Sage cubin, contiguous FP16/BF16 BSHD
+tensors, head dimension 128, and non-causal attention without an explicit
+mask. Unsupported calls use dense `FLASHINFER_ATTN`. Q/K/V are quantized in
+Triton. Reusable per-stream buffers avoid allocations after warmup while the
+Q/K shapes remain stable. For batch sizes above one, K/V length must also be a
+multiple of 16; other batched lengths use the dense fallback.
 
 ### Mixed backends across roles
 
