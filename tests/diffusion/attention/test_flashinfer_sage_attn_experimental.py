@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ pytest.importorskip("flashinfer")
 pytest.importorskip("triton")
 
 import vllm_omni.diffusion.attention.backends.flashinfer_sage_attn_experimental as sage
-from vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_triton import (
+from vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_compile import (
     allocate_sage_buffers,
 )
 from vllm_omni.diffusion.attention.backends.registry import (
@@ -151,6 +152,46 @@ def test_architecture_selects_qk_dtype(capability, expected_dtype):
     assert buffers.kv_indptr.tolist() == [0, 16]
 
 
+def test_compilation_is_not_started_during_construction(monkeypatch: pytest.MonkeyPatch):
+    compiled_module = importlib.import_module(
+        "vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_compile"
+    )
+    compiled_module._get_compiled_preprocessor.cache_clear()
+    calls = 0
+
+    def fake_compile(fn, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    _make_impl(monkeypatch)
+
+    assert calls == 0
+
+
+def test_compiled_callable_is_shared_across_layers(monkeypatch: pytest.MonkeyPatch):
+    compiled_module = importlib.import_module(
+        "vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_compile"
+    )
+    compiled_module._get_compiled_preprocessor.cache_clear()
+    calls = 0
+
+    def fake_compile(fn, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert kwargs == {"fullgraph": True, "dynamic": False, "mode": "default"}
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    first = compiled_module._get_compiled_preprocessor((10, 0), 0, torch.bfloat16)
+    second = compiled_module._get_compiled_preprocessor((10, 0), 0, torch.bfloat16)
+
+    assert first is second
+    assert calls == 1
+    compiled_module._get_compiled_preprocessor.cache_clear()
+
+
 def test_sm103_dispatch_contract(monkeypatch: pytest.MonkeyPatch):
     impl = _make_impl(monkeypatch)
     query = torch.empty(1, 4, 8, 128, dtype=torch.bfloat16)
@@ -174,7 +215,7 @@ def test_sm103_dispatch_contract(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(impl, "_runtime", lambda *_args: (workspace, buffers))
     monkeypatch.setattr(
         sage,
-        "preprocess_sage",
+        "preprocess_sage_compiled",
         lambda *_args: (q, k, v, q_sfs, k_sfs, v_sfs),
     )
 

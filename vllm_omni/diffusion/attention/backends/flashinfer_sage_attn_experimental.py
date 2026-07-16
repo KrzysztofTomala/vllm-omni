@@ -22,10 +22,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.flashinfer_attn import (
     FlashInferAttentionImpl,
 )
-from vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_triton import (
+from vllm_omni.diffusion.attention.backends.flashinfer_sage_preprocess_compile import (
     SageBuffers,
     allocate_sage_buffers,
-    preprocess_sage,
+    preprocess_sage_compiled,
 )
 
 logger = init_logger(__name__)
@@ -153,7 +153,7 @@ class FlashInferSageAttentionExperimentalImpl(AttentionImpl):
         if query.shape[0] > 1 and key.shape[1] % 16:
             return "batched odd K/V lengths are not packed safely"
         if not all(tensor.is_contiguous() for tensor in (query, key, value)):
-            return "Triton preprocessing requires contiguous BSHD tensors"
+            return "Sage preprocessing requires contiguous BSHD tensors"
         if self.causal:
             return "the Sage cubins are non-causal"
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
@@ -190,7 +190,7 @@ class FlashInferSageAttentionExperimentalImpl(AttentionImpl):
         kv_len = key.shape[1]
         physical_kv_len = (kv_len + 15) // 16 * 16
         workspace, buffers = self._runtime(query, key, capability)
-        q, k, v, q_sfs, k_sfs, v_sfs = preprocess_sage(query, key, value, buffers, capability)
+        q, k, v, q_sfs, k_sfs, v_sfs = preprocess_sage_compiled(query, key, value, buffers, capability)
         out = trtllm_ragged_attention_deepseek(
             q,
             k,
