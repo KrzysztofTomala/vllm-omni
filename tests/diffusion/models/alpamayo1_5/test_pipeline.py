@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.alpamayo1_5.pipeline_alpamayo1_5 import (
     _frames_from_observation,
 )
 from vllm_omni.model_executor.models.alpamayo1_5.action import (
+    FourierEncoder,
     UnicycleTrajectoryDecoder,
 )
 from vllm_omni.model_executor.models.alpamayo1_5.pipeline import (
@@ -138,6 +139,18 @@ def test_trajectory_normalization_is_not_loader_managed_state():
     assert decoder.state_dict() == {}
     assert decoder.accel_std == 0.68
     assert decoder.curvature_std == 0.026
+
+
+def test_fourier_frequencies_survive_meta_device_model_construction():
+    with torch.device("meta"):
+        encoder = FourierEncoder(dim=20, max_freq=100.0)
+
+    result = encoder(torch.tensor([[0.0, 0.25, 1.0]]))
+
+    assert encoder.state_dict() == {}
+    assert result.shape == (1, 3, 20)
+    assert torch.isfinite(result).all()
+    assert torch.allclose(result[..., :10].square() + result[..., 10:].square(), torch.full((1, 3, 10), 2.0))
 
 
 def test_pipeline_declares_model_owned_weight_loading():

@@ -52,7 +52,7 @@ class _StopAfterToken(StoppingCriteria):
 
     Transformers returns a generation cache which trails the returned sequence
     by one token. Waiting one extra step ensures the action expert's prefix
-    cache includes ``<|traj_future_start|>``.
+    cache includes ``<|traj_future_start|>``, matching the published model.
     """
 
     def __init__(self, token_id: int) -> None:
@@ -92,7 +92,7 @@ class Alpamayo1_5TorchModel(PreTrainedModel):
         expert_config = copy.deepcopy(config.text_config)
         for key, value in config.expert_cfg.items():
             setattr(expert_config, key, value)
-        expert_config._attn_implementation = "sdpa"
+        expert_config._attn_implementation = config._attn_implementation
         self.expert = AutoModel.from_config(expert_config)
         if hasattr(self.expert, "embed_tokens"):
             del self.expert.embed_tokens
@@ -142,7 +142,11 @@ class Alpamayo1_5TorchModel(PreTrainedModel):
         cache_length = prompt_cache.get_seq_length()
         diffusion_tokens = 64
         positions = torch.arange(diffusion_tokens, device=device)
-        positions = positions.view(1, 1, -1).expand(3, sample_count, -1).clone()
+        # Transformers 5 represents Qwen3-VL positions as text + the three
+        # multimodal RoPE planes. Supplying the older three-plane layout makes
+        # Qwen silently drop text_position_ids in the expert forward pass.
+        rope_planes = 4 if hasattr(self.expert.config, "rope_parameters") else 3
+        positions = positions.view(1, 1, -1).expand(rope_planes, sample_count, -1).clone()
         action_offsets = (rope_deltas + offset[:, None]).repeat_interleave(sample_count, dim=0)
         positions += action_offsets.to(device).view(1, sample_count, 1)
         attention_mask = torch.zeros(
@@ -162,9 +166,7 @@ class Alpamayo1_5TorchModel(PreTrainedModel):
             )
         repeated_offsets = offset.repeat_interleave(sample_count)
         for index, action_offset in enumerate(repeated_offsets.tolist()):
-            attention_mask[index, :, :, action_offset:cache_length] = torch.finfo(
-                attention_mask.dtype
-            ).min
+            attention_mask[index, :, :, action_offset:cache_length] = torch.finfo(attention_mask.dtype).min
 
         generator = None
         if seed is not None:

@@ -24,12 +24,26 @@ class RMSNorm(nn.Module):
 class FourierEncoder(nn.Module):
     def __init__(self, dim: int = 20, max_freq: float = 100.0) -> None:
         super().__init__()
-        frequencies = torch.logspace(0, math.log10(max_freq), steps=dim // 2)
         self.out_dim = dim
-        self.register_buffer("freqs", frequencies[None, :], persistent=False)
+        # Immutable configuration must not be a non-persistent buffer here.
+        # Transformers' low-memory checkpoint loader can materialize such
+        # buffers without their initialized values when the enclosing model is
+        # loaded directly from a sharded checkpoint.
+        self._frequency_count = dim // 2
+        self._max_frequency = max_freq
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        phase = value[..., None] * self.freqs * (2 * torch.pi)
+        frequency_dtype = value.dtype
+        if torch.is_autocast_enabled(value.device.type):
+            frequency_dtype = torch.get_autocast_dtype(value.device.type)
+        frequencies = torch.logspace(
+            0,
+            math.log10(self._max_frequency),
+            steps=self._frequency_count,
+            device=value.device,
+            dtype=torch.float32,
+        ).to(frequency_dtype)
+        phase = value[..., None] * frequencies * (2 * torch.pi)
         return torch.cat((torch.sin(phase), torch.cos(phase)), dim=-1) * math.sqrt(2)
 
 
