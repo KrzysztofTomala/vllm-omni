@@ -6,6 +6,11 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "Alpamayo1_5": (
+        "alpamayo1_5",
+        "alpamayo1_5",
+        "Alpamayo1_5ForConditionalGeneration",
+    ),
     "Alpamayo2Super": (
         "alpamayo2_super",
         "alpamayo2_super",
