@@ -1,0 +1,39 @@
+# Alpamayo 1.5: native Qwen3-VL rollout and action expert on one BF16 GPU.
+
+pipeline: alpamayo1_5
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    # A sample request expands to 3,091 input tokens; 4,096 leaves room for
+    # the configured reasoning rollout without reserving a server-sized cache.
+    max_model_len: 4096
+    gpu_memory_utilization: 0.3
+    # The action trigger runs in the model-runner post-forward hook, leaving
+    # the Qwen3-VL backbone eligible for vLLM compilation and CUDA graphs.
+    enforce_eager: false
+    model_arch: Alpamayo1_5
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.98
+      max_tokens: 128
+      stop_token_ids: [155683]
+      # Enables forwarding request-specific OpenPI observations to the model.
+      extra_args:
+        alpamayo_policy: true
+    hf_overrides:
+      policy_server_config:
+        engine_request_type: ar
+        request_adapter: vllm_omni.model_executor.models.alpamayo1_5.openpi:AlpamayoOpenPIRequestAdapter
+        structured_policy_result: true
+        tokenizer_backbone: nvidia/Cosmos-Reason2-8B
+        needs_session_id: true
+        action_space: ego_trajectory_xyz
+        action_horizon: 64
+        action_dt: 0.1
+        num_trajectory_samples: 6
+        history_waypoints: 16
+        frames_per_camera: 4

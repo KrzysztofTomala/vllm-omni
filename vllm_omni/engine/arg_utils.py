@@ -37,6 +37,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.alpamayo1_5.configuration_alpamayo1_5 import (
+            Alpamayo1_5Config,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
         )
@@ -68,6 +71,7 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("alpamayo1_5", Alpamayo1_5Config),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
@@ -324,6 +328,25 @@ class OmniEngineArgs(EngineArgs):
                             logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
                     except Exception as e:
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
+
+        # Alpamayo stores its tokenizer recipe in config rather than shipping
+        # tokenizer files in the policy checkpoint. Materialize the extended
+        # Cosmos tokenizer before vLLM attempts tokenizer discovery.
+        if not self.tokenizer and self.model_arch == "Alpamayo1_5":
+            from vllm_omni.model_executor.models.alpamayo1_5.tokenizer import (
+                ensure_extended_tokenizer,
+            )
+
+            backbone = "nvidia/Cosmos-Reason2-8B"
+            try:
+                from transformers import PretrainedConfig
+
+                config_dict, _ = PretrainedConfig.get_config_dict(self.model)
+                backbone = config_dict.get("vlm_name_or_path", backbone)
+            except Exception as exc:
+                logger.warning("Could not inspect Alpamayo backbone config: %s", exc)
+            self.tokenizer = ensure_extended_tokenizer(backbone)
+            logger.info("Using extended Alpamayo tokenizer at %s", self.tokenizer)
 
         # Build the vLLM config first, then use it to create the Omni config.
         try:
