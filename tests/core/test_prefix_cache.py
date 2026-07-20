@@ -108,6 +108,17 @@ def test_initialization_with_multimodal():
         assert mm_outputs[mm_key].dtype == cache_tensor.dtype
 
 
+def test_request_level_higher_rank_output_is_not_cached():
+    """A trajectory emitted during one-token decode is request-level data."""
+    cache = get_omni_pcache()
+    trajectory = torch.rand((1, 64, 3), dtype=DTYPE)
+
+    cache.maybe_init_missing_mm_cache_keys({"actions": trajectory}, seq_len=1)
+
+    assert "actions" not in cache.mm_cache_keys
+    assert "actions" not in cache.mm_outputs_cache
+
+
 def test_init_missing_mm_cache_keys_is_idempotent():
     """Ensure that the cache doesn't reinitialize old keys."""
     cache = get_omni_pcache()
