@@ -1,0 +1,26 @@
+# Alpamayo 1.5: model-owned Qwen3-VL rollout and action expert on one BF16 GPU.
+
+pipeline: alpamayo1_5
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Alpamayo1_5Pipeline
+    model_config:
+      attn_implementation: sdpa
+      temperature: 0.6
+      top_p: 0.98
+      max_tokens: 128
+      num_trajectory_samples: 6
+      diffusion_steps: 10
+      policy_server_config:
+        needs_session_id: true
+        action_space: ego_trajectory_xyz
+        action_horizon: 64
+        action_dt: 0.1
+        history_waypoints: 16
+        frames_per_camera: 4

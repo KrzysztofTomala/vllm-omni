@@ -161,6 +161,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "Alpamayo1_5Pipeline": (
+        "alpamayo1_5",
+        "pipeline_alpamayo1_5",
+        "Alpamayo1_5Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
