@@ -29,6 +29,11 @@ and container identifier when available. Compare warmed runs using identical
 image-cache semantics; the first request includes one-time processor and kernel
 initialization and is not representative of steady-state latency.
 
+On the `alpamayo-1.5-nim-fast` branch, add `--compile-actions
+--profile-actions` to compile the action expert and record its KV extraction,
+sampler setup, expert integration, and trajectory-decoder times. Compilation is
+expensive on the first request; compare warmed requests only.
+
 Online policy serving uses the OpenPI-compatible websocket endpoint:
 
 ```bash

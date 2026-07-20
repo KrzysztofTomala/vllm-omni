@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
         help="Change one pixel per run to measure live-frame cache misses.",
     )
     parser.add_argument("--profile-input", action="store_true")
+    parser.add_argument("--profile-actions", action="store_true")
+    parser.add_argument("--compile-actions", action="store_true")
     parser.add_argument(
         "--image-input",
         choices=("pil", "cpu-tensor", "jpeg-cpu-tensor"),
@@ -140,6 +142,8 @@ def main() -> None:
             "num_traj_samples": 1,
             "diffusion_steps": 10,
             "action_temperature": 1.0,
+            "_profile_timings": args.profile_actions,
+            "_compile_expert": args.compile_actions,
         },
     )
 
@@ -244,6 +248,11 @@ def main() -> None:
                     "process_inputs_s": processor_times[-1],
                     "reasoning_text": candidate.text,
                     "actions": float_array(multimodal["actions"]).tolist(),
+                    "action_profile_ms": (
+                        float_array(multimodal["profile_timings_ms"]).tolist()
+                        if "profile_timings_ms" in multimodal
+                        else None
+                    ),
                 }
             )
             print(
