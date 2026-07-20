@@ -110,6 +110,7 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.action_out_proj = nn.Linear(expert_config.hidden_size, 2)
         self.trajectory_decoder = UnicycleTrajectoryDecoder(self.alpamayo_config.action_space_cfg)
         self.expert_config = expert_config
+        self._compiled_expert: nn.Module | None = None
         self._force_future_end = False
 
     @property
@@ -208,6 +209,10 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         observation: Mapping[str, Any],
         extra_args: Mapping[str, Any],
     ) -> dict[str, torch.Tensor]:
+        profile = bool(extra_args.get("_profile_timings", False))
+        timing_events = [torch.cuda.Event(enable_timing=True) for _ in range(5)] if profile else []
+        if profile:
+            timing_events[0].record()
         history = get_observation_history(observation).to(device=caches[0].device, dtype=torch.float32)
         history_rotation = _observation_rotation(observation, history).to(device=history.device, dtype=torch.float32)
         sample_count = int(extra_args.get("num_traj_samples", 6))
@@ -215,6 +220,8 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         temperature = float(extra_args.get("action_temperature", 1.0))
         prefix = self._repeat_cache(self._gather_prefix_cache(caches, block_table, seq_len), sample_count)
         prefix_len = prefix.get_seq_length()
+        if profile:
+            timing_events[1].record()
         generator = None
         sampling_seed = extra_args.get("_sampling_seed")
         if sampling_seed is not None:
@@ -247,12 +254,24 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             device=history.device,
             dtype=self.action_out_proj.weight.dtype,
         )
+        if profile:
+            timing_events[2].record()
+        expert = self.expert
+        if bool(extra_args.get("_compile_expert", False)):
+            if self._compiled_expert is None:
+                self._compiled_expert = torch.compile(
+                    self.expert,
+                    fullgraph=False,
+                    dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+            expert = self._compiled_expert
         for step in range(inference_steps):
             timestep = action.new_full((sample_count, 1, 1), step / inference_steps)
             with torch.autocast(device_type="cuda", dtype=self.action_out_proj.weight.dtype):
                 embeddings = self.action_in_proj(action, timestep)
             embeddings = embeddings.to(dtype=self.action_out_proj.weight.dtype)
-            output = self.expert(
+            output = expert(
                 inputs_embeds=embeddings,
                 position_ids=expert_positions,
                 past_key_values=prefix,
@@ -263,14 +282,27 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             prefix.crop(prefix_len)
             velocity = self.action_out_proj(output.last_hidden_state[:, -64:])
             action = action + velocity / inference_steps
+        if profile:
+            timing_events[3].record()
         repeated_history = history.unsqueeze(0).expand(sample_count, -1, -1)
         repeated_rotation = history_rotation.unsqueeze(0).expand(sample_count, -1, -1, -1)
         xyz, rotation = self.trajectory_decoder(action, repeated_history, repeated_rotation)
-        return {
+        if profile:
+            timing_events[4].record()
+            timing_events[4].synchronize()
+        result = {
             "actions": xyz,
             "rotations": rotation,
             "normalized_controls": action,
         }
+        if profile:
+            # KV extraction, sampler setup, expert integration, trajectory decode.
+            result["profile_timings_ms"] = torch.tensor(
+                [timing_events[index].elapsed_time(timing_events[index + 1]) for index in range(4)],
+                device=history.device,
+                dtype=torch.float32,
+            )
+        return result
 
     def forward(
         self,
