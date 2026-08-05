@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.model_executor.models.alpamayo1_5.pipeline import ALPAMAYO1_5_PIPELINE
+from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -96,6 +97,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "alpamayo1_5": ALPAMAYO1_5_PIPELINE,
+    "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
