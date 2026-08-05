@@ -40,9 +40,7 @@ class AlpamayoOpenPIRequestAdapter:
 
     def __init__(self, policy_config: dict[str, Any]) -> None:
         self.policy_config = policy_config
-        tokenizer_path = ensure_extended_tokenizer(
-            policy_config.get("tokenizer_backbone", "nvidia/Cosmos-Reason2-8B")
-        )
+        tokenizer_path = ensure_extended_tokenizer(policy_config.get("tokenizer_backbone", "nvidia/Cosmos-Reason2-8B"))
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     def build_request(
@@ -97,6 +95,11 @@ class AlpamayoOpenPIRequestAdapter:
             "num_traj_samples": int(self.policy_config.get("num_trajectory_samples", 6)),
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
             "action_temperature": float(self.policy_config.get("action_temperature", 1.0)),
+            "_sampling_seed": int(self.policy_config.get("seed", 42)),
+            "_nim_action_rng_compat": bool(self.policy_config.get("nim_action_rng_compat", True)),
+            "_compile_expert": bool(self.policy_config.get("compile_actions", False)),
+            "_manual_action_cudagraph": bool(self.policy_config.get("manual_action_cudagraph", False)),
+            "_static_expert_cache_max_len": int(self.policy_config.get("static_expert_cache_max_len", 3328)),
         }
         sampling_params = SamplingParams(
             temperature=float(self.policy_config.get("temperature", 0.6)),
@@ -111,9 +114,7 @@ class AlpamayoOpenPIRequestAdapter:
                 "multi_modal_data": {"image": images},
                 # Live frames must miss the multimodal cache. Explicit IDs
                 # avoid hashing the decoded RGB tensors to prove uniqueness.
-                "multi_modal_uuids": {
-                    "image": [f"{request_id}:image:{index}" for index in range(len(images))]
-                },
+                "multi_modal_uuids": {"image": [f"{request_id}:image:{index}" for index in range(len(images))]},
                 "mm_processor_kwargs": {"device": "cuda"},
             },
             sampling_params=sampling_params,

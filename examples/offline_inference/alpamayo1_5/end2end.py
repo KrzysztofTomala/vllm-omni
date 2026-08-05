@@ -66,7 +66,12 @@ def main() -> None:
             "ego_history_xyz": data["ego_history_xyz"].tolist(),
             "ego_history_rot": data["ego_history_rot"].tolist(),
         }
-        extra_args.update(num_traj_samples=6, diffusion_steps=10)
+        extra_args.update(
+            num_traj_samples=6,
+            diffusion_steps=10,
+            _sampling_seed=args.seed,
+            _nim_action_rng_compat=True,
+        )
         prompt_ids = fuse_history_tokens(
             torch.tensor(tokenizer.encode(prompt)), torch.as_tensor(data["ego_history_xyz"])
         ).tolist()

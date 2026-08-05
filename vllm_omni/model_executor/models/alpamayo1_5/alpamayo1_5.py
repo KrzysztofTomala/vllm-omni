@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoModel, DynamicCache
+from transformers import AutoModel, DynamicCache, StaticCache
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_vl import (
@@ -111,6 +111,8 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.trajectory_decoder = UnicycleTrajectoryDecoder(self.alpamayo_config.action_space_cfg)
         self.expert_config = expert_config
         self._compiled_expert: nn.Module | None = None
+        self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._policy_prompt_lengths: dict[str, int] = {}
         self._force_future_end = False
 
     @property
@@ -199,6 +201,210 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
         return repeated
 
+    def _make_static_action_cache(
+        self,
+        cache: DynamicCache,
+        suffix_length: int,
+        max_cache_len: int | None = None,
+    ) -> StaticCache:
+        prefix_length = cache.get_seq_length()
+        minimum_length = prefix_length + suffix_length
+        if max_cache_len is None:
+            max_cache_len = minimum_length
+        if max_cache_len < minimum_length:
+            raise ValueError(
+                f"static action cache is too short: need at least {minimum_length} tokens, got {max_cache_len}"
+            )
+        static_cache = StaticCache(
+            config=self.expert_config,
+            max_cache_len=max_cache_len,
+        )
+        cache_position = torch.arange(
+            prefix_length,
+            device=cache.layers[0].keys.device,
+            dtype=torch.long,
+        )
+        for layer_index, layer in enumerate(cache.layers):
+            static_cache.update(
+                layer.keys,
+                layer.values,
+                layer_index,
+                cache_kwargs={"cache_position": cache_position},
+            )
+        return static_cache
+
+    @staticmethod
+    def _copy_action_prefix(dst: StaticCache, src: DynamicCache, prefix_length: int) -> None:
+        for dst_layer, src_layer in zip(dst.layers, src.layers, strict=True):
+            dst_layer.keys[:, :, :prefix_length].copy_(src_layer.keys)
+            dst_layer.values[:, :, :prefix_length].copy_(src_layer.values)
+            dst_layer.cumulative_length.fill_(prefix_length)
+
+    @staticmethod
+    def _rewind_static_action_cache(
+        cache: StaticCache,
+        prefix_length: int | torch.Tensor,
+    ) -> None:
+        # Every expert call overwrites the full 64-token suffix. Only the write
+        # cursor needs resetting between flow steps.
+        for layer in cache.layers:
+            if isinstance(prefix_length, torch.Tensor):
+                layer.cumulative_length.copy_(prefix_length)
+            else:
+                layer.cumulative_length.fill_(prefix_length)
+
+    @staticmethod
+    def _make_action_attention_mask(
+        *,
+        sample_count: int,
+        prefix_length: int,
+        suffix_length: int,
+        max_cache_len: int | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        minimum_length = prefix_length + suffix_length
+        mask_length = max_cache_len or minimum_length
+        if mask_length < minimum_length:
+            raise ValueError(
+                f"static action cache is too short: need at least {minimum_length} tokens, got {mask_length}"
+            )
+        attention_mask = torch.full(
+            (sample_count, 1, suffix_length, mask_length),
+            torch.finfo(dtype).min,
+            device=device,
+            dtype=dtype,
+        )
+        attention_mask[..., :minimum_length] = 0
+        return attention_mask
+
+    @staticmethod
+    def _make_action_noise(
+        *,
+        sample_count: int,
+        device: torch.device,
+        generator: torch.Generator | None,
+        nim_rng_advance_steps: int = 0,
+    ) -> torch.Tensor:
+        """Draw initial action noise after NIM-compatible RNG advancement."""
+
+        if nim_rng_advance_steps < 0:
+            raise ValueError("nim_rng_advance_steps must be non-negative")
+        if nim_rng_advance_steps:
+            probs = torch.ones((sample_count, 1), device=device)
+            for _ in range(nim_rng_advance_steps):
+                torch.multinomial(probs, num_samples=1, generator=generator)
+        return torch.randn(
+            sample_count,
+            64,
+            2,
+            device=device,
+            # The reference flow sampler keeps the integration state in FP32
+            # even when the model weights and expert run in BF16.
+            dtype=torch.float32,
+            generator=generator,
+        )
+
+    def _run_manual_action_graph(
+        self,
+        *,
+        expert: nn.Module,
+        prefix: DynamicCache,
+        action: torch.Tensor,
+        expert_positions: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_steps: int,
+        static_cache_max_len: int | None,
+    ) -> torch.Tensor:
+        """Replay the fixed-shape action integration through one CUDA graph."""
+
+        prefix_length = prefix.get_seq_length()
+        key = (
+            tuple(action.shape),
+            action.dtype,
+            action.device,
+            tuple(expert_positions.shape),
+            tuple(attention_mask.shape),
+            inference_steps,
+        )
+        state = self._action_graphs.get(key)
+        if state is None:
+            static_cache = self._make_static_action_cache(
+                prefix,
+                suffix_length=64,
+                max_cache_len=static_cache_max_len,
+            )
+            state = {
+                "cache": static_cache,
+                "action": action.clone(),
+                "positions": expert_positions.clone(),
+                "attention_mask": attention_mask.clone(),
+                "cache_position": torch.arange(
+                    prefix_length,
+                    prefix_length + 64,
+                    device=action.device,
+                    dtype=torch.long,
+                ),
+            }
+
+            def graph_body() -> torch.Tensor:
+                graph_action = state["action"]
+                for step in range(inference_steps):
+                    timestep = graph_action.new_full((graph_action.shape[0], 1, 1), step / inference_steps)
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=self.action_out_proj.weight.dtype,
+                    ):
+                        embeddings = self.action_in_proj(graph_action, timestep)
+                    output = expert(
+                        inputs_embeds=embeddings.to(self.action_out_proj.weight.dtype),
+                        position_ids=state["positions"],
+                        past_key_values=static_cache,
+                        attention_mask=state["attention_mask"],
+                        cache_position=state["cache_position"],
+                        use_cache=True,
+                        is_causal=not bool(self.alpamayo_config.expert_non_causal_attention),
+                    )
+                    self._rewind_static_action_cache(
+                        static_cache,
+                        state["cache_position"][0],
+                    )
+                    velocity = self.action_out_proj(output.last_hidden_state[:, -64:])
+                    graph_action = graph_action + velocity / inference_steps
+                return graph_action
+
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    graph_body()
+                    self._rewind_static_action_cache(
+                        static_cache,
+                        state["cache_position"][0],
+                    )
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = graph_body()
+            state["graph"] = graph
+            state["output"] = graph_output
+            self._action_graphs[key] = state
+
+        state["action"].copy_(action)
+        state["positions"].copy_(expert_positions)
+        state["attention_mask"].copy_(attention_mask)
+        state["cache_position"].copy_(
+            torch.arange(
+                prefix_length,
+                prefix_length + 64,
+                device=action.device,
+                dtype=torch.long,
+            )
+        )
+        self._copy_action_prefix(state["cache"], prefix, prefix_length)
+        state["graph"].replay()
+        return state["output"].clone()
+
     def _sample_actions(
         self,
         *,
@@ -220,6 +426,9 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         temperature = float(extra_args.get("action_temperature", 1.0))
         prefix = self._repeat_cache(self._gather_prefix_cache(caches, block_table, seq_len), sample_count)
         prefix_len = prefix.get_seq_length()
+        static_cache_max_len_value = extra_args.get("_static_expert_cache_max_len")
+        static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
+        manual_action_cudagraph = bool(extra_args.get("_manual_action_cudagraph", False))
         if profile:
             timing_events[1].record()
         generator = None
@@ -227,30 +436,38 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if sampling_seed is not None:
             generator = torch.Generator(device=history.device)
             generator.manual_seed(int(sampling_seed))
-        action = (
-            torch.randn(
-                sample_count,
-                64,
-                2,
-                device=history.device,
-                # The reference flow sampler keeps the integration state in
-                # FP32 even when the model weights and expert run in BF16.
-                dtype=torch.float32,
-                generator=generator,
-            )
-            * temperature
+        nim_rng_advance_steps = 0
+        if generator is not None and bool(extra_args.get("_nim_action_rng_compat", False)):
+            prompt_token_count = int(extra_args["_prompt_token_count"])
+            generated_token_count = seq_len - prompt_token_count
+            if generated_token_count <= 0:
+                raise ValueError(
+                    "Alpamayo NIM RNG compatibility requires sequence_length > "
+                    f"_prompt_token_count, got {seq_len} <= {prompt_token_count}"
+                )
+            # NIM's TRT-LLM top-k=1 rollout does not consume Torch RNG. It
+            # mirrors the OSS HF do_sample=True path by consuming one draw per
+            # generated token, plus the assistant generation-prompt token.
+            nim_rng_advance_steps = generated_token_count + 1
+        action = self._make_action_noise(
+            sample_count=sample_count,
+            device=history.device,
+            generator=generator,
+            nim_rng_advance_steps=nim_rng_advance_steps,
         )
+        initial_action_noise = action.clone() if bool(extra_args.get("_return_action_noise", False)) else None
+        action = action * temperature
         if positions.ndim == 2 and positions.shape[0] == 3:
             last_position = positions[:, -1:].to(history.device)
         else:
             last_position = positions.reshape(-1)[-1:].repeat(3, 1).to(history.device)
         expert_positions = last_position[:, None, :] + 1 + torch.arange(64, device=history.device)[None, None, :]
         expert_positions = expert_positions.expand(3, sample_count, 64)
-        attention_mask = torch.zeros(
-            sample_count,
-            1,
-            64,
-            prefix_len + 64,
+        attention_mask = self._make_action_attention_mask(
+            sample_count=sample_count,
+            prefix_length=prefix_len,
+            suffix_length=64,
+            max_cache_len=(static_cache_max_len if manual_action_cudagraph else None),
             device=history.device,
             dtype=self.action_out_proj.weight.dtype,
         )
@@ -266,22 +483,33 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     options={"triton.cudagraphs": False},
                 )
             expert = self._compiled_expert
-        for step in range(inference_steps):
-            timestep = action.new_full((sample_count, 1, 1), step / inference_steps)
-            with torch.autocast(device_type="cuda", dtype=self.action_out_proj.weight.dtype):
-                embeddings = self.action_in_proj(action, timestep)
-            embeddings = embeddings.to(dtype=self.action_out_proj.weight.dtype)
-            output = expert(
-                inputs_embeds=embeddings,
-                position_ids=expert_positions,
-                past_key_values=prefix,
+        if manual_action_cudagraph:
+            action = self._run_manual_action_graph(
+                expert=expert,
+                prefix=prefix,
+                action=action,
+                expert_positions=expert_positions,
                 attention_mask=attention_mask,
-                use_cache=True,
-                is_causal=not bool(self.alpamayo_config.expert_non_causal_attention),
+                inference_steps=inference_steps,
+                static_cache_max_len=static_cache_max_len,
             )
-            prefix.crop(prefix_len)
-            velocity = self.action_out_proj(output.last_hidden_state[:, -64:])
-            action = action + velocity / inference_steps
+        else:
+            for step in range(inference_steps):
+                timestep = action.new_full((sample_count, 1, 1), step / inference_steps)
+                with torch.autocast(device_type="cuda", dtype=self.action_out_proj.weight.dtype):
+                    embeddings = self.action_in_proj(action, timestep)
+                embeddings = embeddings.to(dtype=self.action_out_proj.weight.dtype)
+                output = expert(
+                    inputs_embeds=embeddings,
+                    position_ids=expert_positions,
+                    past_key_values=prefix,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    is_causal=not bool(self.alpamayo_config.expert_non_causal_attention),
+                )
+                prefix.crop(prefix_len)
+                velocity = self.action_out_proj(output.last_hidden_state[:, -64:])
+                action = action + velocity / inference_steps
         if profile:
             timing_events[3].record()
         repeated_history = history.unsqueeze(0).expand(sample_count, -1, -1)
@@ -295,6 +523,13 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "rotations": rotation,
             "normalized_controls": action,
         }
+        if initial_action_noise is not None:
+            result["action_noise"] = initial_action_noise
+            result["action_rng_advance_steps"] = torch.tensor(
+                [nim_rng_advance_steps],
+                device=history.device,
+                dtype=torch.int32,
+            )
         if profile:
             # KV extraction, sampler setup, expert integration, trajectory decode.
             result["profile_timings_ms"] = torch.tensor(
@@ -340,8 +575,8 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         observation = self._policy_observation(sampling_extra_args)
-        trigger = observation is not None and input_ids is not None and bool(
-            torch.any(input_ids == self.future_start_id)
+        trigger = (
+            observation is not None and input_ids is not None and bool(torch.any(input_ids == self.future_start_id))
         )
         multimodal_outputs: dict[str, torch.Tensor] = {}
         if trigger:
@@ -350,6 +585,15 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if len(runner_kv_cache_context.request_ids) != 1:
                 raise RuntimeError("Alpamayo action generation currently supports one request")
             extra = sampling_extra_args[0] if isinstance(sampling_extra_args, list) else {}
+            request_id = runner_kv_cache_context.request_ids[0]
+            if bool(extra.get("_nim_action_rng_compat", False)):
+                prompt_token_count = self._policy_prompt_lengths.pop(request_id, None)
+                if prompt_token_count is None:
+                    raise RuntimeError(
+                        "Alpamayo NIM RNG compatibility could not recover the expanded policy prompt length"
+                    )
+                extra = dict(extra)
+                extra["_prompt_token_count"] = prompt_token_count
             multimodal_outputs = self._sample_actions(
                 caches=runner_kv_cache_context.caches,
                 block_table=runner_kv_cache_context.block_table[0],
@@ -359,6 +603,21 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 extra_args=extra,
             )
             self._force_future_end = True
+        elif (
+            observation is not None
+            and input_ids is not None
+            and input_ids.numel() > 1
+            and runner_kv_cache_context is not None
+            and len(runner_kv_cache_context.request_ids) == 1
+            and isinstance(sampling_extra_args, list)
+            and bool(sampling_extra_args[0].get("_nim_action_rng_compat", False))
+        ):
+            # Capture the real KV-prefix length after multimodal placeholder
+            # expansion. Client-side prompt IDs are much shorter and cannot be
+            # used to infer how many autoregressive sampling steps occurred.
+            self._policy_prompt_lengths[runner_kv_cache_context.request_ids[0]] = (
+                runner_kv_cache_context.sequence_lengths[0]
+            )
         text_hidden_states = hidden_states[0] if isinstance(hidden_states, (list, tuple)) else hidden_states
         return OmniOutput(text_hidden_states=text_hidden_states, multimodal_outputs=multimodal_outputs)
 

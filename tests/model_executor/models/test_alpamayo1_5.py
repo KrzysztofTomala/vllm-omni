@@ -74,9 +74,7 @@ def test_processing_info_uses_vllm_processor_cache(monkeypatch):
         (
             "backbone",
             {
-                "processor_cls": pytest.importorskip(
-                    "vllm.model_executor.models.qwen3_vl"
-                ).Qwen3VLProcessor,
+                "processor_cls": pytest.importorskip("vllm.model_executor.models.qwen3_vl").Qwen3VLProcessor,
                 "tokenizer": tokenizer,
                 "min_pixels": 123,
                 "max_pixels": 456,
@@ -145,12 +143,101 @@ def test_gather_prefix_cache_preserves_block_order():
     assert gathered.layers[0].values.flatten().tolist() == [102.0, 103.0, 100.0]
 
 
+def test_static_action_cache_refreshes_prefix_and_rewinds_cursor():
+    source_layer = SimpleNamespace(
+        keys=torch.tensor([[[[1.0], [2.0]]]]),
+        values=torch.tensor([[[[101.0], [102.0]]]]),
+    )
+    target_layer = SimpleNamespace(
+        keys=torch.zeros(1, 1, 4, 1),
+        values=torch.zeros(1, 1, 4, 1),
+        cumulative_length=torch.tensor(4),
+    )
+    source = SimpleNamespace(layers=[source_layer])
+    target = SimpleNamespace(layers=[target_layer])
+
+    Alpamayo1_5ForConditionalGeneration._copy_action_prefix(target, source, 2)
+
+    assert target_layer.keys.flatten().tolist() == [1.0, 2.0, 0.0, 0.0]
+    assert target_layer.values.flatten().tolist() == [101.0, 102.0, 0.0, 0.0]
+    assert target_layer.cumulative_length.item() == 2
+
+    target_layer.cumulative_length.fill_(4)
+    Alpamayo1_5ForConditionalGeneration._rewind_static_action_cache(target, 2)
+    assert target_layer.cumulative_length.item() == 2
+
+    target_layer.cumulative_length.fill_(4)
+    Alpamayo1_5ForConditionalGeneration._rewind_static_action_cache(
+        target,
+        torch.tensor(1),
+    )
+    assert target_layer.cumulative_length.item() == 1
+
+
+def test_fixed_action_attention_mask_hides_unused_static_cache():
+    mask = Alpamayo1_5ForConditionalGeneration._make_action_attention_mask(
+        sample_count=1,
+        prefix_length=3,
+        suffix_length=2,
+        max_cache_len=8,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    assert mask.shape == (1, 1, 2, 8)
+    assert torch.equal(mask[..., :5], torch.zeros(1, 1, 2, 5, dtype=torch.bfloat16))
+    assert torch.all(mask[..., 5:] == torch.finfo(torch.bfloat16).min)
+
+
+def test_fixed_action_attention_mask_rejects_short_cache():
+    with pytest.raises(ValueError, match="need at least 5 tokens"):
+        Alpamayo1_5ForConditionalGeneration._make_action_attention_mask(
+            sample_count=1,
+            prefix_length=3,
+            suffix_length=2,
+            max_cache_len=4,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
+
+
+def test_action_noise_advances_rng_like_nim():
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(42)
+    actual = Alpamayo1_5ForConditionalGeneration._make_action_noise(
+        sample_count=1,
+        device=torch.device("cpu"),
+        generator=generator,
+        nim_rng_advance_steps=7,
+    )
+
+    reference_generator = torch.Generator(device="cpu")
+    reference_generator.manual_seed(42)
+    probs = torch.ones((1, 1))
+    for _ in range(7):
+        torch.multinomial(probs, num_samples=1, generator=reference_generator)
+    expected = torch.randn((1, 64, 2), generator=reference_generator)
+
+    assert torch.equal(actual, expected)
+
+
+def test_action_noise_rejects_negative_rng_advance():
+    with pytest.raises(ValueError, match="must be non-negative"):
+        Alpamayo1_5ForConditionalGeneration._make_action_noise(
+            sample_count=1,
+            device=torch.device("cpu"),
+            generator=None,
+            nim_rng_advance_steps=-1,
+        )
+
+
 def _minimal_policy_model() -> Alpamayo1_5ForConditionalGeneration:
     model = object.__new__(Alpamayo1_5ForConditionalGeneration)
     nn.Module.__init__(model)
     model.alpamayo_config = SimpleNamespace(
         traj_token_ids={"future_start": 155681, "future_end": 155683},
     )
+    model._policy_prompt_lengths = {}
     model._force_future_end = False
     return model
 
@@ -198,3 +285,50 @@ def test_action_trigger_requires_runner_kv_context(monkeypatch):
     assert output.multimodal_outputs is not None
     assert output.multimodal_outputs["actions"].shape == (1, 64, 3)
     assert model._force_future_end is True
+
+
+def test_nim_rng_compat_uses_expanded_prefill_length(monkeypatch):
+    model = _minimal_policy_model()
+    sample_kwargs = {}
+
+    def fake_sample_actions(**kwargs):
+        sample_kwargs.update(kwargs)
+        return {"actions": torch.zeros(1, 64, 3)}
+
+    monkeypatch.setattr(model, "_sample_actions", fake_sample_actions)
+    common = {
+        "hidden_states": torch.zeros(1, 8),
+        "positions": torch.zeros(3, 1, dtype=torch.long),
+        "sampling_extra_args": [
+            {
+                "robot_obs": {"ego_history_xyz": []},
+                "_nim_action_rng_compat": True,
+            }
+        ],
+    }
+    prefill_context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        sequence_lengths=(3091,),
+        request_ids=("request-0",),
+    )
+    model.make_omni_output(
+        **common,
+        input_ids=torch.arange(3091),
+        runner_kv_cache_context=prefill_context,
+    )
+
+    decode_context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        sequence_lengths=(3111,),
+        request_ids=("request-0",),
+    )
+    model.make_omni_output(
+        **common,
+        input_ids=torch.tensor([155681]),
+        runner_kv_cache_context=decode_context,
+    )
+
+    assert sample_kwargs["extra_args"]["_prompt_token_count"] == 3091
+    assert "request-0" not in model._policy_prompt_lengths
