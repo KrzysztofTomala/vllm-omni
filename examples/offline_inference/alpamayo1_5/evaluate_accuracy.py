@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile-actions", action="store_true")
     parser.add_argument("--manual-action-cudagraph", action="store_true")
+    parser.add_argument("--profile-actions", action="store_true")
+    parser.add_argument("--processor-device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--static-expert-cache-max-len", type=int, default=3328)
     return parser.parse_args()
 
@@ -65,6 +67,12 @@ def image_paths(scene_dir: Path) -> list[Path]:
 def trajectory_errors(actions: np.ndarray, ground_truth: np.ndarray) -> tuple[float, float]:
     displacement = np.linalg.norm(actions[:, :HORIZON, :2] - ground_truth[None, :HORIZON, :2], axis=-1)
     return float(displacement.mean(axis=1).min()), float(displacement[:, -1].min())
+
+
+def as_numpy(value: object) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().float().cpu().numpy()
+    return np.asarray(value, dtype=np.float32)
 
 
 def decode_scene(scene_dir: Path, pool: ThreadPoolExecutor) -> tuple[list[torch.Tensor], list[Path]]:
@@ -98,10 +106,25 @@ def main() -> None:
             "latency_s",
             "preparation_s",
             "end_to_end_s",
+            "process_inputs_s",
+            "output_tokens",
+            "action_profile_ms",
         ),
     )
     csv_writer.writeheader()
     csv_output.flush()
+    processor_times: list[float] = []
+    input_processor = omni.engine.input_processor
+    assert input_processor is not None
+    original_process_inputs = input_processor.process_inputs
+
+    def timed_process_inputs(*process_args: object, **process_kwargs: object) -> object:
+        started = time.perf_counter()
+        result = original_process_inputs(*process_args, **process_kwargs)
+        processor_times.append(time.perf_counter() - started)
+        return result
+
+    input_processor.process_inputs = timed_process_inputs  # type: ignore[method-assign]
     pool = ThreadPoolExecutor(max_workers=16)
     try:
         for index, scene_dir in enumerate(scenes, 1):
@@ -124,7 +147,7 @@ def main() -> None:
             prompt_input = {
                 "prompt_token_ids": prompt_ids,
                 "multi_modal_data": {"image": images},
-                "mm_processor_kwargs": {"device": "cpu"},
+                "mm_processor_kwargs": {"device": args.processor_device},
                 "multi_modal_uuids": {"image": [f"alpamayo-eval:{scene_dir.name}:{path.stem}" for path in paths]},
             }
             sampling = SamplingParams(
@@ -144,6 +167,7 @@ def main() -> None:
                     "action_temperature": 1.0,
                     "_sampling_seed": args.seed,
                     "_nim_action_rng_compat": True,
+                    "_profile_timings": args.profile_actions,
                     "_compile_expert": args.compile_actions,
                     "_manual_action_cudagraph": args.manual_action_cudagraph,
                     "_static_expert_cache_max_len": args.static_expert_cache_max_len,
@@ -155,7 +179,20 @@ def main() -> None:
             inference_s = time.perf_counter() - inference_started
             if not outputs:
                 raise RuntimeError(f"{scene_dir.name}: request produced no output")
-            actions = np.asarray((outputs[0].multimodal_output or {})["actions"], dtype=np.float32)
+            output = getattr(outputs[0], "request_output", outputs[0])
+            candidate = output.outputs[0]
+            multimodal = getattr(output, "multimodal_output", None)
+            if multimodal is None:
+                multimodal = getattr(candidate, "multimodal_output", None)
+            if multimodal is None:
+                multimodal = outputs[0].multimodal_output
+            actions = as_numpy(multimodal["actions"])
+            output_tokens = len(getattr(candidate, "token_ids", ()) or ())
+            action_profile = (
+                as_numpy(multimodal["profile_timings_ms"]).tolist()
+                if "profile_timings_ms" in multimodal
+                else None
+            )
             ground_truth = np.asarray(
                 json.loads((scene_dir / "gt_trajectory.json").read_text(encoding="utf-8"))["ego_future_xyz"],
                 dtype=np.float32,
@@ -168,6 +205,9 @@ def main() -> None:
                 "latency_s": inference_s,
                 "preparation_s": preparation_s,
                 "end_to_end_s": time.perf_counter() - request_started,
+                "process_inputs_s": processor_times[-1],
+                "output_tokens": output_tokens,
+                "action_profile_ms": action_profile,
             }
             rows.append(row)
             csv_writer.writerow(row)
@@ -182,14 +222,21 @@ def main() -> None:
         csv_output.close()
         omni.close()
 
+    warm_rows = rows[1:] if len(rows) > 1 else rows
     summary = {
         "mean_minade_6s": float(np.mean([row["min_ade_6s"] for row in rows])),
         "mean_minfde_6s": float(np.mean([row["min_fde_6s"] for row in rows])),
         "success_rate": 1.0,
         "mean_latency_s": float(np.mean([row["latency_s"] for row in rows])),
+        "mean_warm_latency_s": float(np.mean([row["latency_s"] for row in warm_rows])),
         "mean_preparation_s": float(np.mean([row["preparation_s"] for row in rows])),
         "mean_end_to_end_s": float(np.mean([row["end_to_end_s"] for row in rows])),
+        "mean_warm_process_inputs_s": float(np.mean([row["process_inputs_s"] for row in warm_rows])),
+        "mean_warm_output_tokens": float(np.mean([row["output_tokens"] for row in warm_rows])),
     }
+    profiles = [row["action_profile_ms"] for row in warm_rows if row["action_profile_ms"] is not None]
+    if profiles:
+        summary["mean_warm_action_profile_ms"] = as_numpy(profiles).mean(axis=0).tolist()
     try:
         gpu_details = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"], text=True
@@ -210,6 +257,8 @@ def main() -> None:
             "compile_expert": args.compile_actions,
             "manual_action_cudagraph": args.manual_action_cudagraph,
             "static_expert_cache_max_len": args.static_expert_cache_max_len,
+            "processor_device": args.processor_device,
+            "profile_actions": args.profile_actions,
         },
         "environment": {
             "startup_s": startup_s,
