@@ -27,6 +27,8 @@ def test_alpamayo_openpi_adapter_builds_ar_request_with_unique_image_ids():
     adapter.policy_config = {
         "num_trajectory_samples": 1,
         "diffusion_steps": 10,
+        "compile_actions": True,
+        "manual_action_cudagraph": True,
     }
     adapter.tokenizer = _FakeTokenizer()
     history = np.zeros((16, 3), dtype=np.float32)
@@ -46,10 +48,33 @@ def test_alpamayo_openpi_adapter_builds_ar_request_with_unique_image_ids():
 
     assert request.request_id == "robot-session-7"
     assert len(request.prompt["multi_modal_data"]["image"]) == 4
-    assert request.prompt["multi_modal_uuids"]["image"] == [
-        f"robot-session-7:image:{index}" for index in range(4)
-    ]
+    assert request.prompt["multi_modal_uuids"]["image"] == [f"robot-session-7:image:{index}" for index in range(4)]
     assert len(request.prompt["prompt_token_ids"]) == 50
     assert request.sampling_params.extra_args["robot_obs"]["ego_history_xyz"] == history.tolist()
     assert request.sampling_params.extra_args["reset"] is True
     assert request.sampling_params.extra_args["session_id"] == "session"
+    assert request.sampling_params.extra_args["_sampling_seed"] == 42
+    assert request.sampling_params.extra_args["_nim_action_rng_compat"] is True
+    assert request.sampling_params.extra_args["_compile_expert"] is True
+    assert request.sampling_params.extra_args["_manual_action_cudagraph"] is True
+    assert request.sampling_params.extra_args["_static_expert_cache_max_len"] == 3328
+
+
+def test_alpamayo_openpi_adapter_fast_path_is_opt_in():
+    adapter = object.__new__(AlpamayoOpenPIRequestAdapter)
+    adapter.policy_config = {}
+    adapter.tokenizer = _FakeTokenizer()
+
+    request = adapter.build_request(
+        {
+            "images": np.zeros((4, 3, 8, 8), dtype=np.uint8),
+            "ego_history_xyz": np.zeros((16, 3), dtype=np.float32),
+        },
+        request_id="request",
+        session_id="session",
+        reset=False,
+    )
+
+    assert request.sampling_params.extra_args["_compile_expert"] is False
+    assert request.sampling_params.extra_args["_manual_action_cudagraph"] is False
+    assert request.sampling_params.extra_args["_static_expert_cache_max_len"] == 3328
