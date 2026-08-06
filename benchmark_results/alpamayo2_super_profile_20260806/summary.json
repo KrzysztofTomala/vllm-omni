@@ -39,6 +39,26 @@
     "rotation_matrix_max_abs_delta": 0.0001063868,
     "first_request_compile_capture_seconds": 67.069
   },
+  "vllm_compiled_graph_4660_nvimgcodec": {
+    "warm_samples": 7,
+    "scene_prepare_mean_seconds": 0.009192,
+    "adapter_build_mean_seconds": 0.001732,
+    "ttft_mean_seconds": 0.802500,
+    "expert_kv_materialize_mean_seconds": 0.010733993,
+    "expert_diffusion_mean_seconds": 0.225732333,
+    "generate_mean_seconds": 1.382411,
+    "backend_mean_seconds": 1.393858,
+    "grpc_wall_mean_seconds": 1.409,
+    "grpc_wall_median_seconds": 1.410,
+    "grpc_wall_min_seconds": 1.401,
+    "grpc_wall_max_seconds": 1.425,
+    "gap_vs_trt_grpc_seconds": 0.010428571,
+    "gap_vs_trt_grpc_percent": 0.7456,
+    "trajectory_ade_delta_m": 0.011449,
+    "trajectory_fde_delta_m": 0.035210,
+    "trajectory_max_point_delta_m": 0.035210,
+    "rotation_matrix_max_abs_delta": 0.0001063868
+  },
   "trt_llm_nim_current_node": {
     "warm_samples": 7,
     "decode_request_mean_seconds": 0.007204322,

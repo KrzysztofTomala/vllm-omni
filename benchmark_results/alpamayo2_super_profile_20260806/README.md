@@ -89,6 +89,38 @@ compiled vLLM path is 103.4 ms (7.4%) slower. The largest exact-path gaps are
 request preparation (about 65 ms) and expert diffusion (107.9 ms); VLM rollout
 is only about 18.4 ms slower. The compiled expert closes its gap to 25.5 ms.
 
+## TRT-gap optimization follow-up
+
+The request-preparation gap was traced to the container runtime rather than the
+shared decoder code. On the same 24 JPEGs, upstream torchvision 0.26 in the
+vLLM image took 80.25 ms, while the NVIDIA torchvision build in the TRT image
+took 5.52 ms. The NIM integration now uses `nvImageCodec` with an automatic
+torchvision/CPU fallback. Its isolated vLLM-image time was 8.40 ms including
+code-stream construction and contiguous CHW conversion, with pixels exactly
+equal to the torchvision CUDA result.
+
+The expert cache profile was also reduced from 4,800 to 4,660 tokens, matching
+the standard 4,594-token expert prefix plus its 64-token suffix. Seven stable
+warm requests with the combined nvImageCodec, compiled expert, manual CUDA
+graph, and 4,660-token cache produced:
+
+| Optimized vLLM component | Mean |
+|---|---:|
+| Scene preparation | 9.192 ms |
+| Adapter build | 1.732 ms |
+| TTFT | 802.500 ms |
+| Expert KV materialization | 10.734 ms |
+| Expert diffusion | 225.732 ms |
+| vLLM generate | 1,382.411 ms |
+| Backend total | 1,393.858 ms |
+| gRPC wall | **1,409 ms** |
+
+This is 10.4 ms (0.74%) slower than the same-node TRT gRPC mean of 1,398.6 ms.
+The observed vLLM range was 1,401--1,425 ms and the TRT range was
+1,390--1,407 ms. The decoder and cache-size changes did not alter the compiled
+output: its delta from the exact path remains 0.011449 m ADE, 0.035210 m
+FDE/maximum point error, and `1.063868e-4` maximum rotation-matrix difference.
+
 Cold TRT startup for this fresh local cache was 532.6 seconds through startup
 warmup, including 75.4 seconds for the first VLM export, 97.2 seconds in the
 FlashInfer-prewarm stage, 289.6 seconds for TRT initialization, and 66.4 seconds
