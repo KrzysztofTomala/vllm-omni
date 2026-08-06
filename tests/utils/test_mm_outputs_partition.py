@@ -38,6 +38,17 @@ def test_partition_code2wav_client_audio():
     assert client == payload
 
 
+def test_partition_robot_policy_client_trajectory():
+    payload = {
+        "actions": torch.zeros(6, 64, 3),
+        "rotations": torch.zeros(6, 64, 3, 3),
+        "normalized_controls": torch.zeros(6, 64, 2),
+    }
+    inter, client = partition_flat_payload(payload)
+    assert inter == {}
+    assert client == payload
+
+
 def test_partition_payload_list_preserves_request_alignment():
     payloads = [
         {"hidden_states.layer_0": torch.zeros(1, 2)},
