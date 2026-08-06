@@ -166,20 +166,30 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         dynamic_cache = DynamicCache()
         for layer_index, cache in enumerate(caches):
-            if cache.ndim != 5 or (cache.shape[0] != 2 and cache.shape[1] != 2):
-                raise RuntimeError("Alpamayo currently requires the standard vLLM paged-attention KV layout")
-            block_size = cache.shape[2]
-            num_blocks = (seq_len + block_size - 1) // block_size
-            block_ids = block_table[:num_blocks].to(dtype=torch.long)
-            if cache.shape[0] == 2:
-                key = cache[0].index_select(0, block_ids).flatten(0, 1)[:seq_len]
-                value = cache[1].index_select(0, block_ids).flatten(0, 1)[:seq_len]
-            else:
-                # FlashAttention's current logical layout is
-                # (blocks, 2, block_size, kv_heads, head_dim).
+            if cache.ndim == 4:
+                # vLLM 0.26 FlashAttention packs K and V in the last
+                # dimension: (blocks, kv_heads, block_size, 2 * head_dim).
+                if cache.shape[-1] % 2:
+                    raise RuntimeError("Alpamayo received an invalid packed KV layout")
+                block_size = cache.shape[2]
+                num_blocks = (seq_len + block_size - 1) // block_size
+                block_ids = block_table[:num_blocks].to(dtype=torch.long)
                 selected = cache.index_select(0, block_ids)
-                key = selected[:, 0].flatten(0, 1)[:seq_len]
-                value = selected[:, 1].flatten(0, 1)[:seq_len]
+                tokens = selected.permute(0, 2, 1, 3).flatten(0, 1)[:seq_len]
+                key, value = tokens.chunk(2, dim=-1)
+            elif cache.ndim == 5 and (cache.shape[0] == 2 or cache.shape[1] == 2):
+                block_size = cache.shape[2]
+                num_blocks = (seq_len + block_size - 1) // block_size
+                block_ids = block_table[:num_blocks].to(dtype=torch.long)
+                if cache.shape[0] == 2:
+                    key = cache[0].index_select(0, block_ids).flatten(0, 1)[:seq_len]
+                    value = cache[1].index_select(0, block_ids).flatten(0, 1)[:seq_len]
+                else:
+                    selected = cache.index_select(0, block_ids)
+                    key = selected[:, 0].flatten(0, 1)[:seq_len]
+                    value = selected[:, 1].flatten(0, 1)[:seq_len]
+            else:
+                raise RuntimeError("Alpamayo currently requires the standard vLLM paged-attention KV layout")
             # HF cache layout is (batch, kv_heads, sequence, head_dim).
             dynamic_cache.update(
                 key.transpose(0, 1).unsqueeze(0).contiguous(),
