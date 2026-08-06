@@ -39,6 +39,24 @@
     "rotation_matrix_max_abs_delta": 0.0001063868,
     "first_request_compile_capture_seconds": 67.069
   },
+  "trt_llm_nim_current_node": {
+    "warm_samples": 7,
+    "decode_request_mean_seconds": 0.007204322,
+    "prepare_inputs_mean_seconds": 0.012543991,
+    "vlm_rollout_mean_seconds": 1.134568996,
+    "ttft_mean_seconds": 0.795204857,
+    "decode_span_mean_seconds": 0.314154857,
+    "native_kv_capture_mean_seconds": 0.034543965,
+    "expert_diffusion_mean_seconds": 0.204110790,
+    "trajectory_postprocess_mean_seconds": 0.002034965,
+    "inference_core_mean_seconds": 1.371223210,
+    "backend_mean_seconds": 1.378454127,
+    "grpc_wall_mean_seconds": 1.398571429,
+    "grpc_wall_median_seconds": 1.398,
+    "grpc_wall_min_seconds": 1.390,
+    "grpc_wall_max_seconds": 1.407,
+    "startup_through_warmup_seconds": 532.590
+  },
   "git": {
     "vllm_omni_branch": "alpamayo2-super-vllm-omni-fast",
     "vllm_omni_implementation_commit": "2c2a2829",
