@@ -24,7 +24,7 @@ ALPAMAYO2_SUPER_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             sampling_constraints={
                 "detokenize": True,
-                "stop_token_ids": [155681],
+                "stop_token_ids": [155683],
                 "max_tokens": 128,
             },
         ),
