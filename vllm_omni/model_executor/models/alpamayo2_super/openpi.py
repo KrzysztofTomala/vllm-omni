@@ -146,7 +146,10 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 temperature=float(self.policy_config.get("temperature", 0.6)),
                 top_p=float(self.policy_config.get("top_p", 0.98)),
                 max_tokens=int(self.policy_config.get("max_tokens", 128)),
-                stop_token_ids=[int(self.model_config.traj_ids["future_start"])],
+                # ``future_start`` triggers the in-model action expert on the
+                # following decode step. Stop only after that hook forces the
+                # terminal ``future_end`` token and publishes its payload.
+                stop_token_ids=[int(self.model_config.traj_ids["future_end"])],
                 extra_args=extra_args,
             ),
             request_id=request_id,
