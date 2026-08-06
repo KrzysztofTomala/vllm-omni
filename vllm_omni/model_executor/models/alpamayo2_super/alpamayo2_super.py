@@ -9,7 +9,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
-from transformers import DynamicCache
+from torch import nn
+from transformers import DynamicCache, StaticCache
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_vl import (
@@ -83,6 +84,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             expert_config,
             dtype=vllm_config.model_config.dtype,
         )
+        self._compiled_expert: nn.Module | None = None
+        self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._force_future_end = False
 
     @property
@@ -178,6 +181,195 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tensor = tensor.squeeze(0)
         return tensor
 
+    def _make_static_action_cache(
+        self,
+        cache: DynamicCache,
+        *,
+        suffix_length: int,
+        max_cache_len: int | None,
+    ) -> StaticCache:
+        prefix_length = cache.get_seq_length()
+        minimum_length = prefix_length + suffix_length
+        effective_max_len = max_cache_len or minimum_length
+        if effective_max_len < minimum_length:
+            raise ValueError(
+                "static action cache is too short: need at least "
+                f"{minimum_length} tokens, got {effective_max_len}"
+            )
+        static_cache = StaticCache(
+            config=self.expert.expert.config,
+            max_cache_len=effective_max_len,
+        )
+        cache_position = torch.arange(
+            prefix_length,
+            device=cache.layers[0].keys.device,
+            dtype=torch.long,
+        )
+        for layer_index, layer in enumerate(cache.layers):
+            static_cache.update(
+                layer.keys,
+                layer.values,
+                layer_index,
+                cache_kwargs={"cache_position": cache_position},
+            )
+        return static_cache
+
+    @staticmethod
+    def _copy_action_prefix(
+        dst: StaticCache,
+        src: DynamicCache,
+        prefix_length: int,
+    ) -> None:
+        for dst_layer, src_layer in zip(dst.layers, src.layers, strict=True):
+            dst_layer.keys[:, :, :prefix_length].copy_(src_layer.keys)
+            dst_layer.values[:, :, :prefix_length].copy_(src_layer.values)
+            dst_layer.cumulative_length.fill_(prefix_length)
+
+    @staticmethod
+    def _rewind_static_action_cache(
+        cache: StaticCache,
+        prefix_length: int | torch.Tensor,
+    ) -> None:
+        # Each expert call overwrites the complete action suffix, so only the
+        # write cursor needs to be reset between flow-matching steps.
+        for layer in cache.layers:
+            if isinstance(prefix_length, torch.Tensor):
+                layer.cumulative_length.copy_(prefix_length)
+            else:
+                layer.cumulative_length.fill_(prefix_length)
+
+    @staticmethod
+    def _make_action_attention_mask(
+        *,
+        sample_count: int,
+        prefix_length: int,
+        suffix_length: int,
+        max_cache_len: int | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        minimum_length = prefix_length + suffix_length
+        mask_length = max_cache_len or minimum_length
+        if mask_length < minimum_length:
+            raise ValueError(
+                "static action cache is too short: need at least "
+                f"{minimum_length} tokens, got {mask_length}"
+            )
+        attention_mask = torch.full(
+            (sample_count, 1, suffix_length, mask_length),
+            torch.finfo(dtype).min,
+            device=device,
+            dtype=dtype,
+        )
+        attention_mask[..., :minimum_length] = 0
+        return attention_mask
+
+    def _run_manual_action_graph(
+        self,
+        *,
+        expert: nn.Module,
+        prefix: DynamicCache,
+        action: torch.Tensor,
+        expert_positions: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_steps: int,
+        suffix_length: int,
+        static_cache_max_len: int | None,
+    ) -> torch.Tensor:
+        """Replay the fixed-shape ten-step expert integration in one graph."""
+
+        prefix_length = prefix.get_seq_length()
+        key = (
+            tuple(action.shape),
+            action.dtype,
+            action.device,
+            tuple(expert_positions.shape),
+            tuple(attention_mask.shape),
+            inference_steps,
+        )
+        state = self._action_graphs.get(key)
+        if state is None:
+            static_cache = self._make_static_action_cache(
+                prefix,
+                suffix_length=suffix_length,
+                max_cache_len=static_cache_max_len,
+            )
+            state = {
+                "cache": static_cache,
+                "action": action.clone(),
+                "positions": expert_positions.clone(),
+                "attention_mask": attention_mask.clone(),
+                "cache_position": torch.arange(
+                    prefix_length,
+                    prefix_length + suffix_length,
+                    device=action.device,
+                    dtype=torch.long,
+                ),
+            }
+
+            def graph_body() -> torch.Tensor:
+                graph_action = state["action"]
+                for step in range(inference_steps):
+                    timestep = graph_action.new_full(
+                        (graph_action.shape[0],) + (1,) * (graph_action.ndim - 1),
+                        step / inference_steps,
+                    )
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=self.expert.action_out_proj.weight.dtype,
+                    ):
+                        embeddings = self.expert.action_in_proj(graph_action, timestep)
+                    output = expert(
+                        inputs_embeds=embeddings.to(self.expert.action_out_proj.weight.dtype),
+                        position_ids=state["positions"],
+                        past_key_values=static_cache,
+                        attention_mask=state["attention_mask"],
+                        cache_position=state["cache_position"],
+                        use_cache=True,
+                        is_causal=not bool(self.expert.config.expert_non_causal_attention),
+                    )
+                    self._rewind_static_action_cache(
+                        static_cache,
+                        state["cache_position"][0],
+                    )
+                    velocity = self.expert.action_out_proj(
+                        output.last_hidden_state[:, -suffix_length:]
+                    )
+                    graph_action = graph_action + velocity.float().view_as(graph_action) / inference_steps
+                return graph_action
+
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    graph_body()
+                    self._rewind_static_action_cache(
+                        static_cache,
+                        state["cache_position"][0],
+                    )
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = graph_body()
+            state["graph"] = graph
+            state["output"] = graph_output
+            self._action_graphs[key] = state
+
+        state["action"].copy_(action)
+        state["positions"].copy_(expert_positions)
+        state["attention_mask"].copy_(attention_mask)
+        state["cache_position"].copy_(
+            torch.arange(
+                prefix_length,
+                prefix_length + suffix_length,
+                device=action.device,
+                dtype=torch.long,
+            )
+        )
+        self._copy_action_prefix(state["cache"], prefix, prefix_length)
+        state["graph"].replay()
+        return state["output"].clone()
+
     def _sample_actions(
         self,
         *,
@@ -189,6 +381,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         extra_args: Mapping[str, Any],
     ) -> dict[str, torch.Tensor]:
         device = caches[0].device
+        profile_action = bool(extra_args.get("_profile_action", False)) and device.type == "cuda"
+        profile_events: list[torch.cuda.Event] = []
+
+        def record_profile_event() -> None:
+            if profile_action:
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                profile_events.append(event)
+
+        record_profile_event()
         sample_count = int(extra_args.get("num_traj_samples", 1))
         inference_steps = int(extra_args.get("diffusion_steps", 10))
         temperature = float(extra_args.get("action_temperature", 1.0))
@@ -199,8 +401,28 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self._gather_prefix_cache(caches, block_table, seq_len),
             sample_count,
         )
+        record_profile_event()
         prefix_len = prefix.get_seq_length()
         action_dims = tuple(int(dim) for dim in self.expert.action_space.get_action_space_dims())
+        suffix_length = action_dims[0]
+        static_cache_max_len_value = extra_args.get("_static_expert_cache_max_len")
+        static_cache_max_len = (
+            int(static_cache_max_len_value)
+            if static_cache_max_len_value is not None
+            else None
+        )
+        manual_action_cudagraph = bool(extra_args.get("_manual_action_cudagraph", False))
+        static_expert_cache = bool(
+            extra_args.get("_static_expert_cache", manual_action_cudagraph)
+        )
+        if static_expert_cache and static_cache_max_len is not None:
+            # The configured length is the reusable latency profile, not a
+            # hard request limit. Longer prompts remain correct and simply
+            # create a second graph shape.
+            static_cache_max_len = max(
+                static_cache_max_len,
+                prefix_len + suffix_length,
+            )
 
         generator = None
         if (sampling_seed := extra_args.get("_sampling_seed")) is not None:
@@ -220,40 +442,86 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             last_position = positions[:, -1:].to(device)
         else:
             last_position = positions.reshape(-1)[-1:].repeat(3, 1).to(device)
-        suffix_length = action_dims[0]
         expert_positions = (
             last_position[:, None, :]
             + 1
             + torch.arange(suffix_length, device=device)[None, None, :]
         ).expand(3, sample_count, suffix_length)
         weight_dtype = self.expert.action_out_proj.weight.dtype
-        attention_mask = torch.zeros(
-            (sample_count, 1, suffix_length, prefix_len + suffix_length),
+        attention_mask = self._make_action_attention_mask(
+            sample_count=sample_count,
+            prefix_length=prefix_len,
+            suffix_length=suffix_length,
+            max_cache_len=(static_cache_max_len if static_expert_cache else None),
             device=device,
-            # Transformers SDPA requires additive-mask and query dtypes to
-            # match. With a compact paged prefix this mask contains no padded
-            # tail, so BF16 zeros are exactly equivalent to reference FP32.
             dtype=weight_dtype,
         )
+        expert_cache: DynamicCache | StaticCache = prefix
+        expert_cache_position = None
+        if static_expert_cache and not manual_action_cudagraph:
+            expert_cache = self._make_static_action_cache(
+                prefix,
+                suffix_length=suffix_length,
+                max_cache_len=static_cache_max_len,
+            )
+            expert_cache_position = torch.arange(
+                prefix_len,
+                prefix_len + suffix_length,
+                device=device,
+                dtype=torch.long,
+            )
+        record_profile_event()
 
-        for step in range(inference_steps):
-            timestep = action.new_full(
-                (sample_count,) + (1,) * len(action_dims),
-                step / inference_steps,
-            )
-            with torch.autocast(device_type=device.type, dtype=weight_dtype):
-                embeddings = self.expert.action_in_proj(action, timestep)
-            outputs = self.expert.expert(
-                inputs_embeds=embeddings.to(weight_dtype),
-                position_ids=expert_positions,
-                past_key_values=prefix,
+        expert = self.expert.expert
+        if bool(extra_args.get("_compile_expert", False)):
+            if self._compiled_expert is None:
+                self._compiled_expert = torch.compile(
+                    self.expert.expert,
+                    fullgraph=False,
+                    dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+            expert = self._compiled_expert
+        if manual_action_cudagraph:
+            action = self._run_manual_action_graph(
+                expert=expert,
+                prefix=prefix,
+                action=action,
+                expert_positions=expert_positions,
                 attention_mask=attention_mask,
-                use_cache=True,
-                is_causal=not bool(self.expert.config.expert_non_causal_attention),
+                inference_steps=inference_steps,
+                suffix_length=suffix_length,
+                static_cache_max_len=static_cache_max_len,
             )
-            prefix.crop(prefix_len)
-            velocity = self.expert.action_out_proj(outputs.last_hidden_state)
-            action = action + velocity.float().view(sample_count, *action_dims) / inference_steps
+        else:
+            for step in range(inference_steps):
+                timestep = action.new_full(
+                    (sample_count,) + (1,) * len(action_dims),
+                    step / inference_steps,
+                )
+                with torch.autocast(device_type=device.type, dtype=weight_dtype):
+                    embeddings = self.expert.action_in_proj(action, timestep)
+                outputs = expert(
+                    inputs_embeds=embeddings.to(weight_dtype),
+                    position_ids=expert_positions,
+                    past_key_values=expert_cache,
+                    attention_mask=attention_mask,
+                    cache_position=expert_cache_position,
+                    use_cache=True,
+                    is_causal=not bool(self.expert.config.expert_non_causal_attention),
+                )
+                if isinstance(expert_cache, StaticCache):
+                    self._rewind_static_action_cache(expert_cache, prefix_len)
+                else:
+                    expert_cache.crop(prefix_len)
+                velocity = self.expert.action_out_proj(
+                    outputs.last_hidden_state[:, -suffix_length:]
+                )
+                action = (
+                    action
+                    + velocity.float().view(sample_count, *action_dims) / inference_steps
+                )
+        record_profile_event()
 
         history_xyz = self._observation_tensor(observation["ego_history_xyz"], device=device)
         history_rot = self._observation_tensor(observation["ego_history_rot"], device=device)
@@ -270,6 +538,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             repeated_history_xyz,
             repeated_history_rot,
         )
+        record_profile_event()
         result = {
             "pred_trajectories": pred_xyz,
             "pred_rotations": pred_rot,
@@ -277,6 +546,19 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "rotations": pred_rot,
             "normalized_controls": action,
         }
+        if profile_action:
+            # Synchronize only for explicitly profiled requests. The four
+            # intervals are KV materialization, action setup, diffusion, and
+            # action-space trajectory conversion respectively.
+            profile_events[-1].synchronize()
+            result["action_profile_ms"] = torch.tensor(
+                [
+                    profile_events[index].elapsed_time(profile_events[index + 1])
+                    for index in range(len(profile_events) - 1)
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
         if initial_noise is not None:
             result["action_noise"] = initial_noise
         return result
