@@ -35,5 +35,15 @@ stages:
         action_horizon: 64
         action_dt: 0.1
         num_trajectory_samples: 6
+        # Match NIM's request-local action-noise stream after the VLM rollout.
+        seed: 42
+        nim_action_rng_compat: true
+        # Fast-branch action path: compile the expert once, then capture the
+        # fixed-shape ten-step flow integration in a persistent CUDA graph.
+        compile_actions: true
+        manual_action_cudagraph: true
+        # Matches NIM: one fixed KV/mask shape is reusable across reasoning
+        # prefix lengths. This includes the 64 action tokens.
+        static_expert_cache_max_len: 3328
         history_waypoints: 16
         frames_per_camera: 4

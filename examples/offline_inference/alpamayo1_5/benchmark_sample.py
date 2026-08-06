@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import cProfile
+import hashlib
 import io
 import json
 import os
@@ -46,7 +47,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile-input", action="store_true")
     parser.add_argument("--profile-actions", action="store_true")
+    parser.add_argument("--return-action-noise", action="store_true")
     parser.add_argument("--compile-actions", action="store_true")
+    parser.add_argument("--manual-action-cudagraph", action="store_true")
+    parser.add_argument("--static-expert-cache-max-len", type=int, default=3328)
     parser.add_argument(
         "--image-input",
         choices=("pil", "cpu-tensor", "jpeg-cpu-tensor"),
@@ -84,10 +88,7 @@ def main() -> None:
             with Image.open(path) as image:
                 images.append(image.convert("RGB"))
     else:
-        encoded_images = [
-            torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8)
-            for path in image_paths
-        ]
+        encoded_images = [torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8) for path in image_paths]
         decode_pool = ThreadPoolExecutor(max_workers=len(encoded_images))
         images = list(
             decode_pool.map(
@@ -115,18 +116,14 @@ def main() -> None:
         add_generation_prompt=False,
         continue_final_message=True,
     )
-    prompt_ids = fuse_history_tokens(
-        torch.tensor(tokenizer.encode(prompt)), torch.from_numpy(history_xyz)
-    ).tolist()
+    prompt_ids = fuse_history_tokens(torch.tensor(tokenizer.encode(prompt)), torch.from_numpy(history_xyz)).tolist()
     prompt_input = {
         "prompt_token_ids": prompt_ids,
         "multi_modal_data": {"image": images},
         "mm_processor_kwargs": {"device": args.processor_device},
     }
     if args.stable_uuids:
-        prompt_input["multi_modal_uuids"] = {
-            "image": [f"alpamayo-sample:{path.stem}" for path in image_paths]
-        }
+        prompt_input["multi_modal_uuids"] = {"image": [f"alpamayo-sample:{path.stem}" for path in image_paths]}
     sampling = SamplingParams(
         temperature=1.0,
         top_p=1.0,
@@ -142,8 +139,13 @@ def main() -> None:
             "num_traj_samples": 1,
             "diffusion_steps": 10,
             "action_temperature": 1.0,
+            "_sampling_seed": 42,
+            "_nim_action_rng_compat": True,
+            "_return_action_noise": args.return_action_noise,
             "_profile_timings": args.profile_actions,
             "_compile_expert": args.compile_actions,
+            "_manual_action_cudagraph": args.manual_action_cudagraph,
+            "_static_expert_cache_max_len": args.static_expert_cache_max_len,
         },
     )
 
@@ -205,9 +207,7 @@ def main() -> None:
                     if isinstance(image, torch.Tensor):
                         varied = image.clone()
                         channel = image_index % int(varied.shape[0])
-                        varied[channel, 0, 0] = (
-                            int(varied[channel, 0, 0]) + run_index + image_index + 1
-                        ) % 256
+                        varied[channel, 0, 0] = (int(varied[channel, 0, 0]) + run_index + image_index + 1) % 256
                     else:
                         varied = image.copy()
                         pixel = list(varied.getpixel((0, 0)))
@@ -224,10 +224,7 @@ def main() -> None:
                     # Unique IDs bypass expensive content hashing while still
                     # forcing a cache miss for every live frame on every run.
                     run_prompt["multi_modal_uuids"] = {
-                        "image": [
-                            f"alpamayo-sample:{path.stem}:run-{run_index}"
-                            for path in image_paths
-                        ]
+                        "image": [f"alpamayo-sample:{path.stem}:run-{run_index}" for path in image_paths]
                     }
             started = time.perf_counter()
             outputs = list(omni.generate([run_prompt], [sampling], use_tqdm=False))
@@ -251,6 +248,21 @@ def main() -> None:
                     "action_profile_ms": (
                         float_array(multimodal["profile_timings_ms"]).tolist()
                         if "profile_timings_ms" in multimodal
+                        else None
+                    ),
+                    "action_noise_sha256": (
+                        hashlib.sha256(float_array(multimodal["action_noise"]).tobytes()).hexdigest()
+                        if "action_noise" in multimodal
+                        else None
+                    ),
+                    "action_noise_head": (
+                        float_array(multimodal["action_noise"]).reshape(-1)[:8].tolist()
+                        if "action_noise" in multimodal
+                        else None
+                    ),
+                    "action_rng_advance_steps": (
+                        int(float_array(multimodal["action_rng_advance_steps"]).item())
+                        if "action_rng_advance_steps" in multimodal
                         else None
                     ),
                 }
@@ -289,8 +301,7 @@ def main() -> None:
                 "gpu_memory_mib": gpu_memory_mib,
                 "torch_version": torch.__version__,
                 "torch_cuda_version": torch.version.cuda,
-                "container_image": os.environ.get("NVIDIA_BUILD_ID")
-                or os.environ.get("VLLM_IMAGE_TAG"),
+                "container_image": os.environ.get("NVIDIA_BUILD_ID") or os.environ.get("VLLM_IMAGE_TAG"),
                 "stable_uuids": args.stable_uuids,
                 "vary_images": args.vary_images,
                 "image_input": args.image_input,

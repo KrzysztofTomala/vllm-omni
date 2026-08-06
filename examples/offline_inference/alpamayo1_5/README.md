@@ -24,6 +24,12 @@ python examples/offline_inference/alpamayo1_5/benchmark_sample.py \
 
 The benchmark uses the matched BF16, seed-42, top-k-1 settings. Add
 `--no-stable-uuids --vary-images` to measure the live-camera cache-miss path.
+Trajectory requests also mirror the CUDA RNG consumed by the reference HF VLM
+sampling loop before drawing the initial action-expert noise. The expanded
+multimodal prompt length is captured during prefill, so the number of RNG
+advances stays aligned when reasoning lengths differ. Use
+`--return-action-noise` to record the initial-noise SHA-256 and first values in
+the sample benchmark JSON.
 The JSON result records the hostname, GPU UUID, driver, PyTorch/CUDA versions,
 and container identifier when available. Compare warmed runs using identical
 image-cache semantics; the first request includes one-time processor and kernel
@@ -33,6 +39,15 @@ On the `alpamayo-1.5-nim-fast` branch, add `--compile-actions
 --profile-actions` to compile the action expert and record its KV extraction,
 sampler setup, expert integration, and trajectory-decoder times. Compilation is
 expensive on the first request; compare warmed requests only.
+Add `--manual-action-cudagraph` to capture and replay the fixed-shape ten-step
+action integration using persistent input and KV-cache buffers. The fast path
+pads the expert cache and attention mask to 3,328 tokens, matching the NIM
+default, so one graph can serve different reasoning-prefix lengths. Override
+this with `--static-expert-cache-max-len` when benchmarking a different maximum
+sequence length.
+The fast branch's bundled deploy config enables both optimizations for OpenPI
+serving. Remove `compile_actions` and `manual_action_cudagraph` from
+`policy_server_config` to run the eager action path.
 
 Online policy serving uses the OpenPI-compatible websocket endpoint:
 
