@@ -61,12 +61,39 @@ expert (0.230 vs 0.659 seconds). The exact graph expert is 2.11x faster (0.312 s
 These ratios are estimates from one sample and one H100, not a throughput benchmark. A
 multi-example evaluation is still required before treating them as release-level numbers.
 
-## Historical TensorRT-LLM NIM reference
+## TensorRT-LLM NIM comparison
 
-The prior TensorRT-LLM NIM measurement on this H100 was approximately 1.432 seconds warm gRPC
-latency with approximately 204 ms in expert diffusion. Thus the compiled vLLM path is within
-about 70 ms (4.9%) end to end, while the selected exact-output path is about 150 ms (10.5%)
-slower. This historical result was not rerun as part of this matrix.
+The TensorRT-LLM NIM was rerun on the same H100 on 2026-08-06 using the same
+checkpoint, scene, BF16 precision, K=1, top-k=1, and seed 42. Seven stable warm
+requests were retained after discarding the first post-readiness client request,
+which had a one-time transport/setup delay despite normal server timing.
+
+| TensorRT-LLM component | Mean | Std. dev. |
+|---|---:|---:|
+| Request decode | 7.204 ms | 0.222 ms |
+| Model-input preparation | 12.544 ms | 0.179 ms |
+| VLM rollout | 1,134.569 ms | 4.832 ms |
+| Native KV capture | 34.544 ms | 0.258 ms |
+| Expert diffusion | 204.111 ms | 1.622 ms |
+| Trajectory postprocess | 2.035 ms | 0.052 ms |
+| Inference core | 1,371.223 ms | 5.692 ms |
+| Backend total | 1,378.454 ms | 5.737 ms |
+| gRPC wall | **1,398.571 ms** | **6.241 ms** |
+
+The TRT VLM TTFT was 795.205 ms and its post-first-token decode span was
+314.155 ms. The expert's ten diffusion steps took 183.855 ms inside a 204.111
+ms expert total; static-cache setup took 13.162 ms.
+
+Against TRT end to end, the exact vLLM path is 183.4 ms (13.1%) slower and the
+compiled vLLM path is 103.4 ms (7.4%) slower. The largest exact-path gaps are
+request preparation (about 65 ms) and expert diffusion (107.9 ms); VLM rollout
+is only about 18.4 ms slower. The compiled expert closes its gap to 25.5 ms.
+
+Cold TRT startup for this fresh local cache was 532.6 seconds through startup
+warmup, including 75.4 seconds for the first VLM export, 97.2 seconds in the
+FlashInfer-prewarm stage, 289.6 seconds for TRT initialization, and 66.4 seconds
+for startup warmup/initial expert graph capture. These costs are excluded from
+the warm measurements.
 
 ## Raw artifacts
 
