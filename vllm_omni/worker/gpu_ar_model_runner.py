@@ -463,9 +463,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
         downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
         engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
-        # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
-        # need multimodal payloads for final audio postprocess/output.
-        if engine_output_type == "audio" and not downstream_req_ids:
+        # A non-text stage that finishes the request still needs its
+        # multimodal payload routed to the client (audio, actions, images,
+        # etc.), even though it has no downstream stage.
+        if engine_output_type != "text" and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
