@@ -1,0 +1,47 @@
+{
+  "date": "2026-08-06",
+  "hardware": "NVIDIA H100 NVL",
+  "precision": "BF16",
+  "num_traj_samples": 1,
+  "seed": 42,
+  "prompt_tokens": 4580,
+  "generation_tokens": 15,
+  "warm_samples": 6,
+  "oss_warm_samples": 5,
+  "oss_seconds": {
+    "prepare_inputs_mean": 0.3770799278,
+    "vlm_rollout_mean": 1.7885951116,
+    "expert_diffusion_mean": 0.6590568610,
+    "model_total_mean": 2.4521087858,
+    "core_total_mean": 2.8291887136
+  },
+  "vllm_exact_graph_4800": {
+    "grpc_wall_mean_seconds": 1.582,
+    "grpc_wall_median_seconds": 1.576,
+    "backend_mean_seconds": 1.562417,
+    "generate_mean_seconds": 1.477680,
+    "expert_diffusion_mean_seconds": 0.311976,
+    "speedup_vs_oss_core": 1.7884,
+    "latency_reduction_vs_oss_core_percent": 44.08,
+    "parity": "bitwise exact versus dynamic baseline"
+  },
+  "vllm_compiled_graph_4800": {
+    "grpc_wall_mean_seconds": 1.502,
+    "grpc_wall_median_seconds": 1.494,
+    "backend_mean_seconds": 1.481585,
+    "generate_mean_seconds": 1.396723,
+    "expert_diffusion_mean_seconds": 0.229604736,
+    "speedup_vs_oss_core": 1.8836,
+    "latency_reduction_vs_oss_core_percent": 46.91,
+    "trajectory_ade_delta_m": 0.011449,
+    "trajectory_fde_delta_m": 0.035210,
+    "trajectory_max_point_delta_m": 0.035210,
+    "rotation_matrix_max_abs_delta": 0.0001063868,
+    "first_request_compile_capture_seconds": 67.069
+  },
+  "git": {
+    "vllm_omni_branch": "alpamayo2-super-vllm-omni-fast",
+    "vllm_omni_implementation_commit": "2c2a2829",
+    "nim_branch": "ktomala/alpamayo2-super-vllm-omni"
+  }
+}
