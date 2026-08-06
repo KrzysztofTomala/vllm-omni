@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from fastapi import FastAPI, WebSocket
 from omegaconf import OmegaConf
 from starlette.testclient import TestClient
@@ -192,6 +193,77 @@ def test_policy_server_config_reads_engine_model_config():
     assert serving.policy_server_config.to_dict() == policy_config
 
 
+def test_policy_server_config_reads_nested_hf_config():
+    policy_config = {"engine_request_type": "ar", "structured_policy_result": True}
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(policy_server_config=policy_config))
+    )
+
+    # Avoid materializing the real tokenizer in this config lookup test.
+    config = openpi_serving.PolicyServerConfig.from_model_config(engine_client.model_config)
+
+    assert config.to_dict() == policy_config
+
+
+def test_non_diffusion_policy_requires_request_adapter():
+    policy_config = {"engine_request_type": "ar"}
+
+    with pytest.raises(ValueError, match="request_adapter"):
+        openpi_serving.ServingRealtimeRobotOpenPI(
+            engine_client=SimpleNamespace(
+                model_config=SimpleNamespace(policy_server_config=policy_config)
+            )
+        )
+
+
+def test_model_request_adapter_owns_request_construction(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def build_request(self, observation, **kwargs):
+            self.calls.append((observation, kwargs))
+            return SimpleNamespace(
+                prompt={"prompt_token_ids": [1]},
+                sampling_params=SimpleNamespace(extra_args={}),
+                request_id=kwargs["request_id"],
+            )
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(
+        openpi_serving,
+        "load_openpi_request_adapter",
+        lambda path, config: adapter,
+    )
+    policy_config = {
+        "engine_request_type": "ar",
+        "request_adapter": "model.module:Adapter",
+    }
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(policy_server_config=policy_config)
+        )
+    )
+
+    request = serving._build_request(
+        {"sensor": "value"},
+        session_id="session-a",
+        reset=True,
+    )
+
+    assert request.request_id == "robot-session-a-0"
+    assert adapter.calls == [
+        (
+            {"sensor": "value"},
+            {
+                "request_id": "robot-session-a-0",
+                "session_id": "session-a",
+                "reset": True,
+            },
+        )
+    ]
+
+
 def test_build_request_uses_unique_engine_request_id_per_inference():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
@@ -333,6 +405,58 @@ def test_infer_preserves_dict_actions_from_multimodal_output():
     np.testing.assert_allclose(actions["right_arm"], np.array([[3.0, 4.0]], dtype=np.float32))
     assert actions["left_arm"].dtype == np.float32
     assert actions["right_arm"].dtype == np.float32
+
+
+def test_infer_preserves_structured_policy_result_when_enabled():
+    policy_config = {
+        **TEST_POLICY_SERVER_CONFIG,
+        "structured_policy_result": True,
+    }
+
+    class FakeEngineClient:
+        def get_diffusion_od_config(self):
+            return SimpleNamespace(model_config={"policy_server_config": policy_config})
+
+        async def generate(self, **kwargs):
+            yield SimpleNamespace(
+                multimodal_output={
+                    "actions": {
+                        "trajectory_xyz": np.ones((1, 64, 3), dtype=np.float64),
+                    },
+                    "info": {
+                        "chain_of_causation": ["The lead vehicle is braking."],
+                        "seed": 42,
+                    },
+                    "rotations": torch.eye(3, dtype=torch.float64).reshape(1, 1, 3, 3),
+                }
+            )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=FakeEngineClient())
+
+    output = asyncio.run(serving.infer({"prompt": "drive safely"}, session_id="av-1", reset=True))
+
+    assert set(output) == {"actions", "info", "rotations"}
+    assert output["actions"]["trajectory_xyz"].dtype == np.float32
+    assert output["rotations"].dtype == np.float32
+    assert output["info"] == {
+        "chain_of_causation": ["The lead vehicle is braking."],
+        "seed": 42,
+    }
+
+
+def test_structured_policy_result_is_opt_in():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(
+        multimodal_output={
+            "actions": [[1.0, 2.0]],
+            "info": {"chain_of_causation": ["not exposed"]},
+        }
+    )
+
+    output = serving._extract_policy_output(result)
+
+    np.testing.assert_allclose(output, np.array([[1.0, 2.0]], dtype=np.float32))
 
 
 def test_extract_actions_does_not_iterate_result_object():

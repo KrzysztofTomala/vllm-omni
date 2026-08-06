@@ -236,12 +236,12 @@ class RobotRealtimeConnection:
                             self._call_count = 0
 
                         self._call_count += 1
-                        actions = await self.serving.infer(
+                        policy_output = await self.serving.infer(
                             obs,
                             session_id=session_id,
                             reset=self._call_count <= 1,
                         )
-                        await self.websocket.send_bytes(_pack(actions))
+                        await self.websocket.send_bytes(_pack(policy_output))
                 except Exception:
                     logger.exception("Error handling request")
                     try:
