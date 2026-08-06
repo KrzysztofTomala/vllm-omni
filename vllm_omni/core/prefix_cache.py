@@ -95,14 +95,19 @@ class OmniTensorPrefixCache:
         determined by the warmup.
         """
         for key, val in multimodal_outputs.items():
-            # Only cache per-token feature tensors: 2D+ with first dim == seq_len.
+            # Only cache per-token feature matrices: exactly 2D with first dim
+            # equal to seq_len. Higher-rank request outputs can coincidentally
+            # have a leading dimension equal to a one-token decode step (for
+            # example, an Alpamayo trajectory shaped [1, 64, 3]); treating
+            # those as token features loses the middle dimensions when the
+            # cache is flattened and causes an index_copy_ shape mismatch.
             # A 1D tensor of shape (seq_len,) is a broadcast scalar (per-request
             # metadata such as ref_code_len / codec_streaming), not per-token data;
             # caching it by slot causes a shape mismatch when a later request has a
             # different scheduled seq length.
             if (
                 isinstance(val, torch.Tensor)
-                and val.ndim >= 2
+                and val.ndim == 2
                 and val.shape[0] == seq_len
                 and key not in self.mm_cache_keys
             ):
