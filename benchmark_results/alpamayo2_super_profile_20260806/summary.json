@@ -54,10 +54,11 @@
     "grpc_wall_max_seconds": 1.425,
     "gap_vs_trt_grpc_seconds": 0.010428571,
     "gap_vs_trt_grpc_percent": 0.7456,
-    "trajectory_ade_delta_m": 0.011449,
-    "trajectory_fde_delta_m": 0.035210,
-    "trajectory_max_point_delta_m": 0.035210,
-    "rotation_matrix_max_abs_delta": 0.0001063868
+    "trajectory_ade_delta_m": 0.014163,
+    "trajectory_fde_delta_m": 0.039684,
+    "trajectory_max_point_delta_m": 0.039684,
+    "rotation_matrix_max_abs_delta": 0.0001127794,
+    "max_point_delta_vs_compiled_graph_4800_m": 0.004636765
   },
   "trt_llm_nim_current_node": {
     "warm_samples": 7,
