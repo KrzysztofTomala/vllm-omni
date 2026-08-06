@@ -117,9 +117,12 @@ graph, and 4,660-token cache produced:
 
 This is 10.4 ms (0.74%) slower than the same-node TRT gRPC mean of 1,398.6 ms.
 The observed vLLM range was 1,401--1,425 ms and the TRT range was
-1,390--1,407 ms. The decoder and cache-size changes did not alter the compiled
-output: its delta from the exact path remains 0.011449 m ADE, 0.035210 m
-FDE/maximum point error, and `1.063868e-4` maximum rotation-matrix difference.
+1,390--1,407 ms. The decoder did not alter pixels or model output. Reducing the
+compiled graph from 4,800 to 4,660 tokens changed floating-point rounding
+slightly: its delta from the exact path is 0.014163 m ADE, 0.039684 m
+FDE/maximum point error, and `1.127794e-4` maximum rotation-matrix difference.
+Relative to the 4,800-token compiled result, the additional maximum trajectory
+change is 4.64 mm.
 
 Cold TRT startup for this fresh local cache was 532.6 seconds through startup
 warmup, including 75.4 seconds for the first VLM export, 97.2 seconds in the
