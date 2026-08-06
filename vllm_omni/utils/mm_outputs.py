@@ -22,6 +22,9 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "video",
         "videos",
         "trajectory_latents",
+        "actions",
+        "rotations",
+        "normalized_controls",
         "latents",
     }
 )

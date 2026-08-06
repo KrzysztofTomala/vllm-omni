@@ -34,6 +34,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -1392,8 +1393,43 @@ class OmniGPUModelRunner(GPUModelRunner):
             for req_id in self.input_batch.req_ids:
                 req = self.requests[req_id]
                 sp = req.sampling_params if req else None
-                extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
+                request_extra_args = dict(sp.extra_args) if sp and sp.extra_args else {}
+                # Models with continuous samplers need the request seed too;
+                # SamplingParams.extra_args alone does not contain it. Keep the
+                # internal key namespaced and do not mutate the user mapping.
+                if sp is not None and sp.seed is not None:
+                    request_extra_args.setdefault("_sampling_seed", int(sp.seed))
+                extra_args_list.append(request_extra_args)
             model_kwargs_extra["sampling_extra_args"] = extra_args_list
+
+        # Terminal model hooks may reuse an autoregressive prefix without
+        # recomputing it. Expose a read-only view of the paged cache only to
+        # models which explicitly opt in; ordinary vLLM models never see these
+        # runner internals.
+        if getattr(self.model, "needs_runner_kv_cache", False):
+            num_reqs = len(self.input_batch.req_ids)
+            get_block_table = self.input_batch.block_table[0].get_device_tensor
+            try:
+                # vLLM >= 0.24 accepts the active request count and returns an
+                # already-sliced view.
+                runner_block_table = get_block_table(num_reqs)
+            except TypeError:
+                # Keep compatibility with releases where the method has no
+                # arguments and exposes the entire preallocated table.
+                runner_block_table = get_block_table()[:num_reqs]
+            scheduled = self._omni_num_scheduled_tokens_np
+            computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            if scheduled is not None:
+                sequence_lengths = tuple(
+                    int(base + added)
+                    for base, added in zip(computed, scheduled, strict=True)
+                )
+                model_kwargs_extra["runner_kv_cache_context"] = RunnerKVCacheContext(
+                    caches=self.kv_caches,
+                    block_table=runner_block_table,
+                    sequence_lengths=sequence_lengths,
+                    request_ids=tuple(self.input_batch.req_ids),
+                )
 
         return model_kwargs_extra
 
@@ -1995,7 +2031,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs_extra,
         )
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
-            model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+            model_output = self.model.make_omni_output(
+                model_output,
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+                **model_kwargs_extra,
+            )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
