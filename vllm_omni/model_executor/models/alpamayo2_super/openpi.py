@@ -132,6 +132,16 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "num_traj_samples": int(self.policy_config.get("num_trajectory_samples", 1)),
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
             "_sampling_seed": int(self.policy_config.get("seed", 42)),
+            "_static_expert_cache": bool(
+                self.policy_config.get("static_expert_cache", False)
+            ),
+            "_compile_expert": bool(self.policy_config.get("compile_actions", False)),
+            "_manual_action_cudagraph": bool(
+                self.policy_config.get("manual_action_cudagraph", False)
+            ),
+            "_static_expert_cache_max_len": int(
+                self.policy_config.get("static_expert_cache_max_len", 4800)
+            ),
         }
         return OpenPIEngineRequest(
             prompt={

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
@@ -99,6 +101,58 @@ def test_super_gathers_standard_paged_kv_layout() -> None:
         gathered.layers[0].values,
         expected_value.transpose(0, 1).unsqueeze(0),
     )
+
+
+def test_super_static_action_cache_refreshes_prefix_and_rewinds_cursor() -> None:
+    source_layer = SimpleNamespace(
+        keys=torch.tensor([[[[1.0], [2.0]]]]),
+        values=torch.tensor([[[[101.0], [102.0]]]]),
+    )
+    target_layer = SimpleNamespace(
+        keys=torch.zeros(1, 1, 4, 1),
+        values=torch.zeros(1, 1, 4, 1),
+        cumulative_length=torch.tensor(4),
+    )
+    source = SimpleNamespace(layers=[source_layer])
+    target = SimpleNamespace(layers=[target_layer])
+
+    Alpamayo2SuperForConditionalGeneration._copy_action_prefix(target, source, 2)
+    assert target_layer.keys.flatten().tolist() == [1.0, 2.0, 0.0, 0.0]
+    assert target_layer.values.flatten().tolist() == [101.0, 102.0, 0.0, 0.0]
+    assert target_layer.cumulative_length.item() == 2
+
+    target_layer.cumulative_length.fill_(4)
+    Alpamayo2SuperForConditionalGeneration._rewind_static_action_cache(target, 2)
+    assert target_layer.cumulative_length.item() == 2
+
+
+def test_super_fixed_action_mask_hides_unused_static_cache() -> None:
+    mask = Alpamayo2SuperForConditionalGeneration._make_action_attention_mask(
+        sample_count=1,
+        prefix_length=3,
+        suffix_length=2,
+        max_cache_len=8,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert mask.shape == (1, 1, 2, 8)
+    assert torch.equal(
+        mask[..., :5],
+        torch.zeros(1, 1, 2, 5, dtype=torch.bfloat16),
+    )
+    assert torch.all(mask[..., 5:] == torch.finfo(torch.bfloat16).min)
+
+
+def test_super_fixed_action_mask_rejects_short_cache() -> None:
+    with pytest.raises(ValueError, match="need at least 5 tokens"):
+        Alpamayo2SuperForConditionalGeneration._make_action_attention_mask(
+            sample_count=1,
+            prefix_length=3,
+            suffix_length=2,
+            max_cache_len=4,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
 
 
 def test_super_policy_does_not_export_vlm_hidden_prefix() -> None:
