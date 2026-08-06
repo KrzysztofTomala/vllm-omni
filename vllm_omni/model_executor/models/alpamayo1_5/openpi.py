@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""OpenPI request adaptation owned by the Alpamayo model integration."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+import numpy as np
+import torch
+from transformers import AutoTokenizer
+from vllm import SamplingParams
+
+from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
+
+from .processing import create_policy_messages, fuse_history_tokens, get_observation_history
+from .tokenizer import ensure_extended_tokenizer
+
+
+def _to_sampling_value(value: Any) -> Any:
+    """Convert observation values to builtins accepted by extra_args RPC."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(key): _to_sampling_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_sampling_value(item) for item in value]
+    return value
+
+
+class AlpamayoOpenPIRequestAdapter:
+    """Build the training-compatible Alpamayo AR policy request."""
+
+    def __init__(self, policy_config: dict[str, Any]) -> None:
+        self.policy_config = policy_config
+        tokenizer_path = ensure_extended_tokenizer(
+            policy_config.get("tokenizer_backbone", "nvidia/Cosmos-Reason2-8B")
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    def build_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        request_id: str,
+        session_id: str,
+        reset: bool,
+    ) -> OpenPIEngineRequest:
+        image_frames = observation.get("image_frames", observation.get("images"))
+        if image_frames is None:
+            raise KeyError("Alpamayo observations require 'image_frames' or 'images'")
+        frames = torch.as_tensor(image_frames) if isinstance(image_frames, np.ndarray) else image_frames
+        if isinstance(frames, torch.Tensor):
+            if frames.ndim == 5:
+                frames = frames.flatten(0, 1)
+            if frames.ndim != 4:
+                raise ValueError("Alpamayo image frames must be rank 4 or 5")
+            images = list(frames)
+        else:
+            images = list(frames)
+
+        camera_indices = observation.get("camera_indices")
+        if isinstance(camera_indices, np.ndarray):
+            camera_indices = camera_indices.tolist()
+        messages = create_policy_messages(
+            images,
+            camera_indices=camera_indices,
+            frames_per_camera=int(observation.get("num_frames_per_camera", 4)),
+            navigation=observation.get("nav_text", observation.get("navigation")),
+        )
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            continue_final_message=True,
+        )
+        prompt_ids = torch.tensor(self.tokenizer.encode(prompt_text))
+        prompt_ids = fuse_history_tokens(
+            prompt_ids,
+            get_observation_history(observation),
+        ).tolist()
+
+        policy_observation = {"ego_history_xyz": observation["ego_history_xyz"]}
+        if "ego_history_rot" in observation:
+            policy_observation["ego_history_rot"] = observation["ego_history_rot"]
+        extra_args = {
+            "reset": reset,
+            "session_id": session_id,
+            "robot_obs": _to_sampling_value(policy_observation),
+            "num_traj_samples": int(self.policy_config.get("num_trajectory_samples", 6)),
+            "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
+            "action_temperature": float(self.policy_config.get("action_temperature", 1.0)),
+        }
+        sampling_params = SamplingParams(
+            temperature=float(self.policy_config.get("temperature", 0.6)),
+            top_p=float(self.policy_config.get("top_p", 0.98)),
+            max_tokens=int(self.policy_config.get("max_tokens", 128)),
+            stop_token_ids=[155683],
+            extra_args=extra_args,
+        )
+        return OpenPIEngineRequest(
+            prompt={
+                "prompt_token_ids": prompt_ids,
+                "multi_modal_data": {"image": images},
+                # Live frames must miss the multimodal cache. Explicit IDs
+                # avoid hashing the decoded RGB tensors to prove uniqueness.
+                "multi_modal_uuids": {
+                    "image": [f"{request_id}:image:{index}" for index in range(len(images))]
+                },
+                "mm_processor_kwargs": {"device": "cuda"},
+            },
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
