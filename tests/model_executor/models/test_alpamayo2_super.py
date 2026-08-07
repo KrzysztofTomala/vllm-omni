@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
@@ -186,3 +187,27 @@ def test_super_policy_does_not_export_vlm_hidden_prefix() -> None:
     assert model.needs_runner_kv_cache
     assert not model.requires_full_prefix_cached_hidden_states
     assert not model.omni_pooler_payload_include_hidden
+
+
+def test_super_policy_masks_text_eos_until_action_boundary(monkeypatch) -> None:
+    model = object.__new__(Alpamayo2SuperForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.alpamayo_config = SimpleNamespace(
+        traj_ids={"history_id0": 4, "future_id0": 8, "future_end": 14},
+        traj_vocab_size=3,
+    )
+    model._force_future_end = False
+    model._policy_generation_active = True
+    model._text_eos_ids = (1, 2)
+    logits = torch.zeros(1, 16)
+    monkeypatch.setattr(
+        Qwen3VLForConditionalGeneration,
+        "compute_logits",
+        lambda _self, _hidden_states: logits.clone(),
+    )
+
+    result = model.compute_logits(torch.zeros(1, 1))
+
+    assert torch.all(result[..., [1, 2]] == -torch.inf)
+    assert torch.all(result[..., 4:7] == -torch.inf)
+    assert result[..., 3].item() == 0
