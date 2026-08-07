@@ -87,6 +87,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self._compiled_expert: nn.Module | None = None
         self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._force_future_end = False
+        self._policy_generation_active = False
+        generation_config = vllm_config.model_config.try_get_generation_config()
+        text_eos_ids = generation_config.get("eos_token_id", ())
+        if isinstance(text_eos_ids, int):
+            text_eos_ids = (text_eos_ids,)
+        self._text_eos_ids = tuple(
+            int(token_id)
+            for token_id in (text_eos_ids or ())
+            if int(token_id) != self.future_start_id
+        )
 
     @property
     def future_start_id(self) -> int:
@@ -608,6 +618,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         observation = self._policy_observation(sampling_extra_args)
+        self._policy_generation_active = observation is not None
         trigger = (
             observation is not None
             and input_ids is not None
@@ -648,6 +659,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             traj_ids = self.alpamayo_config.traj_ids
             start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
             logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
+            if self._policy_generation_active and self._text_eos_ids:
+                logits[..., list(self._text_eos_ids)] = -torch.inf
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
