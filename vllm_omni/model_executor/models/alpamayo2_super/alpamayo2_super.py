@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -81,6 +82,19 @@ def alpamayo_flash_attention_3_forward(
             is_causal=is_causal,
             **kwargs,
         )
+
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        allow_fp8_kv_cast = os.getenv(
+            "NIM_ALPAMAYO_FP8_EXPERT_KV_CAST", "0"
+        ).lower() in {"1", "true", "yes", "on"}
+        if not allow_fp8_kv_cast:
+            raise RuntimeError(
+                "The Alpamayo action expert requires query, key, and value to "
+                "have matching dtypes. Set NIM_ALPAMAYO_FP8_EXPERT_KV_CAST=1 "
+                "to measure the experimental FP8-KV-to-query-dtype bridge."
+            )
+        key = key.to(query.dtype)
+        value = value.to(query.dtype)
 
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -242,6 +256,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         caches: list[torch.Tensor],
         block_table: torch.Tensor,
         seq_len: int,
+        target_dtype: torch.dtype,
     ) -> DynamicCache:
         """Convert one request's standard paged cache to HF cache layout."""
 
@@ -275,6 +290,18 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 raise RuntimeError(
                     "Alpamayo 2 Super requires the standard vLLM paged KV layout"
                 )
+            if key.dtype == torch.uint8:
+                allow_fp8_kv_cast = os.getenv(
+                    "NIM_ALPAMAYO_FP8_EXPERT_KV_CAST", "0"
+                ).lower() in {"1", "true", "yes", "on"}
+                if not allow_fp8_kv_cast:
+                    raise RuntimeError(
+                        "The Alpamayo action expert cannot consume vLLM's raw "
+                        "FP8 paged cache. Set NIM_ALPAMAYO_FP8_EXPERT_KV_CAST=1 "
+                        "to measure the experimental dequantization bridge."
+                    )
+                key = key.view(torch.float8_e4m3fn).to(target_dtype)
+                value = value.view(torch.float8_e4m3fn).to(target_dtype)
             dynamic_cache.update(
                 key.transpose(0, 1).unsqueeze(0).contiguous(),
                 value.transpose(0, 1).unsqueeze(0).contiguous(),
@@ -519,7 +546,12 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             raise ValueError("num_traj_samples and diffusion_steps must be positive")
 
         prefix = self._repeat_cache(
-            self._gather_prefix_cache(caches, block_table, seq_len),
+            self._gather_prefix_cache(
+                caches,
+                block_table,
+                seq_len,
+                self.expert.action_out_proj.weight.dtype,
+            ),
             sample_count,
         )
         record_profile_event()
