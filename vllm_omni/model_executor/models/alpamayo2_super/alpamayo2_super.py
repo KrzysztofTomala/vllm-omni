@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import DynamicCache, StaticCache
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import AttentionInterface
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_vl import (
@@ -26,6 +28,96 @@ from vllm.transformers_utils.processor import cached_get_processor
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
+
+
+def alpamayo_flash_attention_3_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    is_causal: bool | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Run the single-sample action suffix through vLLM's bundled FA3.
+
+    The action expert has 64 non-causal query tokens attending to a much
+    longer VLM prefix.  PyTorch SDPA selects its SM80 memory-efficient kernel
+    for that unequal-Q/K shape, while vLLM's FA3 varlen kernel is native to
+    Hopper and accepts the expert's GQA layout without repeating K/V heads.
+
+    StaticCache allocates more K/V tokens than are valid. ``cache_position``
+    supplies the live sequence length to FA3 through device-side cumulative
+    lengths, preserving CUDA-graph replay without a host synchronization.
+    Unsupported shapes retain the previously validated SDPA behavior.
+    """
+
+    effective_is_causal = (
+        bool(is_causal)
+        if is_causal is not None
+        else bool(getattr(module, "is_causal", True))
+    )
+    use_fa3 = (
+        query.is_cuda
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.shape[0] == key.shape[0] == value.shape[0] == 1
+        and key.shape == value.shape
+        and query.shape[-1] == key.shape[-1]
+        and query.shape[1] % key.shape[1] == 0
+        and not effective_is_causal
+        and dropout == 0.0
+    )
+    if not use_fa3:
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+            **kwargs,
+        )
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    query_length = query.shape[2]
+    allocated_key_length = key.shape[2]
+    cache_position = kwargs.get("cache_position")
+    if cache_position is None:
+        valid_key_length = torch.scalar_tensor(
+            allocated_key_length,
+            device=query.device,
+            dtype=torch.int32,
+        )
+    else:
+        valid_key_length = cache_position.reshape(-1)[-1].to(dtype=torch.int32) + 1
+    cu_seqlens_q = torch.stack(
+        (valid_key_length.new_zeros(()), valid_key_length.new_tensor(query_length))
+    )
+    cu_seqlens_k = torch.stack((valid_key_length.new_zeros(()), valid_key_length))
+    output = flash_attn_varlen_func(
+        query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1]),
+        key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1]),
+        value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1]),
+        query_length,
+        cu_seqlens_q,
+        allocated_key_length,
+        cu_seqlens_k,
+        dropout_p=dropout,
+        softmax_scale=scaling,
+        causal=False,
+        fa_version=3,
+    )
+    return output.view(1, query_length, query.shape[1], query.shape[-1]), None
+
+
+AttentionInterface.register(
+    "alpamayo_fa3", alpamayo_flash_attention_3_forward
+)
 
 
 class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
@@ -77,9 +169,14 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         from alpamayo2_super.models.expert import ExpertModel, ExpertModelConfig
 
         expert_config = ExpertModelConfig(**copy.deepcopy(self.alpamayo_config.expert_config))
-        # A non-causal 4D mask is required by the diffusion suffix. HF SDPA
-        # supports it without requiring the separately packaged flash-attn.
-        expert_config.llm_config._attn_implementation = "sdpa"
+        policy_config = self.alpamayo_config.policy_server_config or {}
+        if hasattr(policy_config, "model_dump"):
+            policy_config = policy_config.model_dump()
+        elif not isinstance(policy_config, Mapping):
+            policy_config = vars(policy_config)
+        expert_config.llm_config._attn_implementation = str(
+            policy_config.get("expert_attention_backend", "sdpa")
+        )
         self.expert = ExpertModel(
             expert_config,
             dtype=vllm_config.model_config.dtype,
