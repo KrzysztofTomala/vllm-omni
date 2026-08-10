@@ -78,6 +78,28 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             )
         return frame_tensor, camera_indices, frames_per_camera
 
+    @staticmethod
+    def _future_tensor(name: str, value: Any) -> torch.Tensor:
+        tensor = torch.as_tensor(value)
+        if name == "ego_future_xyz":
+            if tensor.ndim == 2:
+                return tensor.unsqueeze(0).unsqueeze(0)
+            if tensor.ndim == 3:
+                return tensor.unsqueeze(1)
+            if tensor.ndim == 4:
+                return tensor
+        else:
+            if tensor.ndim == 3:
+                return tensor.unsqueeze(0).unsqueeze(0)
+            if tensor.ndim == 4:
+                return tensor.unsqueeze(1)
+            if tensor.ndim == 5:
+                return tensor
+        raise ValueError(
+            f"{name} has incompatible shape {tuple(tensor.shape)}; expected a "
+            "future trajectory with optional batch and trajectory dimensions"
+        )
+
     def _policy_prompt(self, observation: Mapping[str, Any]) -> tuple[list[int], list[torch.Tensor]]:
         from alpamayo2_super.helper import create_messages
         from alpamayo2_super.models.utils import fuse_traj_tokens
@@ -140,7 +162,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 self.policy_config.get("manual_action_cudagraph", False)
             ),
             "_static_expert_cache_max_len": int(
-                self.policy_config.get("static_expert_cache_max_len", 4800)
+                self.policy_config.get("static_expert_cache_max_len", 5120)
             ),
         }
         return OpenPIEngineRequest(
@@ -190,5 +212,94 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 "multi_modal_data": {"image": list(frames.flatten(0, 1))},
             },
             sampling_params=SamplingParams(max_tokens=256),
+            request_id=request_id,
+        )
+
+    def build_text_task_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        task: str,
+        request_id: str,
+        question: str | None = None,
+        future_xyz: Any | None = None,
+        future_rot: Any | None = None,
+    ) -> OpenPIEngineRequest:
+        """Build a released Super text-task request for the shared VLM stage."""
+        from alpamayo2_super.models.utils import fuse_traj_tokens
+        from alpamayo2_super.text_tasks import (
+            DEFAULT_GROUNDING_QUESTION,
+            build_text_task_messages,
+        )
+
+        if task not in {"meta_action", "auto_labeling", "grounding"}:
+            raise ValueError(f"Unsupported Alpamayo text task: {task!r}")
+        frames, camera_indices, _ = self._frames(observation)
+        prompt_task = "vqa" if task == "grounding" else task
+        data: dict[str, Any] = {
+            "image_frames": frames,
+            "camera_indices": camera_indices,
+        }
+        if task == "grounding":
+            data["question"] = (question or DEFAULT_GROUNDING_QUESTION).strip()
+        else:
+            data["ego_history_xyz"] = torch.as_tensor(
+                observation["ego_history_xyz"]
+            )
+            data["ego_history_rot"] = torch.as_tensor(observation["ego_history_rot"])
+        if task == "auto_labeling":
+            if future_xyz is None or future_rot is None:
+                raise ValueError("auto_labeling requires future_xyz and future_rot")
+            data["ego_future_xyz"] = self._future_tensor(
+                "ego_future_xyz", future_xyz
+            )
+            data["ego_future_rot"] = self._future_tensor(
+                "ego_future_rot", future_rot
+            )
+
+        messages = build_text_task_messages(data, self.model_config, prompt_task)
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_ids = torch.tensor([self.tokenizer.encode(prompt)])
+        if task != "grounding":
+            trajectory_data = {
+                "ego_history_xyz": data["ego_history_xyz"],
+                "ego_history_rot": data["ego_history_rot"],
+            }
+            if task == "auto_labeling":
+                trajectory_data.update(
+                    ego_future_xyz=data["ego_future_xyz"],
+                    ego_future_rot=data["ego_future_rot"],
+                )
+            prompt_ids = fuse_traj_tokens(
+                self.history_tokenizer,
+                self.future_tokenizer,
+                prompt_ids,
+                trajectory_data,
+                self.model_config.traj_ids,
+            )
+
+        stop_token_ids = None
+        if task == "meta_action":
+            stop_token_ids = [int(self.model_config.traj_ids["future_start"])]
+        return OpenPIEngineRequest(
+            prompt={
+                "prompt_token_ids": prompt_ids[0].tolist(),
+                "multi_modal_data": {"image": list(frames.flatten(0, 1))},
+                "multi_modal_uuids": {
+                    "image": [
+                        f"{request_id}:image:{index}"
+                        for index in range(frames.shape[0] * frames.shape[1])
+                    ]
+                },
+                "mm_processor_kwargs": {"device": "cuda"},
+            },
+            sampling_params=SamplingParams(
+                max_tokens=1024 if task == "auto_labeling" else 512,
+                stop_token_ids=stop_token_ids,
+            ),
             request_id=request_id,
         )

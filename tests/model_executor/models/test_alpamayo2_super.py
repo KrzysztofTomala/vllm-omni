@@ -14,6 +14,9 @@ from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
 from vllm_omni.model_executor.models.alpamayo2_super.configuration_alpamayo2_super import (
     Alpamayo2SuperConfig,
 )
+from vllm_omni.model_executor.models.alpamayo2_super.openpi import (
+    Alpamayo2SuperOpenPIRequestAdapter,
+)
 from vllm_omni.model_executor.models.alpamayo2_super.pipeline import (
     ALPAMAYO2_SUPER_PIPELINE,
 )
@@ -211,3 +214,22 @@ def test_super_policy_masks_text_eos_until_action_boundary(monkeypatch) -> None:
     assert torch.all(result[..., [1, 2]] == -torch.inf)
     assert torch.all(result[..., 4:7] == -torch.inf)
     assert result[..., 3].item() == 0
+
+
+def test_super_text_adapter_normalizes_unbatched_future_trajectory() -> None:
+    xyz = Alpamayo2SuperOpenPIRequestAdapter._future_tensor(
+        "ego_future_xyz", torch.zeros(64, 3)
+    )
+    rotations = Alpamayo2SuperOpenPIRequestAdapter._future_tensor(
+        "ego_future_rot", torch.eye(3).repeat(64, 1, 1)
+    )
+
+    assert xyz.shape == (1, 1, 64, 3)
+    assert rotations.shape == (1, 1, 64, 3, 3)
+
+
+def test_super_text_adapter_rejects_invalid_future_shape() -> None:
+    with pytest.raises(ValueError, match="incompatible shape"):
+        Alpamayo2SuperOpenPIRequestAdapter._future_tensor(
+            "ego_future_xyz", torch.zeros(64)
+        )
