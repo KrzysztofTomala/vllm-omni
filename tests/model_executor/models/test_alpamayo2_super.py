@@ -89,7 +89,7 @@ def test_super_gathers_standard_paged_kv_layout() -> None:
     block_table = torch.tensor([2, 0, 1])
 
     gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
-        [cache], block_table, seq_len=5
+        [cache], block_table, seq_len=5, target_dtype=torch.float32
     )
 
     expected_key = cache[0].index_select(0, block_table).flatten(0, 1)[:5]
@@ -115,7 +115,7 @@ def test_super_gathers_v026_packed_paged_kv_layout() -> None:
     block_table = torch.tensor([2, 0, 1])
 
     gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
-        [cache], block_table, seq_len=5
+        [cache], block_table, seq_len=5, target_dtype=torch.float32
     )
 
     expected_key = key.index_select(0, block_table).permute(0, 2, 1, 3)
@@ -127,6 +127,40 @@ def test_super_gathers_v026_packed_paged_kv_layout() -> None:
     torch.testing.assert_close(
         gathered.layers[0].values,
         expected_value.flatten(0, 1)[:5].transpose(0, 1).unsqueeze(0),
+    )
+
+
+def test_super_dequantizes_raw_fp8_paged_cache_for_expert(
+    monkeypatch,
+) -> None:
+    key = torch.tensor(
+        [[[[1.0, -2.0], [0.5, 4.0]]], [[[3.0, -1.0], [2.0, 0.25]]]],
+        dtype=torch.float8_e4m3fn,
+    )
+    value = torch.tensor(
+        [[[[-1.0, 2.0], [-0.5, -4.0]]], [[[-3.0, 1.0], [-2.0, -0.25]]]],
+        dtype=torch.float8_e4m3fn,
+    )
+    cache = torch.cat((key, value), dim=-1).view(torch.uint8)
+    block_table = torch.tensor([1, 0])
+    monkeypatch.setenv("NIM_ALPAMAYO_FP8_EXPERT_KV_CAST", "1")
+
+    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
+        [cache],
+        block_table,
+        seq_len=3,
+        target_dtype=torch.bfloat16,
+    )
+
+    expected_key = key.index_select(0, block_table).permute(0, 2, 1, 3)
+    expected_value = value.index_select(0, block_table).permute(0, 2, 1, 3)
+    torch.testing.assert_close(
+        gathered.layers[0].keys,
+        expected_key.flatten(0, 1)[:3].transpose(0, 1).unsqueeze(0).bfloat16(),
+    )
+    torch.testing.assert_close(
+        gathered.layers[0].values,
+        expected_value.flatten(0, 1)[:3].transpose(0, 1).unsqueeze(0).bfloat16(),
     )
 
 
