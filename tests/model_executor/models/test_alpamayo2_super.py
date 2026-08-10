@@ -10,6 +10,7 @@ from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
+    alpamayo_flash_attention_3_forward,
 )
 from vllm_omni.model_executor.models.alpamayo2_super.configuration_alpamayo2_super import (
     Alpamayo2SuperConfig,
@@ -179,6 +180,35 @@ def test_super_fixed_action_mask_rejects_short_cache() -> None:
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
         )
+
+
+def test_super_flash_attention_3_falls_back_for_cpu(monkeypatch) -> None:
+    expected = torch.randn(1, 2, 4, 3)
+    calls = []
+
+    def fake_sdpa(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected, None
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super."
+        "sdpa_attention_forward",
+        fake_sdpa,
+    )
+    query = torch.randn(1, 4, 2, 3)
+    key = torch.randn(1, 2, 5, 3)
+    output, weights = alpamayo_flash_attention_3_forward(
+        SimpleNamespace(),
+        query,
+        key,
+        key,
+        None,
+        is_causal=False,
+    )
+
+    assert output is expected
+    assert weights is None
+    assert len(calls) == 1
 
 
 def test_super_policy_does_not_export_vlm_hidden_prefix() -> None:
