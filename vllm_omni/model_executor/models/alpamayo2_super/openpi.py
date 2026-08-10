@@ -62,6 +62,33 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         )
 
     @staticmethod
+    def _vision_cache_enabled() -> bool:
+        return os.getenv("NIM_ALPAMAYO_VISION_EMBED_CACHE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _image_uuids(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        request_id: str,
+        image_count: int,
+    ) -> list[str]:
+        if not self._vision_cache_enabled():
+            return [f"{request_id}:image:{index}" for index in range(image_count)]
+        image_uuids = observation.get("image_uuids")
+        if not isinstance(image_uuids, list) or len(image_uuids) != image_count:
+            uuid_count = len(image_uuids) if isinstance(image_uuids, list) else 0
+            raise ValueError(
+                "Vision embedding caching requires one content UUID per image; "
+                f"got {uuid_count} IDs for {image_count} images."
+            )
+        return [str(image_uuid) for image_uuid in image_uuids]
+
+    @staticmethod
     def _frames(observation: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, int]:
         frames = observation.get("image_frames", observation.get("images"))
         if frames is None:
@@ -73,9 +100,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         camera_indices = torch.as_tensor(observation["camera_indices"], dtype=torch.int64)
         frames_per_camera = int(observation.get("num_frames_per_camera", 4))
         if frame_tensor.ndim == 4:
-            frame_tensor = frame_tensor.unflatten(
-                0, (camera_indices.numel(), frames_per_camera)
-            )
+            frame_tensor = frame_tensor.unflatten(0, (camera_indices.numel(), frames_per_camera))
         return frame_tensor, camera_indices, frames_per_camera
 
     def _policy_prompt(self, observation: Mapping[str, Any]) -> tuple[list[int], list[torch.Tensor]]:
@@ -132,23 +157,21 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "num_traj_samples": int(self.policy_config.get("num_trajectory_samples", 1)),
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
             "_sampling_seed": int(self.policy_config.get("seed", 42)),
-            "_static_expert_cache": bool(
-                self.policy_config.get("static_expert_cache", False)
-            ),
+            "_static_expert_cache": bool(self.policy_config.get("static_expert_cache", False)),
             "_compile_expert": bool(self.policy_config.get("compile_actions", False)),
-            "_manual_action_cudagraph": bool(
-                self.policy_config.get("manual_action_cudagraph", False)
-            ),
-            "_static_expert_cache_max_len": int(
-                self.policy_config.get("static_expert_cache_max_len", 4800)
-            ),
+            "_manual_action_cudagraph": bool(self.policy_config.get("manual_action_cudagraph", False)),
+            "_static_expert_cache_max_len": int(self.policy_config.get("static_expert_cache_max_len", 4800)),
         }
         return OpenPIEngineRequest(
             prompt={
                 "prompt_token_ids": prompt_ids,
                 "multi_modal_data": {"image": images},
                 "multi_modal_uuids": {
-                    "image": [f"{request_id}:image:{index}" for index in range(len(images))]
+                    "image": self._image_uuids(
+                        observation,
+                        request_id=request_id,
+                        image_count=len(images),
+                    )
                 },
                 "mm_processor_kwargs": {"device": "cuda"},
             },
@@ -181,14 +204,22 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "question": question,
         }
         messages = build_text_task_messages(data, self.model_config, "vqa")
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        engine_prompt = {
+            "prompt": prompt,
+            "multi_modal_data": {"image": list(frames.flatten(0, 1))},
+        }
+        if self._vision_cache_enabled():
+            image_count = int(frames.flatten(0, 1).shape[0])
+            engine_prompt["multi_modal_uuids"] = {
+                "image": self._image_uuids(
+                    observation,
+                    request_id=request_id,
+                    image_count=image_count,
+                )
+            }
         return OpenPIEngineRequest(
-            prompt={
-                "prompt": prompt,
-                "multi_modal_data": {"image": list(frames.flatten(0, 1))},
-            },
+            prompt=engine_prompt,
             sampling_params=SamplingParams(max_tokens=256),
             request_id=request_id,
         )
