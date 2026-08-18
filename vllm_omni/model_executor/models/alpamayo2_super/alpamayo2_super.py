@@ -214,6 +214,11 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return int(self.alpamayo_config.traj_ids["future_start"])
 
     @property
+    def speculation_terminal_token_id(self) -> int:
+        """Token after which EAGLE must yield to the normal action step."""
+        return self.future_start_id
+
+    @property
     def future_end_id(self) -> int:
         return int(self.alpamayo_config.traj_ids["future_end"])
 
@@ -528,7 +533,17 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         observation: Mapping[str, Any],
         extra_args: Mapping[str, Any],
     ) -> dict[str, torch.Tensor]:
-        device = caches[0].device
+        # With a draft model, vLLM appends the drafter's KV cache to the
+        # verifier caches exposed by the runner. The action expert mirrors the
+        # verifier depth and must never consume those additional draft layers.
+        num_prefix_layers = int(self.expert.expert.config.num_hidden_layers)
+        if len(caches) < num_prefix_layers:
+            raise RuntimeError(
+                "Alpamayo 2 Super received fewer verifier KV-cache layers "
+                f"than expected: {len(caches)} < {num_prefix_layers}"
+            )
+        verifier_caches = caches[:num_prefix_layers]
+        device = verifier_caches[0].device
         profile_action = bool(extra_args.get("_profile_action", False)) and device.type == "cuda"
         profile_events: list[torch.cuda.Event] = []
 
@@ -547,7 +562,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         prefix = self._repeat_cache(
             self._gather_prefix_cache(
-                caches,
+                verifier_caches,
                 block_table,
                 seq_len,
                 self.expert.action_out_proj.weight.dtype,
@@ -751,7 +766,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         trigger = (
             observation is not None
             and input_ids is not None
-            and bool(torch.any(input_ids == self.future_start_id))
+            # A speculative verification block can contain an unaccepted
+            # future_start after its first token. After acceptance, the
+            # scheduler feeds future_start back as the first real token of a
+            # decode step. CUDA-graph padding means ``numel()`` can still be
+            # greater than one, so key the boundary off the first token.
+            and input_ids.numel() > 0
+            and int(input_ids.reshape(-1)[0]) == self.future_start_id
         )
         multimodal_outputs: dict[str, torch.Tensor] = {}
         if trigger:
@@ -769,11 +790,20 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 extra_args=extra,
             )
             self._force_future_end = True
-        text_hidden_states = hidden_states[0] if isinstance(hidden_states, (list, tuple)) else hidden_states
-        return OmniOutput(
+        aux_hidden_states = None
+        if isinstance(hidden_states, (list, tuple)):
+            text_hidden_states = hidden_states[0]
+            if len(hidden_states) == 2:
+                aux_hidden_states = hidden_states[1]
+        else:
+            text_hidden_states = hidden_states
+        omni_output = OmniOutput(
             text_hidden_states=text_hidden_states,
             multimodal_outputs=multimodal_outputs,
         )
+        if aux_hidden_states is not None:
+            return omni_output, aux_hidden_states
+        return omni_output
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor:
         if isinstance(hidden_states, OmniOutput):
