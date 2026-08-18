@@ -1276,7 +1276,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if self.is_pooling_model:
                 multimodal_outputs = None
             else:
-                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                # EAGLE3 models return ``(target_output, aux_hidden_states)``.
+                # Extract the Omni payload from the target output after unpacking
+                # so the auxiliary states remain available to the drafter.
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
@@ -2053,6 +2056,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
+        terminal_token_id = getattr(self.model, "speculation_terminal_token_id", None)
+        speculation_terminal_sampled = terminal_token_id is not None and bool(
+            torch.any(sampler_output.sampled_token_ids == terminal_token_id)
+        )
+
         self._draft_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
@@ -2087,7 +2095,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer | Gemma4Proposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
-                if input_fits_in_drafter:
+                if speculation_terminal_sampled:
+                    # The accepted terminal token must be the sole input on
+                    # the next target step so model-owned action generation
+                    # cannot run on unaccepted draft tokens.
+                    pass
+                elif input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
