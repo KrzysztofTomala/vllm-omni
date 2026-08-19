@@ -24,12 +24,37 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
+    _mask_model_owned_terminal_drafts,
 )
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_mask_model_owned_terminal_drafts() -> None:
+    draft_token_ids = torch.tensor([[5, 17, 9], [17, 17, 4]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, 17)
+
+    assert draft_token_ids.tolist() == [[5, 0, 9], [0, 0, 4]]
+
+
+def test_mask_model_owned_terminal_drafts_is_noop_without_terminal() -> None:
+    draft_token_ids = torch.tensor([[5, 17, 9]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, None)
+
+    assert draft_token_ids.tolist() == [[5, 17, 9]]
+
+
+def test_mask_model_owned_terminal_drafts_handles_zero_terminal() -> None:
+    draft_token_ids = torch.tensor([[5, 0, 9]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, 0)
+
+    assert draft_token_ids.tolist() == [[5, 1, 9]]
 
 
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
