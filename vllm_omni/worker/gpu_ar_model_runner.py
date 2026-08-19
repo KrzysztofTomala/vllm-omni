@@ -65,6 +65,19 @@ from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 logger = init_logger(__name__)
 
 
+def _mask_model_owned_terminal_drafts(
+    draft_token_ids: torch.Tensor,
+    terminal_token_id: int | None,
+) -> None:
+    """Force model-owned terminal boundaries onto the verifier path."""
+    if terminal_token_id is not None:
+        replacement_token_id = int(terminal_token_id == 0)
+        draft_token_ids.masked_fill_(
+            draft_token_ids == terminal_token_id,
+            replacement_token_id,
+        )
+
+
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     if tensor.device.type == "cpu":
@@ -2054,7 +2067,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
-        terminal_token_id = getattr(self.model, "speculation_terminal_token_id", None)
+        terminal_token_id = getattr(
+            getattr(self, "model", None),
+            "speculation_terminal_token_id",
+            None,
+        )
         speculation_terminal_sampled = terminal_token_id is not None and bool(
             torch.any(sampler_output.sampled_token_ids == terminal_token_id)
         )
@@ -2077,6 +2094,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
+                )
+                # Model-owned terminal tokens (for example Alpamayo's
+                # future_start action boundary) must be emitted by the
+                # verifier as the recovery/bonus token. If the drafter
+                # proposes and the verifier accepts the boundary, it is
+                # consumed inside the verification block and is not replayed
+                # as the next one-token model step, so the model-owned
+                # terminal hook cannot run.
+                _mask_model_owned_terminal_drafts(
+                    self._draft_token_ids,
+                    terminal_token_id,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
