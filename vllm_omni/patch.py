@@ -25,6 +25,16 @@ from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
+# The released Alpamayo 1.5 W4A16 checkpoint uses ModelOpt's AWQ export
+# format, which is not recognized by the pinned vLLM release. Install the
+# format adapter before ModelConfig normalizes the checkpoint quantization
+# metadata or constructs its linear layers.
+from vllm_omni.model_executor.layers.quantization.modelopt_awq import (
+    install_modelopt_w4a16_awq_patch,
+)
+
+install_modelopt_w4a16_awq_patch()
+
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
 # =============================================================================
