@@ -8,6 +8,8 @@ from typing import Any
 
 from transformers import Qwen3VLConfig
 
+from .tokenizer import resolve_backbone_path
+
 
 class Alpamayo1_5Config(Qwen3VLConfig):
     """Expose Alpamayo's external Qwen3-VL backbone to vLLM.
@@ -45,6 +47,7 @@ class Alpamayo1_5Config(Qwen3VLConfig):
         max_pixels: int = 196608,
         **kwargs: Any,
     ) -> None:
+        vlm_name_or_path = resolve_backbone_path(vlm_name_or_path)
         if text_config is None or vision_config is None:
             backbone = Qwen3VLConfig.from_pretrained(vlm_name_or_path)
             text_config = text_config or backbone.text_config.to_dict()

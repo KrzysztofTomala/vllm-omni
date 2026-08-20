@@ -370,7 +370,9 @@ class OmniEngineArgs(EngineArgs):
                 backbone = config_dict.get("vlm_name_or_path", backbone)
             except Exception as exc:
                 logger.warning("Could not inspect Alpamayo backbone config: %s", exc)
-            self.tokenizer = ensure_extended_tokenizer(backbone)
+            self.tokenizer = ensure_extended_tokenizer(
+                backbone, model_path=self.model
+            )
             logger.info("Using extended Alpamayo tokenizer at %s", self.tokenizer)
 
         # Build the vLLM config first, then use it to create the Omni config.

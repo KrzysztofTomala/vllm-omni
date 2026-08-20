@@ -19,6 +19,9 @@ from vllm_omni.model_executor.models.alpamayo1_5.processing import (
     extend_tokenizer,
     fuse_history_tokens,
 )
+from vllm_omni.model_executor.models.alpamayo1_5.tokenizer import (
+    resolve_backbone_path,
+)
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -97,6 +100,18 @@ def test_tokenizer_extension_matches_checkpoint_ids():
         "history": 155684,
         "future": 155685,
     }
+
+
+def test_bundled_backbone_is_preferred_for_offline_workspace(tmp_path):
+    policy = tmp_path / "alpamayo"
+    backbone = tmp_path / "cosmos-reason2"
+    policy.mkdir()
+    backbone.mkdir()
+    (backbone / "config.json").write_text("{}", encoding="utf-8")
+
+    assert resolve_backbone_path(
+        "nvidia/Cosmos-Reason2-8B", model_path=policy
+    ) == str(backbone)
 
 
 def test_history_delta_encoding_and_fusion():
