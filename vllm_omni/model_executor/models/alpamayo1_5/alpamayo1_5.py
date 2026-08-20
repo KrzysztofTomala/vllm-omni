@@ -531,6 +531,8 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             timing_events[4].record()
             timing_events[4].synchronize()
         result = {
+            "pred_trajectories": xyz,
+            "pred_rotations": rotation,
             "actions": xyz,
             "rotations": rotation,
             "normalized_controls": action,
@@ -544,7 +546,7 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
         if profile:
             # KV extraction, sampler setup, expert integration, trajectory decode.
-            result["profile_timings_ms"] = torch.tensor(
+            result["action_profile_ms"] = torch.tensor(
                 [timing_events[index].elapsed_time(timing_events[index + 1]) for index in range(4)],
                 device=history.device,
                 dtype=torch.float32,
