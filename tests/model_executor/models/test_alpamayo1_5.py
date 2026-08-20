@@ -10,6 +10,7 @@ from torch import nn
 from vllm_omni.model_executor.models.alpamayo1_5.alpamayo1_5 import (
     Alpamayo1_5ForConditionalGeneration,
     Alpamayo1_5ProcessingInfo,
+    alpamayo1_5_flash_attention_3_forward,
 )
 from vllm_omni.model_executor.models.alpamayo1_5.processing import (
     SPECIAL_TOKENS,
@@ -48,6 +49,35 @@ class _FakeTokenizer:
 
     def __len__(self):
         return len(self.tokens)
+
+
+def test_alpamayo1_5_flash_attention_3_falls_back_for_cpu(monkeypatch):
+    expected = torch.randn(1, 2, 4, 3)
+    calls = []
+
+    def fake_sdpa(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected, None
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.alpamayo1_5.alpamayo1_5."
+        "sdpa_attention_forward",
+        fake_sdpa,
+    )
+    query = torch.randn(1, 4, 2, 3)
+    key = torch.randn(1, 2, 5, 3)
+    output, weights = alpamayo1_5_flash_attention_3_forward(
+        SimpleNamespace(),
+        query,
+        key,
+        key,
+        None,
+        is_causal=False,
+    )
+
+    assert output is expected
+    assert weights is None
+    assert len(calls) == 1
 
 
 def test_processing_info_uses_vllm_processor_cache(monkeypatch):
