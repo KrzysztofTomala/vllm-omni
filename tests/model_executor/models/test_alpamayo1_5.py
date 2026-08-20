@@ -158,6 +158,31 @@ def test_gather_prefix_cache_preserves_block_order():
     assert gathered.layers[0].values.flatten().tolist() == [102.0, 103.0, 100.0]
 
 
+def test_gather_prefix_cache_supports_fa3_packed_layout():
+    blocks, kv_heads, block_size, head_dim = 3, 2, 2, 3
+    key = torch.arange(
+        blocks * kv_heads * block_size * head_dim, dtype=torch.float32
+    ).reshape(blocks, kv_heads, block_size, head_dim)
+    value = key + 1000
+    paged_cache = torch.cat((key, value), dim=-1)
+    block_table = torch.tensor([2, 0, 1])
+
+    gathered = Alpamayo1_5ForConditionalGeneration._gather_prefix_cache(
+        [paged_cache], block_table, seq_len=5
+    )
+
+    expected_key = key.index_select(0, block_table).permute(0, 2, 1, 3)
+    expected_value = value.index_select(0, block_table).permute(0, 2, 1, 3)
+    torch.testing.assert_close(
+        gathered.layers[0].keys,
+        expected_key.flatten(0, 1)[:5].transpose(0, 1).unsqueeze(0),
+    )
+    torch.testing.assert_close(
+        gathered.layers[0].values,
+        expected_value.flatten(0, 1)[:5].transpose(0, 1).unsqueeze(0),
+    )
+
+
 def test_static_action_cache_refreshes_prefix_and_rewinds_cursor():
     source_layer = SimpleNamespace(
         keys=torch.tensor([[[[1.0], [2.0]]]]),
