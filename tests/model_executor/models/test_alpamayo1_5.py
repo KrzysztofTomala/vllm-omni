@@ -10,6 +10,7 @@ from torch import nn
 from vllm_omni.model_executor.models.alpamayo1_5.alpamayo1_5 import (
     Alpamayo1_5ForConditionalGeneration,
     Alpamayo1_5ProcessingInfo,
+    _partition_checkpoint_weights,
     alpamayo1_5_flash_attention_3_forward,
 )
 from vllm_omni.model_executor.models.alpamayo1_5.processing import (
@@ -26,6 +27,39 @@ from vllm_omni.model_executor.models.alpamayo1_5.tokenizer import (
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_partition_bf16_checkpoint_weights_strips_vlm_prefix():
+    tensor = torch.zeros(1)
+    vlm, local = _partition_checkpoint_weights(
+        [
+            ("vlm.model.layers.0.weight", tensor),
+            ("expert.layers.0.weight", tensor),
+        ],
+        split_quantized_vlm=False,
+    )
+
+    assert [name for name, _ in vlm] == ["model.layers.0.weight"]
+    assert [name for name, _ in local] == ["expert.layers.0.weight"]
+
+
+def test_partition_split_quantized_checkpoint_ignores_policy_vlm_tensors():
+    tensor = torch.zeros(1)
+    vlm, local = _partition_checkpoint_weights(
+        [
+            ("vlm.model.layers.0.weight", tensor),
+            ("model.layers.0.weight", tensor),
+            ("lm_head.weight", tensor),
+            ("expert.layers.0.weight", tensor),
+        ],
+        split_quantized_vlm=True,
+    )
+
+    assert [name for name, _ in vlm] == [
+        "model.layers.0.weight",
+        "lm_head.weight",
+    ]
+    assert [name for name, _ in local] == ["expert.layers.0.weight"]
 
 
 class _FakeTokenizer:

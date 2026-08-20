@@ -122,6 +122,31 @@ AttentionInterface.register(
 )
 
 
+def _partition_checkpoint_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], *, split_quantized_vlm: bool
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    """Separate the Qwen backbone from the Alpamayo-owned action modules.
+
+    Quantized NIM profiles combine symlinked ModelOpt VLM shards with policy
+    shards. Safetensors names come from shard headers, not from the rewritten
+    index: ModelOpt tensors therefore remain unprefixed while policy tensors
+    retain ``vlm.``. In this mode the latter are stale BF16 backbone tensors
+    co-located with the action expert and must be ignored.
+    """
+
+    vlm_weights: list[tuple[str, torch.Tensor]] = []
+    local_weights: list[tuple[str, torch.Tensor]] = []
+    for name, weight in weights:
+        if split_quantized_vlm:
+            if name.startswith(("model.", "lm_head.")):
+                vlm_weights.append((name, weight))
+        elif name.startswith("vlm."):
+            vlm_weights.append((name.removeprefix("vlm."), weight))
+        if name.startswith(("expert.", "action_in_proj.", "action_out_proj.")):
+            local_weights.append((name, weight))
+    return vlm_weights, local_weights
+
+
 class Alpamayo1_5ProcessingInfo(Qwen3VLProcessingInfo):
     """Load visual preprocessing from Cosmos rather than the policy repo."""
 
@@ -177,6 +202,7 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._split_quantized_vlm = getattr(vllm_config, "quant_config", None) is not None
         self.alpamayo_config = vllm_config.model_config.hf_config
         expert_config = copy.deepcopy(self.alpamayo_config.text_config)
         for key, value in self.alpamayo_config.expert_cfg.items():
@@ -746,13 +772,9 @@ class Alpamayo1_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        vlm_weights: list[tuple[str, torch.Tensor]] = []
-        local_weights: list[tuple[str, torch.Tensor]] = []
-        for name, weight in weights:
-            if name.startswith("vlm."):
-                vlm_weights.append((name.removeprefix("vlm."), weight))
-            elif name.startswith(("expert.", "action_in_proj.", "action_out_proj.")):
-                local_weights.append((name, weight))
+        vlm_weights, local_weights = _partition_checkpoint_weights(
+            weights, split_quantized_vlm=self._split_quantized_vlm
+        )
         loaded = set(super().load_weights(vlm_weights))
         parameters = dict(self.named_parameters())
         for name, weight in local_weights:
