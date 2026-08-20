@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,7 +16,12 @@ from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
 
-from .processing import create_policy_messages, fuse_history_tokens, get_observation_history
+from .processing import (
+    create_policy_messages,
+    create_vqa_messages,
+    fuse_history_tokens,
+    get_observation_history,
+)
 from .tokenizer import ensure_extended_tokenizer
 
 
@@ -42,6 +48,33 @@ class AlpamayoOpenPIRequestAdapter:
         self.policy_config = policy_config
         tokenizer_path = ensure_extended_tokenizer(policy_config.get("tokenizer_backbone", "nvidia/Cosmos-Reason2-8B"))
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    @staticmethod
+    def _vision_cache_enabled() -> bool:
+        return os.getenv("NIM_ALPAMAYO_VISION_EMBED_CACHE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _image_uuids(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        request_id: str,
+        image_count: int,
+    ) -> list[str]:
+        if not self._vision_cache_enabled():
+            return [f"{request_id}:image:{index}" for index in range(image_count)]
+        image_uuids = observation.get("image_uuids")
+        if not isinstance(image_uuids, list) or len(image_uuids) != image_count:
+            uuid_count = len(image_uuids) if isinstance(image_uuids, list) else 0
+            raise ValueError(
+                "Vision embedding caching requires one content UUID per image; "
+                f"got {uuid_count} IDs for {image_count} images."
+            )
+        return [str(image_uuid) for image_uuid in image_uuids]
 
     def build_request(
         self,
@@ -114,9 +147,67 @@ class AlpamayoOpenPIRequestAdapter:
                 "multi_modal_data": {"image": images},
                 # Live frames must miss the multimodal cache. Explicit IDs
                 # avoid hashing the decoded RGB tensors to prove uniqueness.
-                "multi_modal_uuids": {"image": [f"{request_id}:image:{index}" for index in range(len(images))]},
+                "multi_modal_uuids": {
+                    "image": self._image_uuids(
+                        observation,
+                        request_id=request_id,
+                        image_count=len(images),
+                    )
+                },
                 "mm_processor_kwargs": {"device": "cuda"},
             },
             sampling_params=sampling_params,
+            request_id=request_id,
+        )
+
+    def build_vqa_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        question: str,
+        request_id: str,
+    ) -> OpenPIEngineRequest:
+        """Build the native Alpamayo 1.5 visual-question request."""
+
+        image_frames = observation.get("image_frames", observation.get("images"))
+        if image_frames is None:
+            raise KeyError("Alpamayo observations require 'image_frames' or 'images'")
+        frames = torch.as_tensor(image_frames) if isinstance(image_frames, np.ndarray) else image_frames
+        if isinstance(frames, torch.Tensor):
+            if frames.ndim == 5:
+                frames = frames.flatten(0, 1)
+            if frames.ndim != 4:
+                raise ValueError("Alpamayo image frames must be rank 4 or 5")
+            images = list(frames)
+        else:
+            images = list(frames)
+        camera_indices = observation.get("camera_indices")
+        if isinstance(camera_indices, np.ndarray):
+            camera_indices = camera_indices.tolist()
+        messages = create_vqa_messages(
+            images,
+            question,
+            camera_indices=camera_indices,
+        )
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            continue_final_message=True,
+        )
+        return OpenPIEngineRequest(
+            prompt={
+                "prompt": prompt,
+                "multi_modal_data": {"image": images},
+                "multi_modal_uuids": {
+                    "image": self._image_uuids(
+                        observation,
+                        request_id=request_id,
+                        image_count=len(images),
+                    )
+                },
+                "mm_processor_kwargs": {"device": "cuda"},
+            },
+            sampling_params=SamplingParams(max_tokens=256),
             request_id=request_id,
         )

@@ -78,3 +78,50 @@ def test_alpamayo_openpi_adapter_fast_path_is_opt_in():
     assert request.sampling_params.extra_args["_compile_expert"] is False
     assert request.sampling_params.extra_args["_manual_action_cudagraph"] is False
     assert request.sampling_params.extra_args["_static_expert_cache_max_len"] == 3328
+
+
+def test_alpamayo_openpi_adapter_builds_vqa_request():
+    adapter = object.__new__(AlpamayoOpenPIRequestAdapter)
+    adapter.policy_config = {}
+    adapter.tokenizer = _FakeTokenizer()
+
+    request = adapter.build_vqa_request(
+        {
+            "image_frames": np.zeros((1, 4, 3, 8, 8), dtype=np.uint8),
+            "camera_indices": np.array([1]),
+        },
+        question="What is ahead?",
+        request_id="vqa-3",
+    )
+
+    assert request.request_id == "vqa-3"
+    assert request.prompt["prompt"] == "policy prompt"
+    assert len(request.prompt["multi_modal_data"]["image"]) == 4
+    assert request.prompt["multi_modal_uuids"]["image"] == [
+        f"vqa-3:image:{index}" for index in range(4)
+    ]
+    assert request.sampling_params.max_tokens == 256
+
+
+def test_alpamayo_openpi_adapter_uses_content_ids_when_cache_enabled(monkeypatch):
+    monkeypatch.setenv("NIM_ALPAMAYO_VISION_EMBED_CACHE", "1")
+    adapter = object.__new__(AlpamayoOpenPIRequestAdapter)
+    adapter.policy_config = {}
+    adapter.tokenizer = _FakeTokenizer()
+
+    request = adapter.build_vqa_request(
+        {
+            "image_frames": np.zeros((4, 3, 8, 8), dtype=np.uint8),
+            "camera_indices": [1],
+            "image_uuids": ["frame-0", "frame-1", "frame-2", "frame-3"],
+        },
+        question="What is ahead?",
+        request_id="vqa-cache",
+    )
+
+    assert request.prompt["multi_modal_uuids"]["image"] == [
+        "frame-0",
+        "frame-1",
+        "frame-2",
+        "frame-3",
+    ]
