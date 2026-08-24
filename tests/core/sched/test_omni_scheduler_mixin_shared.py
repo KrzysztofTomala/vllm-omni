@@ -107,3 +107,24 @@ def test_output_helper_preserves_required_nan_counter_default():
     output = scheduler._make_omni_engine_output(request, new_token_ids=[])
 
     assert output.num_nans_in_logits == 0
+
+
+def test_output_helper_emits_spec_decode_metrics_only_on_finish():
+    scheduler = _Scheduler()
+    metrics = SimpleNamespace(num_draft_tokens=7)
+    request = SimpleNamespace(
+        request_id="req-output",
+        trace_headers=None,
+        spec_decode_metrics=metrics,
+        take_events=lambda: [],
+    )
+
+    partial = scheduler._make_omni_engine_output(request, new_token_ids=[1])
+    finished = scheduler._make_omni_engine_output(
+        request,
+        new_token_ids=[2],
+        finish_reason=FinishReason.STOP,
+    )
+
+    assert partial.spec_decode_metrics is None
+    assert finished.spec_decode_metrics is metrics

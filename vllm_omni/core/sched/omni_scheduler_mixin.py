@@ -489,6 +489,7 @@ class OmniSchedulerMixin:
             stop_reason=stop_reason,
             events=request.take_events(),
             prefill_stats=prefill_stats,
+            spec_decode_metrics=(getattr(request, "spec_decode_metrics", None) if finish_reason is not None else None),
             kv_transfer_params=kv_transfer_params,
             trace_headers=request.trace_headers,
             routed_experts=routed_experts,
