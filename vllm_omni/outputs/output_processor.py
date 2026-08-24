@@ -259,6 +259,7 @@ class OmniRequestState(RequestState):
                 finish_reason=str(finish_reason) if finished else None,
                 stop_reason=stop_reason if finished else None,
                 routed_experts=routed_experts,
+                spec_decode_metrics=(self.spec_decode_metrics if finished else None),
             )
         else:
             base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)

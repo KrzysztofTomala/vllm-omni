@@ -448,6 +448,19 @@ def test_no_detokenizer_completion_output():
     assert AUDIO in out.multimodal_output
 
 
+def test_no_detokenizer_completion_preserves_finished_spec_decode_metrics():
+    """Generation stages retain vLLM's final speculative metrics."""
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    metrics = SimpleNamespace(num_draft_tokens=7)
+    state.spec_decode_metrics = metrics
+
+    partial = state._new_completion_output([1], None, None)
+    finished = state._new_completion_output([1, 2], FinishReason.STOP, None)
+
+    assert partial.spec_decode_metrics is None
+    assert finished.spec_decode_metrics is metrics
+
+
 def test_no_detokenizer_make_request_output():
     """make_request_output works without detokenizer when multimodal data is present."""
     s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
