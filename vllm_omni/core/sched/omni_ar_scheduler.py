@@ -495,6 +495,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                request_metrics = getattr(request, "spec_decode_metrics", None)
+                if request_metrics is not None:
+                    adjusted_drafts = num_draft_tokens
+                    if scheduler_output.num_invalid_spec_tokens:
+                        adjusted_drafts -= scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                    request_metrics.observe(
+                        num_draft_tokens=adjusted_drafts,
+                        num_accepted=num_accepted,
+                        detailed=(getattr(self, "spec_decode_metrics_level", "none") == "detailed"),
+                    )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:

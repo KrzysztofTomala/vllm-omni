@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -102,6 +103,7 @@ class _Request:
         self.stop_reason = None
         self.trace_headers = None
         self.num_nans_in_logits = 0
+        self.spec_decode_metrics = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
@@ -145,6 +147,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
         recompute_kv_load_failures=False,
+        spec_decode_metrics_level="summary",
     )
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
@@ -179,6 +182,7 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     be trimmed with them (upstream slices logprobs after the trim)."""
     request = _Request("req")
     request.num_computed_tokens = 8
+    request.spec_decode_metrics = SimpleNamespace(observe=MagicMock())
     scheduler = _make_scheduler_stub([request])
 
     def update_request_trimming(req, token_ids):
@@ -222,6 +226,11 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     assert token_rows.shape[0] == len(output.new_token_ids)
     assert value_rows.shape[0] == len(output.new_token_ids)
     np.testing.assert_array_equal(token_rows[:, 0], [7])
+    request.spec_decode_metrics.observe.assert_called_once_with(
+        num_draft_tokens=2,
+        num_accepted=2,
+        detailed=False,
+    )
 
 
 def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
