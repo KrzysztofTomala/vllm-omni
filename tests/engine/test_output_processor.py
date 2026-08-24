@@ -592,6 +592,20 @@ def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
     assert "r" not in processor.request_states
 
 
+def test_mm_only_terminal_output_preserves_spec_decode_metrics(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+    metrics = SimpleNamespace(num_draft_tokens=7)
+    engine_output = _audio_engine_output(
+        is_segment_finished=False,
+        is_last_chunk=True,
+    )
+    engine_output.spec_decode_metrics = metrics
+
+    result = processor.process_outputs([engine_output])
+
+    assert result.request_outputs[0].outputs[0].spec_decode_metrics is metrics
+
+
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
     output channel (_process_mm_only_outputs) passes, and attaches it to the
