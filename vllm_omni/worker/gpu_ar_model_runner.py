@@ -1209,15 +1209,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
             )
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:
-            cudagraph_mode = CUDAGraphMode.NONE
-            runner_assisted_full_attn = False
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False
-
         runner_assisted_context_enabled = False
         if runner_assisted_full_attn:
             runner_assisted_context_enabled = self._set_runner_assisted_full_attention_metadata_context(
