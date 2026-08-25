@@ -192,3 +192,96 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             sampling_params=SamplingParams(max_tokens=256),
             request_id=request_id,
         )
+
+    @staticmethod
+    def _normalize_future_tensor(value: Any, *, rotations: bool) -> torch.Tensor:
+        tensor = torch.as_tensor(value)
+        unbatched_ndim = 3 if rotations else 2
+        if tensor.ndim == unbatched_ndim:
+            return tensor.unsqueeze(0).unsqueeze(0)
+        if tensor.ndim == unbatched_ndim + 1:
+            return tensor.unsqueeze(1)
+        if tensor.ndim == unbatched_ndim + 2:
+            return tensor
+        kind = "future_rot" if rotations else "future_xyz"
+        raise ValueError(f"{kind} has an unsupported trajectory shape {tuple(tensor.shape)}")
+
+    def build_text_task_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        task: str,
+        request_id: str,
+        question: str | None = None,
+        future_xyz: Any | None = None,
+        future_rot: Any | None = None,
+    ) -> OpenPIEngineRequest:
+        """Build a vLLM request for the released structured text tasks."""
+        from alpamayo2_super.models.utils import fuse_traj_tokens
+        from alpamayo2_super.text_tasks import (
+            DEFAULT_GROUNDING_QUESTION,
+            build_text_task_messages,
+        )
+
+        if task not in {"meta_action", "auto_labeling", "grounding"}:
+            raise ValueError(f"Unsupported Alpamayo 2 Super text task: {task!r}")
+        if (future_xyz is None) != (future_rot is None):
+            raise ValueError("future_xyz and future_rot must be provided together")
+        if task == "auto_labeling" and future_xyz is None:
+            raise ValueError("auto_labeling requires a future trajectory")
+
+        frames, camera_indices, _ = self._frames(observation)
+        data: dict[str, Any] = {
+            "image_frames": frames,
+            "camera_indices": camera_indices,
+        }
+        prompt_task = task
+        if task == "grounding":
+            # Grounding uses the released no-special VQA generation path; the
+            # caller/backend parses the returned Qwen-style bounding-box JSON.
+            prompt_task = "vqa"
+            data["question"] = question or DEFAULT_GROUNDING_QUESTION
+
+        messages = build_text_task_messages(data, self.model_config, prompt_task)
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_ids = torch.tensor([self.tokenizer.encode(prompt)])
+        if task != "grounding":
+            trajectory_data = {
+                "ego_history_xyz": torch.as_tensor(observation["ego_history_xyz"]),
+                "ego_history_rot": torch.as_tensor(observation["ego_history_rot"]),
+            }
+            if task == "auto_labeling":
+                trajectory_data["ego_future_xyz"] = self._normalize_future_tensor(
+                    future_xyz, rotations=False
+                )
+                trajectory_data["ego_future_rot"] = self._normalize_future_tensor(
+                    future_rot, rotations=True
+                )
+            prompt_ids = fuse_traj_tokens(
+                self.history_tokenizer,
+                self.future_tokenizer,
+                prompt_ids,
+                trajectory_data,
+                self.model_config.traj_ids,
+            )
+
+        stop_token_ids = None
+        if task == "meta_action":
+            # The next special token starts policy trajectory generation. Text
+            # tasks stop at that boundary instead of invoking the action expert.
+            stop_token_ids = [int(self.model_config.traj_ids["future_start"])]
+        return OpenPIEngineRequest(
+            prompt={
+                "prompt_token_ids": prompt_ids[0].tolist(),
+                "multi_modal_data": {"image": list(frames.flatten(0, 1))},
+            },
+            sampling_params=SamplingParams(
+                max_tokens=1024 if task == "auto_labeling" else 512,
+                stop_token_ids=stop_token_ids,
+            ),
+            request_id=request_id,
+        )
