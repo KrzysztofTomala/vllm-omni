@@ -184,9 +184,14 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        prompt_ids = self.tokenizer.encode(prompt)
         return OpenPIEngineRequest(
             prompt={
-                "prompt": prompt,
+                # Pass token IDs, as the trajectory path does. Passing the
+                # multimodal chat-template string back through AsyncOmni's
+                # generic prompt parser makes it reinterpret Alpamayo image
+                # placeholders and fails with ``TypeError: must be str, not int``.
+                "prompt_token_ids": prompt_ids,
                 "multi_modal_data": {"image": list(frames.flatten(0, 1))},
             },
             sampling_params=SamplingParams(max_tokens=256),

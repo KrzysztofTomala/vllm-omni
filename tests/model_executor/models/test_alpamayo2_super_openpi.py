@@ -83,6 +83,19 @@ def test_meta_action_request_fuses_history_and_stops_before_policy(text_task_cal
     assert text_task_calls[0][1] == "meta_action"
 
 
+def test_vqa_request_bypasses_generic_string_prompt_parser(text_task_calls):
+    request = _adapter().build_vqa_request(
+        _observation(), question="What is ahead?", request_id="vqa-1"
+    )
+
+    assert "prompt" not in request.prompt
+    assert request.prompt["prompt_token_ids"] == [18, 2]
+    assert len(request.prompt["multi_modal_data"]["image"]) == 4
+    data, task = text_task_calls[0]
+    assert task == "vqa"
+    assert data["question"] == "What is ahead?"
+
+
 def test_auto_labeling_request_normalizes_future_trajectory(text_task_calls):
     request = _adapter().build_text_task_request(
         _observation(),
