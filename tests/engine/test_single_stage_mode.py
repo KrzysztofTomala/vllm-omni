@@ -1224,9 +1224,12 @@ class TestConnectRemoteEngineCoresCoordinator:
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
         omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
-        _, _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        _, core_engines, parallel_config, _, _, launch = mock_wait.call_args.args
         assert core_engines[0].local is False
         assert parallel_config.data_parallel_size_local == 0
+        assert launch.engine_manager is None
+        assert launch.coordinator is None
+        assert launch.addresses is resources.addresses
 
 
 class TestLaunchOmniCoreEngines:

@@ -82,6 +82,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
         context = get_mp_context()
         common_kwargs: dict[str, object] = {
             "vllm_config": vllm_config,

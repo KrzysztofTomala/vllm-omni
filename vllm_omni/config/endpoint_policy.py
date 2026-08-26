@@ -8,7 +8,8 @@ from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from vllm.entrypoints.serve.utils.error_response import create_error_response
+from starlette.routing import Route
+from vllm.entrypoints.serve import create_error_response
 
 
 class RouteTarget(NamedTuple):
@@ -62,6 +63,22 @@ def build_rejection_handler(reason: str):
     return rejection_handler
 
 
+def remove_route_from_app(
+    app: FastAPI,
+    path: str,
+    methods: frozenset[str] | set[str] | None = None,
+) -> None:
+    """Remove matching routes without importing the full serving stack."""
+    routes_to_remove = []
+    for route in app.routes:
+        if isinstance(route, Route) and route.path == path:
+            if methods is None or (route.methods and route.methods & methods):
+                routes_to_remove.append(route)
+
+    for route in routes_to_remove:
+        app.routes.remove(route)
+
+
 def shutdown_unsupported_routes(
     app: FastAPI,
     endpoint_restrictions: tuple[EndpointRestriction, ...],
@@ -69,8 +86,6 @@ def shutdown_unsupported_routes(
     """Given an initialized FastAPI server instance and a set of model specific endpoint
     restrictions, remove the restricted routes and patch a handler that returns 400.
     """
-    from vllm_omni.entrypoints.openai.api_server import _remove_route_from_app
-
     # Generally these should not overlap since there is no point. If they do,
     # we use the reason message in UNSUPPORTED_ROUTES, for consistent error messages.
     restricted_endpoints = (*endpoint_restrictions, *UNSUPPORTED_ROUTES)
@@ -78,7 +93,7 @@ def shutdown_unsupported_routes(
     for end_restrict in restricted_endpoints:
         capability = end_restrict.capability
         # Remove the route from the app
-        _remove_route_from_app(app, capability.path, capability.methods)
+        remove_route_from_app(app, capability.path, capability.methods)
 
         # Patch the bad request error with the model specific
         # reason for shutting down this endpoint

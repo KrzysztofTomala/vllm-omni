@@ -1,3 +1,4 @@
+import inspect
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -8,6 +9,12 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_dummy_run_accepts_upstream_randomize_inputs() -> None:
+    signature = inspect.signature(OmniGPUModelRunner._dummy_run)
+
+    assert "randomize_inputs" in signature.parameters
 
 
 class DummyBuffer:

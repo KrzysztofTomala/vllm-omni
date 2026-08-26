@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
@@ -16,6 +17,7 @@ from vllm_omni.model_executor.models.alpamayo2_super.configuration_alpamayo2_sup
 from vllm_omni.model_executor.models.alpamayo2_super.pipeline import (
     ALPAMAYO2_SUPER_PIPELINE,
 )
+from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 
 
 def test_super_config_flattens_nested_qwen_config(tmp_path) -> None:
@@ -103,6 +105,31 @@ def test_super_gathers_standard_paged_kv_layout() -> None:
     )
 
 
+def test_super_gathers_concatenated_paged_kv_layout() -> None:
+    blocks = 3
+    block_size = 2
+    kv_heads = 2
+    head_dim = 3
+    cache = torch.arange(
+        blocks * block_size * kv_heads * 2 * head_dim,
+        dtype=torch.float32,
+    ).reshape(blocks, kv_heads, block_size, 2 * head_dim)
+    block_table = torch.tensor([2, 0, 1])
+
+    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
+        [cache], block_table, seq_len=5
+    )
+
+    key_blocks, value_blocks = cache.chunk(2, dim=-1)
+    expected_key = key_blocks.index_select(0, block_table)
+    expected_value = value_blocks.index_select(0, block_table)
+    expected_key = expected_key.permute(1, 0, 2, 3).flatten(1, 2)[:, :5]
+    expected_value = expected_value.permute(1, 0, 2, 3).flatten(1, 2)[:, :5]
+    assert gathered.get_seq_length() == 5
+    torch.testing.assert_close(gathered.layers[0].keys, expected_key.unsqueeze(0))
+    torch.testing.assert_close(gathered.layers[0].values, expected_value.unsqueeze(0))
+
+
 def test_super_static_action_cache_refreshes_prefix_and_rewinds_cursor() -> None:
     source_layer = SimpleNamespace(
         keys=torch.tensor([[[[1.0], [2.0]]]]),
@@ -155,9 +182,103 @@ def test_super_fixed_action_mask_rejects_short_cache() -> None:
         )
 
 
+def test_super_action_boundary_position_ignores_mrope_graph_padding() -> None:
+    positions = torch.tensor(
+        [
+            [705, 17, 18, 19],
+            [705, 17, 18, 19],
+            [705, 17, 18, 19],
+        ]
+    )
+
+    actual = Alpamayo2SuperForConditionalGeneration._action_boundary_position(
+        positions,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(actual, torch.tensor([[705], [705], [705]]))
+
+
+def test_super_action_boundary_position_expands_scalar_position() -> None:
+    positions = torch.tensor([705, 17, 18, 19])
+
+    actual = Alpamayo2SuperForConditionalGeneration._action_boundary_position(
+        positions,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(actual, torch.tensor([[705], [705], [705]]))
+
+
 def test_super_policy_does_not_export_vlm_hidden_prefix() -> None:
     model = Alpamayo2SuperForConditionalGeneration
     assert model.have_multimodal_outputs
     assert model.needs_runner_kv_cache
     assert not model.requires_full_prefix_cached_hidden_states
     assert not model.omni_pooler_payload_include_hidden
+
+
+def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
+    model = object.__new__(Alpamayo2SuperForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.alpamayo_config = SimpleNamespace(
+        traj_ids={"future_start": 7, "future_end": 9},
+    )
+    model._force_future_end = False
+    return model
+
+
+def test_super_declares_future_start_as_speculation_terminal() -> None:
+    model = _minimal_policy_model()
+
+    assert model.speculation_terminal_token_id == 7
+
+
+def test_super_action_runs_when_terminal_is_first_input(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(
+        model,
+        "_sample_actions",
+        lambda **kwargs: calls.append(kwargs) or {"actions": torch.zeros(1)},
+    )
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        sequence_lengths=(101,),
+        request_ids=("request-0",),
+    )
+
+    output = model.make_omni_output(
+        torch.zeros(1, 8),
+        input_ids=torch.tensor([7]),
+        positions=torch.arange(3).reshape(3, 1),
+        sampling_extra_args=[{"robot_obs": {}}],
+        runner_kv_cache_context=context,
+    )
+
+    assert len(calls) == 1
+    assert "actions" in output.multimodal_outputs
+    assert model._force_future_end is True
+
+
+def test_super_action_ignores_terminal_later_in_verification_block(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(
+        model,
+        "_sample_actions",
+        lambda **kwargs: calls.append(kwargs) or {"actions": torch.zeros(1)},
+    )
+
+    output = model.make_omni_output(
+        torch.zeros(3, 8),
+        input_ids=torch.tensor([5, 7, 6]),
+        positions=torch.arange(9).reshape(3, 3),
+        sampling_extra_args=[{"robot_obs": {}}],
+        runner_kv_cache_context=None,
+    )
+
+    assert calls == []
+    assert output.multimodal_outputs == {}
+    assert model._force_future_end is False

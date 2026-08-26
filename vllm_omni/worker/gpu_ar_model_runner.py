@@ -52,6 +52,19 @@ from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 logger = init_logger(__name__)
 
 
+def _mask_model_owned_terminal_drafts(
+    draft_token_ids: torch.Tensor,
+    terminal_token_id: int | None,
+) -> None:
+    """Force model-owned terminal boundaries onto the verifier path."""
+    if terminal_token_id is not None:
+        replacement_token_id = int(terminal_token_id == 0)
+        draft_token_ids.masked_fill_(
+            draft_token_ids == terminal_token_id,
+            replacement_token_id,
+        )
+
+
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     if tensor.device.type == "cpu":
@@ -1097,10 +1110,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            (
+                logits_indices,
+                spec_decode_metadata,
+                max_num_sampled_tokens,
+            ) = self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -1193,6 +1207,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 max_query_len=max_num_scheduled_tokens,
                 ubatch_slices=ubatch_slices_attn,
                 logits_indices=logits_indices,
+                max_num_sampled_tokens=max_num_sampled_tokens,
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
@@ -1235,7 +1250,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
-        if self.calculate_kv_scales:
+        if getattr(self, "calculate_kv_scales", False):
             cudagraph_mode = CUDAGraphMode.NONE
             runner_assisted_full_attn = False
             # Mark KV scales as calculated after the first forward pass
@@ -1914,6 +1929,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
+        spec_config = self.speculative_config
+        terminal_token_id = None
+        speculation_terminal_sampled = False
+        if spec_config is not None:
+            terminal_token_id = getattr(
+                getattr(self, "model", None),
+                "speculation_terminal_token_id",
+                None,
+            )
+            speculation_terminal_sampled = terminal_token_id is not None and bool(
+                torch.any(sampler_output.sampled_token_ids == terminal_token_id)
+            )
+
         self._draft_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
@@ -1933,9 +1961,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     spec_decode_common_attn_metadata,
                     slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
                 )
+                # Model-owned terminal tokens (for example Alpamayo's
+                # future_start action boundary) must be emitted by the
+                # verifier as the recovery/bonus token. If the drafter
+                # proposes and the verifier accepts the boundary, it is
+                # consumed inside the verification block and is not replayed
+                # as the next one-token model step, so the model-owned
+                # terminal hook cannot run.
+                _mask_model_owned_terminal_drafts(
+                    self._draft_token_ids,
+                    terminal_token_id,
+                )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
-        spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             input_fits_in_drafter = self._input_fits_in_drafter(spec_decode_common_attn_metadata)
@@ -1948,7 +1986,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer | Gemma4Proposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
-                if input_fits_in_drafter:
+                if speculation_terminal_sampled:
+                    # The accepted terminal token must be the sole input on
+                    # the next target step so model-owned action generation
+                    # cannot run on unaccepted draft tokens.
+                    pass
+                elif input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
@@ -1967,11 +2010,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
-                propose_drafts_after_bookkeeping = input_fits_in_drafter
+                propose_drafts_after_bookkeeping = (
+                    input_fits_in_drafter and not speculation_terminal_sampled
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
+                _num_nans_device,
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,

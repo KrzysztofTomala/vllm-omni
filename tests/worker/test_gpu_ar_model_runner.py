@@ -10,10 +10,35 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
+    _mask_model_owned_terminal_drafts,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_mask_model_owned_terminal_drafts() -> None:
+    draft_token_ids = torch.tensor([[4, 7, 8], [7, 9, 7]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, terminal_token_id=7)
+
+    assert torch.equal(draft_token_ids, torch.tensor([[4, 0, 8], [0, 9, 0]]))
+
+
+def test_mask_model_owned_terminal_drafts_is_inert_without_terminal() -> None:
+    draft_token_ids = torch.tensor([[0, 1, 2]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, terminal_token_id=None)
+
+    assert torch.equal(draft_token_ids, torch.tensor([[0, 1, 2]]))
+
+
+def test_mask_model_owned_zero_terminal_uses_nonterminal_replacement() -> None:
+    draft_token_ids = torch.tensor([[0, 2, 0]])
+
+    _mask_model_owned_terminal_drafts(draft_token_ids, terminal_token_id=0)
+
+    assert torch.equal(draft_token_ids, torch.tensor([[1, 2, 1]]))
 
 
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
@@ -174,6 +199,8 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     async_output._logprobs_tensors_cpu = None
     async_output._routed_experts = None
     async_output._routed_experts_cpu = None
+    async_output._num_nans = None
+    async_output._num_nans_cpu = None
     async_output.vocab_size = 10
 
     output = async_output.get_output()
@@ -636,6 +663,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         "_bookkeeping_sync",
         lambda *args, **kwargs: (
             0,
+            None,
             None,
             [],
             None,

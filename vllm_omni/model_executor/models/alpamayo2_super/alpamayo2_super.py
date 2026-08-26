@@ -93,6 +93,11 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return int(self.alpamayo_config.traj_ids["future_start"])
 
     @property
+    def speculation_terminal_token_id(self) -> int:
+        """Token after which speculative decoding yields to the action step."""
+        return self.future_start_id
+
+    @property
     def future_end_id(self) -> int:
         return int(self.alpamayo_config.traj_ids["future_end"])
 
@@ -136,27 +141,45 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         block_table: torch.Tensor,
         seq_len: int,
     ) -> DynamicCache:
-        """Convert one request's standard paged cache to HF cache layout."""
+        """Convert one request's paged cache to HF cache layout.
+
+        vLLM has used both a rank-5 layout with an explicit K/V axis and a
+        rank-4 layout with K and V concatenated in the final dimension.
+        """
 
         dynamic_cache = DynamicCache()
         for layer_index, cache in enumerate(caches):
-            if cache.ndim != 5 or (cache.shape[0] != 2 and cache.shape[1] != 2):
-                raise RuntimeError(
-                    "Alpamayo 2 Super requires the standard vLLM paged KV layout"
-                )
-            block_size = cache.shape[2]
-            num_blocks = (seq_len + block_size - 1) // block_size
-            block_ids = block_table[:num_blocks].to(dtype=torch.long)
-            if cache.shape[0] == 2:
-                key = cache[0].index_select(0, block_ids).flatten(0, 1)[:seq_len]
-                value = cache[1].index_select(0, block_ids).flatten(0, 1)[:seq_len]
+            if cache.ndim == 4 and cache.shape[-1] % 2 == 0:
+                # FlashAttention: [blocks, kv_heads, block_size, 2 * head_dim].
+                block_size = cache.shape[2]
+                num_blocks = (seq_len + block_size - 1) // block_size
+                block_ids = block_table[:num_blocks].to(dtype=torch.long)
+                key_blocks, value_blocks = cache.chunk(2, dim=-1)
+                key = key_blocks.index_select(0, block_ids)
+                value = value_blocks.index_select(0, block_ids)
+                key = key.permute(1, 0, 2, 3).flatten(1, 2)[:, :seq_len]
+                value = value.permute(1, 0, 2, 3).flatten(1, 2)[:, :seq_len]
+            elif cache.ndim == 5 and (cache.shape[0] == 2 or cache.shape[1] == 2):
+                block_size = cache.shape[2]
+                num_blocks = (seq_len + block_size - 1) // block_size
+                block_ids = block_table[:num_blocks].to(dtype=torch.long)
+                if cache.shape[0] == 2:
+                    key = cache[0].index_select(0, block_ids).flatten(0, 1)[:seq_len]
+                    value = cache[1].index_select(0, block_ids).flatten(0, 1)[:seq_len]
+                else:
+                    selected = cache.index_select(0, block_ids)
+                    key = selected[:, 0].flatten(0, 1)[:seq_len]
+                    value = selected[:, 1].flatten(0, 1)[:seq_len]
+                key = key.transpose(0, 1)
+                value = value.transpose(0, 1)
             else:
-                selected = cache.index_select(0, block_ids)
-                key = selected[:, 0].flatten(0, 1)[:seq_len]
-                value = selected[:, 1].flatten(0, 1)[:seq_len]
+                raise RuntimeError(
+                    "Alpamayo 2 Super requires a supported vLLM paged KV layout; "
+                    f"layer {layer_index} has shape {tuple(cache.shape)}"
+                )
             dynamic_cache.update(
-                key.transpose(0, 1).unsqueeze(0).contiguous(),
-                value.transpose(0, 1).unsqueeze(0).contiguous(),
+                key.unsqueeze(0).contiguous(),
+                value.unsqueeze(0).contiguous(),
                 layer_index,
             )
         return dynamic_cache
@@ -180,6 +203,17 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         while tensor.ndim > 1 and tensor.shape[0] == 1:
             tensor = tensor.squeeze(0)
         return tensor
+
+    @staticmethod
+    def _action_boundary_position(
+        positions: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return the real terminal position, excluding graph padding."""
+        if positions.ndim == 2 and positions.shape[0] == 3:
+            return positions[:, :1].to(device)
+        return positions.reshape(-1)[:1].repeat(3, 1).to(device)
 
     def _make_static_action_cache(
         self,
@@ -438,10 +472,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         initial_noise = action.clone() if bool(extra_args.get("_return_action_noise", False)) else None
         action = action * temperature
 
-        if positions.ndim == 2 and positions.shape[0] == 3:
-            last_position = positions[:, -1:].to(device)
-        else:
-            last_position = positions.reshape(-1)[-1:].repeat(3, 1).to(device)
+        last_position = self._action_boundary_position(positions, device=device)
         expert_positions = (
             last_position[:, None, :]
             + 1
@@ -597,7 +628,12 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         trigger = (
             observation is not None
             and input_ids is not None
-            and bool(torch.any(input_ids == self.future_start_id))
+            # A speculative verification block can contain an unaccepted
+            # future_start after its first token. Once the verifier samples
+            # the boundary, the runner feeds it back as the first token of a
+            # draft-free decode step. CUDA-graph padding can make numel > 1.
+            and input_ids.numel() > 0
+            and int(input_ids.reshape(-1)[0]) == self.future_start_id
         )
         multimodal_outputs: dict[str, torch.Tensor] = {}
         if trigger:
