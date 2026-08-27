@@ -86,6 +86,10 @@ class OmniRequestState(RequestState):
         arrival_time = kwargs.get("arrival_time")
         super().__init__(*args, **kwargs)
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
+        # vLLM 0.28 no longer carries per-request speculative metrics on its
+        # base RequestState/CompletionOutput types. Keep them in Omni state
+        # and attach the terminal snapshot as an extension attribute.
+        self.spec_decode_metrics: Any | None = None
         # Omni-specific: multimodal output accumulation
         # TODO: mm_type is per-request, not per-key. If a model ever produces
         # both audio and latent outputs, the modality type would flip on each
@@ -271,10 +275,11 @@ class OmniRequestState(RequestState):
                 finish_reason=str(finish_reason) if finished else None,
                 stop_reason=stop_reason if finished else None,
                 routed_experts=routed_experts,
-                spec_decode_metrics=(self.spec_decode_metrics if finished else None),
             )
         else:
             base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+
+        base_output.spec_decode_metrics = self.spec_decode_metrics if finish_reason is not None else None
 
         # Always provide cumulative token IDs for inter-stage processors.
         if self.detokenizer is not None:
@@ -301,6 +306,7 @@ class OmniRequestState(RequestState):
                     multimodal_output=snapshot,
                     **kwargs,
                 )
+                output.spec_decode_metrics = base_output.spec_decode_metrics
                 output.cumulative_token_ids = base_output.cumulative_token_ids
                 if hasattr(base_output, "cumulative_text"):
                     output.cumulative_text = base_output.cumulative_text

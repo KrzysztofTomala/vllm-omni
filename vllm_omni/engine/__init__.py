@@ -133,6 +133,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Per-request speculative decoding metrics are Omni-owned. vLLM 0.28
+    # removed this field from EngineCoreOutput, but downstream Omni stages
+    # still need the terminal snapshot to expose acceptance statistics.
+    spec_decode_metrics: Any | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
