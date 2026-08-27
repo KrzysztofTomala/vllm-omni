@@ -334,6 +334,23 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tensor = tensor.squeeze(0)
         return tensor
 
+    @staticmethod
+    def _action_boundary_position(
+        positions: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return the real terminal position, excluding graph padding.
+
+        The terminal token is deliberately replayed as the first token of a
+        draft-free decode step. Speculative decoding can still execute that
+        step in a CUDA graph whose remaining input rows are padding, so the
+        last position is not necessarily the terminal token's position.
+        """
+        if positions.ndim == 2 and positions.shape[0] == 3:
+            return positions[:, :1].to(device)
+        return positions.reshape(-1)[:1].repeat(3, 1).to(device)
+
     def _make_static_action_cache(
         self,
         cache: DynamicCache,
@@ -606,10 +623,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         initial_noise = action.clone() if bool(extra_args.get("_return_action_noise", False)) else None
         action = action * temperature
 
-        if positions.ndim == 2 and positions.shape[0] == 3:
-            last_position = positions[:, -1:].to(device)
-        else:
-            last_position = positions.reshape(-1)[-1:].repeat(3, 1).to(device)
+        last_position = self._action_boundary_position(positions, device=device)
         expert_positions = (
             last_position[:, None, :]
             + 1
