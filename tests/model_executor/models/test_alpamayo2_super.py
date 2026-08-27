@@ -275,3 +275,31 @@ def test_super_policy_masks_text_eos_until_action_boundary(monkeypatch) -> None:
     assert torch.all(result[..., [1, 2]] == -torch.inf)
     assert torch.all(result[..., 4:7] == -torch.inf)
     assert result[..., 3].item() == 0
+
+
+def test_super_action_boundary_uses_first_mrope_position_not_graph_padding() -> None:
+    positions = torch.tensor(
+        [
+            [101, 0, 0, 0],
+            [202, 0, 0, 0],
+            [303, 0, 0, 0],
+        ]
+    )
+
+    actual = Alpamayo2SuperForConditionalGeneration._action_boundary_position(
+        positions,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(actual, torch.tensor([[101], [202], [303]]))
+
+
+def test_super_action_boundary_expands_first_linear_position() -> None:
+    positions = torch.tensor([101, 0, 0, 0])
+
+    actual = Alpamayo2SuperForConditionalGeneration._action_boundary_position(
+        positions,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(actual, torch.tensor([[101], [101], [101]]))
