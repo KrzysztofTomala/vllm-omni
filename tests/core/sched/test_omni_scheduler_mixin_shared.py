@@ -197,3 +197,27 @@ def test_output_helper_emits_spec_decode_metrics_only_on_finish():
 
     assert partial.spec_decode_metrics is None
     assert finished.spec_decode_metrics is metrics
+
+
+def test_output_helper_serializes_public_spec_decode_metrics_before_ipc():
+    scheduler = _Scheduler()
+    payload = {
+        "num_draft_tokens": 7,
+        "num_accepted_draft_tokens": 4,
+        "num_spec_steps": 1,
+    }
+    metrics = SimpleNamespace(to_dict=lambda: payload)
+    request = SimpleNamespace(
+        request_id="req-output",
+        trace_headers=None,
+        spec_decode_metrics=metrics,
+        take_events=lambda: [],
+    )
+
+    output = scheduler._make_omni_engine_output(
+        request,
+        new_token_ids=[2],
+        finish_reason=FinishReason.STOP,
+    )
+
+    assert output.spec_decode_metrics == payload

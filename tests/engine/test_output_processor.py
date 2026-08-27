@@ -461,6 +461,31 @@ def test_no_detokenizer_completion_preserves_finished_spec_decode_metrics():
     assert finished.spec_decode_metrics is metrics
 
 
+def test_text_output_router_captures_finished_spec_decode_metrics(monkeypatch):
+    """Text outputs retain Omni metrics before vLLM 0.28 processes them."""
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.TEXT
+    processor.request_states = {"r": state}
+    metrics = SimpleNamespace(num_draft_tokens=7)
+    upstream_result = SimpleNamespace(request_outputs=[], reqs_to_abort=[])
+
+    def process_upstream(self, outputs, **_kwargs):
+        assert outputs[0].request_id == "r"
+        assert self.request_states["r"].spec_decode_metrics is metrics
+        return upstream_result
+
+    monkeypatch.setattr(VLLMOutputProcessor, "process_outputs", process_upstream)
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output=None,
+        pooling_output=None,
+        spec_decode_metrics=metrics,
+    )
+
+    assert processor.process_outputs([engine_output]) is upstream_result
+
+
 def test_no_detokenizer_make_request_output():
     """make_request_output works without detokenizer when multimodal data is present."""
     s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)

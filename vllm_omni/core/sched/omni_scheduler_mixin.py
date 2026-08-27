@@ -498,6 +498,16 @@ class OmniSchedulerMixin:
         new_prompt_len_snapshot: int | None = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
+        spec_decode_metrics = (
+            getattr(request, "spec_decode_metrics", None)
+            if finish_reason is not None
+            else None
+        )
+        # Serialize the public snapshot before IPC. msgspec decodes an object
+        # carried through an ``Any`` field as its raw dataclass storage, which
+        # omits derived API fields such as num_accepted_draft_tokens.
+        if hasattr(spec_decode_metrics, "to_dict"):
+            spec_decode_metrics = spec_decode_metrics.to_dict()
         return OmniEngineCoreOutput(
             request_id=request.request_id,
             new_token_ids=new_token_ids,
@@ -509,7 +519,7 @@ class OmniSchedulerMixin:
             stop_reason=stop_reason,
             events=request.take_events(),
             prefill_stats=prefill_stats,
-            spec_decode_metrics=(getattr(request, "spec_decode_metrics", None) if finish_reason is not None else None),
+            spec_decode_metrics=spec_decode_metrics,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
             trace_headers=request.trace_headers,

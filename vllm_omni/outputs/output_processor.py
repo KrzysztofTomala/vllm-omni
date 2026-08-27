@@ -533,6 +533,12 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                # vLLM 0.28 no longer copies per-request speculative metrics
+                # from EngineCoreOutput into RequestState. Capture the terminal
+                # snapshot before routing text outputs through its processor.
+                spec_decode_metrics = getattr(eco, "spec_decode_metrics", None)
+                if spec_decode_metrics is not None:
+                    req_state.spec_decode_metrics = spec_decode_metrics
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
@@ -596,10 +602,6 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 req_state.num_cached_tokens = prefill_stats.num_cached_tokens
                 req_state.num_cache_creation_tokens = prefill_stats.num_cache_creation_tokens
             req_state.is_prefilling = False
-            spec_decode_metrics = getattr(eco, "spec_decode_metrics", None)
-            if spec_decode_metrics is not None:
-                req_state.spec_decode_metrics = spec_decode_metrics
-
             is_non_final_audio_chunk = (
                 finish_reason is not None
                 and req_state.output_kind == RequestOutputKind.DELTA
