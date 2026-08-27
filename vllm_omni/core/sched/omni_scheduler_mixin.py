@@ -38,6 +38,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.metrics.spec_decode import RequestSpecDecodeMetrics
 
 logger = init_logger(__name__)
 
@@ -105,6 +106,11 @@ class OmniSchedulerMixin:
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
         model_config = self.vllm_config.model_config
+        self.spec_decode_metrics_level = getattr(
+            model_config,
+            "per_request_spec_decode_metrics",
+            "none",
+        )
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config) if getattr(model_config, "async_chunk", False) else None
         )
@@ -120,6 +126,19 @@ class OmniSchedulerMixin:
         _decoder_path = getattr(model_config, "pooling_output_decoder", None)
         if _decoder_path:
             self._pooling_output_decoder = resolve_obj_by_qualname(str(_decoder_path))
+
+    def add_request(self, request: Request) -> None:
+        """Admit a request and initialize Omni-owned speculative metrics."""
+        is_new = request.request_id not in self.requests
+        super().add_request(request)
+        if (
+            is_new
+            and self.spec_decode_metrics_level != "none"
+            and getattr(request, "spec_decode_metrics", None) is None
+        ):
+            request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
+                int(self.num_spec_tokens or 0)
+            )
 
     def _maybe_decode_pooling_output(self, request: Request, pooler_output: Any) -> Any:
         """Apply the stage's pooling-output decoder hook to the pooler tensor

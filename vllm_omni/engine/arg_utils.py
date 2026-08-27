@@ -218,6 +218,9 @@ class OmniEngineArgs(EngineArgs):
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
+    # vLLM 0.28 removed this request-scoped observability option. Omni keeps
+    # it because structured APIs expose acceptance metrics with each result.
+    per_request_spec_decode_metrics: str = "none"
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -246,6 +249,11 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.per_request_spec_decode_metrics not in {"none", "summary", "detailed"}:
+            raise ValueError(
+                "per_request_spec_decode_metrics must be one of "
+                "'none', 'summary', or 'detailed'"
+            )
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -437,6 +445,7 @@ class OmniEngineArgs(EngineArgs):
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
+            per_request_spec_decode_metrics=self.per_request_spec_decode_metrics,
         )
         return omni_config
 

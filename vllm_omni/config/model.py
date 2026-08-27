@@ -153,6 +153,7 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
+    per_request_spec_decode_metrics: str = "none"
 
     @property
     def registry(self):
