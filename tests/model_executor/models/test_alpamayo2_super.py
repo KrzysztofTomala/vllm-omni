@@ -240,7 +240,11 @@ def test_super_action_runs_when_terminal_is_first_input(monkeypatch) -> None:
     monkeypatch.setattr(
         model,
         "_sample_actions",
-        lambda **kwargs: calls.append(kwargs) or {"actions": torch.zeros(1)},
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "actions": torch.zeros(8, 64, 3),
+            "action_profile_ms": torch.zeros(4),
+        },
     )
     context = RunnerKVCacheContext(
         caches=[],
@@ -258,7 +262,8 @@ def test_super_action_runs_when_terminal_is_first_input(monkeypatch) -> None:
     )
 
     assert len(calls) == 1
-    assert "actions" in output.multimodal_outputs
+    assert output.multimodal_outputs["actions"].shape == (1, 8, 64, 3)
+    assert output.multimodal_outputs["action_profile_ms"].shape == (4,)
     assert model._force_future_end is True
 
 

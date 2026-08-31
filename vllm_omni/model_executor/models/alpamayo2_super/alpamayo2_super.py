@@ -118,6 +118,30 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         observation = policy_requests[0].get("robot_obs")
         return observation if isinstance(observation, Mapping) else None
 
+    @staticmethod
+    def _add_request_batch_to_policy_outputs(
+        outputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Keep the request dimension distinct from the trajectory dimension.
+
+        The generic output router treats the leading tensor dimension as a
+        request- or token-batch dimension. Policy inference is limited to one
+        request, so expose that dimension explicitly instead of allowing K to
+        be mistaken for a scheduler batch size and sliced to one trajectory.
+        """
+        request_batched = {
+            "pred_trajectories",
+            "pred_rotations",
+            "actions",
+            "rotations",
+            "normalized_controls",
+            "action_noise",
+        }
+        return {
+            key: value.unsqueeze(0) if key in request_batched else value
+            for key, value in outputs.items()
+        }
+
     def prepare_runner_inputs(
         self,
         input_ids: torch.Tensor | None,
@@ -642,16 +666,18 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if len(runner_kv_cache_context.request_ids) != 1:
                 raise RuntimeError("Super action generation currently supports one request")
             extra = sampling_extra_args[0] if isinstance(sampling_extra_args, list) else {}
-            multimodal_outputs = self._sample_actions(
-                caches=runner_kv_cache_context.caches,
-                block_table=runner_kv_cache_context.block_table[0],
-                seq_len=runner_kv_cache_context.sequence_lengths[0],
-                positions=positions,
-                observation=observation,
-                extra_args=extra,
+            multimodal_outputs = self._add_request_batch_to_policy_outputs(
+                self._sample_actions(
+                    caches=runner_kv_cache_context.caches,
+                    block_table=runner_kv_cache_context.block_table[0],
+                    seq_len=runner_kv_cache_context.sequence_lengths[0],
+                    positions=positions,
+                    observation=observation,
+                    extra_args=extra,
+                )
             )
             self._force_future_end = True
-        text_hidden_states = hidden_states[0] if isinstance(hidden_states, (list, tuple)) else hidden_states
+        text_hidden_states = hidden_states[0] if isinstance(hidden_states, list | tuple) else hidden_states
         return OmniOutput(
             text_hidden_states=text_hidden_states,
             multimodal_outputs=multimodal_outputs,
