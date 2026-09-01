@@ -72,9 +72,7 @@ def test_super_pipeline_is_single_stage_policy() -> None:
     assert ALPAMAYO2_SUPER_PIPELINE.model_type == "alpamayo2_super"
     assert len(ALPAMAYO2_SUPER_PIPELINE.stages) == 1
     assert ALPAMAYO2_SUPER_PIPELINE.stages[0].model_stage == "policy"
-    assert ALPAMAYO2_SUPER_PIPELINE.stages[0].sampling_constraints[
-        "stop_token_ids"
-    ] == [155683]
+    assert ALPAMAYO2_SUPER_PIPELINE.stages[0].sampling_constraints["stop_token_ids"] == [155683]
 
 
 def test_super_gathers_standard_paged_kv_layout() -> None:
@@ -88,9 +86,7 @@ def test_super_gathers_standard_paged_kv_layout() -> None:
     ).reshape(2, blocks, block_size, kv_heads, head_dim)
     block_table = torch.tensor([2, 0, 1])
 
-    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
-        [cache], block_table, seq_len=5
-    )
+    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache([cache], block_table, seq_len=5)
 
     expected_key = cache[0].index_select(0, block_table).flatten(0, 1)[:5]
     expected_value = cache[1].index_select(0, block_table).flatten(0, 1)[:5]
@@ -116,9 +112,7 @@ def test_super_gathers_concatenated_paged_kv_layout() -> None:
     ).reshape(blocks, kv_heads, block_size, 2 * head_dim)
     block_table = torch.tensor([2, 0, 1])
 
-    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
-        [cache], block_table, seq_len=5
-    )
+    gathered = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache([cache], block_table, seq_len=5)
 
     key_blocks, value_blocks = cache.chunk(2, dim=-1)
     expected_key = key_blocks.index_select(0, block_table)
@@ -224,7 +218,9 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model.alpamayo_config = SimpleNamespace(
         traj_ids={"future_start": 7, "future_end": 9},
     )
-    model._force_future_end = False
+    model._force_future_end_indices = ()
+    model._force_future_start_indices = ()
+    model._pending_policy_groups = {}
     return model
 
 
@@ -262,9 +258,9 @@ def test_super_action_runs_when_terminal_is_first_input(monkeypatch) -> None:
     )
 
     assert len(calls) == 1
-    assert output.multimodal_outputs["actions"].shape == (1, 8, 64, 3)
-    assert output.multimodal_outputs["action_profile_ms"].shape == (4,)
-    assert model._force_future_end is True
+    assert output.multimodal_outputs["actions"][0].shape == (8, 64, 3)
+    assert output.multimodal_outputs["action_profile_ms"][0].shape == (4,)
+    assert model._force_future_end_indices == (0,)
 
 
 def test_super_action_ignores_terminal_later_in_verification_block(monkeypatch) -> None:
@@ -286,4 +282,115 @@ def test_super_action_ignores_terminal_later_in_verification_block(monkeypatch) 
 
     assert calls == []
     assert output.multimodal_outputs == {}
-    assert model._force_future_end is False
+    assert model._force_future_end_indices == ()
+
+
+def test_super_action_routes_independent_batched_policy_children(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+
+    def sample_actions(**kwargs):
+        calls.append(kwargs)
+        marker = float(kwargs["seq_len"])
+        return {
+            "actions": torch.full((1, 64, 3), marker),
+            "rotations": torch.full((1, 64, 3, 3), marker),
+        }
+
+    monkeypatch.setattr(model, "_sample_actions", sample_actions)
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+        sequence_lengths=(101, 202, 303),
+        request_ids=("0-parent", "1-parent", "2-parent"),
+    )
+    extras = [
+        {"robot_obs": {"branch": 0}, "_sampling_seed": 40},
+        {"robot_obs": {"branch": 1}, "_sampling_seed": 41},
+        {"robot_obs": {"branch": 2}, "_sampling_seed": 42},
+    ]
+
+    output = model.make_omni_output(
+        torch.zeros(5, 8),
+        input_ids=torch.tensor([7, 11, 5, 7, 12]),
+        positions=torch.arange(15).reshape(3, 5),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 2), (2, 3), (3, 5)],
+    )
+
+    assert [call["observation"]["branch"] for call in calls] == [0, 2]
+    assert [call["extra_args"]["_sampling_seed"] for call in calls] == [40, 42]
+    assert [call["block_table"].item() for call in calls] == [10, 30]
+    assert torch.equal(calls[0]["positions"], torch.arange(15).reshape(3, 5)[:, 0:2])
+    assert torch.equal(calls[1]["positions"], torch.arange(15).reshape(3, 5)[:, 3:5])
+    assert output.multimodal_outputs["actions"][1] is None
+    assert output.multimodal_outputs["actions"][0].shape == (1, 64, 3)
+    assert output.multimodal_outputs["actions"][2][0, 0, 0].item() == 303
+    assert model._force_future_end_indices == (0, 2)
+
+
+def test_super_batched_action_expert_rendezvous_waits_for_every_vlm_child(
+    monkeypatch,
+) -> None:
+    model = _minimal_policy_model()
+    calls = []
+
+    def sample_actions_batch(**kwargs):
+        calls.append(kwargs)
+        markers = torch.tensor(kwargs["seq_lens"], dtype=torch.float32)
+        return {
+            "actions": markers[:, None, None].expand(-1, 64, 3).clone(),
+            "rotations": markers[:, None, None, None].expand(-1, 64, 3, 3).clone(),
+        }
+
+    monkeypatch.setattr(model, "_sample_actions_batch", sample_actions_batch)
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+        sequence_lengths=(101, 202, 303),
+        request_ids=("0_parent", "1_parent", "2_parent"),
+    )
+    extras = [
+        {
+            "robot_obs": {"branch": index},
+            "_sampling_seed": 40 + index,
+            "_parallel_sample_count": 3,
+            "_batch_action_expert": True,
+        }
+        for index in range(3)
+    ]
+
+    waiting = model.make_omni_output(
+        torch.zeros(3, 8),
+        input_ids=torch.tensor([7, 5, 7]),
+        positions=torch.arange(9).reshape(3, 3),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 2), (2, 3)],
+    )
+
+    assert calls == []
+    assert waiting.multimodal_outputs == {}
+    assert model._force_future_start_indices == (0, 2)
+
+    completed = model.make_omni_output(
+        torch.zeros(3, 8),
+        input_ids=torch.tensor([7, 7, 7]),
+        positions=torch.arange(9, 18).reshape(3, 3),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 2), (2, 3)],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["seq_lens"] == [101, 202, 303]
+    assert [item["branch"] for item in calls[0]["observations"]] == [0, 1, 2]
+    assert [item["_sampling_seed"] for item in calls[0]["extra_args"]] == [40, 41, 42]
+    assert [item[0, 0, 0].item() for item in completed.multimodal_outputs["actions"]] == [
+        101,
+        202,
+        303,
+    ]
+    assert model._force_future_end_indices == (0, 1, 2)
+    assert model._pending_policy_groups == {}

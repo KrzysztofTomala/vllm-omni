@@ -1021,6 +1021,49 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_submit_initial_fans_out_parallel_sampling() -> None:
+    client = FakeStageClient(stage_type="llm", final_output=False)
+    output_processor = FakeOutputProcessor()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    params = SamplingParams(n=3, seed=17, max_tokens=4)
+    req_state = OrchestratorRequestState(
+        request_id="req-parallel",
+        sampling_params_list=[params],
+        final_stage_id=0,
+    )
+    request = SimpleNamespace(
+        request_id="req-parallel",
+        external_req_id="req-parallel",
+        params=params,
+        sampling_params=params,
+        prompt_token_ids=[1, 2],
+    )
+
+    await pool.submit_initial("req-parallel", req_state, request)
+
+    submitted = [args[0] for args in client.add_request_calls]
+    assert [child.request_id for child in submitted] == [
+        "0_req-parallel",
+        "1_req-parallel",
+        "2_req-parallel",
+    ]
+    assert [child.sampling_params.n for child in submitted] == [1, 1, 1]
+    assert [child.sampling_params.seed for child in submitted] == [17, 18, 19]
+    registrations = [kwargs for _, kwargs in output_processor.add_request_calls]
+    assert [registration["request_index"] for registration in registrations] == [0, 1, 2]
+    assert all(registration["parent_req"] is registrations[0]["parent_req"] for registration in registrations)
+
+    await pool.abort_requests(["req-parallel"])
+    assert client.abort_calls == [["0_req-parallel", "1_req-parallel", "2_req-parallel"]]
+    assert output_processor.abort_calls == [["0_req-parallel", "1_req-parallel", "2_req-parallel"]]
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(

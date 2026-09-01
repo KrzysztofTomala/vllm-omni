@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections.abc import Mapping
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -97,6 +99,7 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._parallel_children_by_request: dict[str, list[str]] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -469,6 +472,7 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._parallel_children_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -968,33 +972,60 @@ class StagePool:
         client = self.clients[replica_id]
         if client is None:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-        except Exception:
-            self.release_binding(request_id)
-            raise
+        parent_request: ParentRequest | None = None
+        requests = [(request, None, 0)]
+        params = getattr(request, "params", None)
+        if int(getattr(params, "n", 1)) > 1:
+            parent_request = ParentRequest(request)
+            requests = []
+            for index in range(parent_request.n):
+                child_id, child_params = parent_request.get_child_info(index)
+                child_request = copy(request)
+                child_request.request_id = child_id
+                child_request.sampling_params = child_params
+                requests.append((child_request, parent_request, index))
+            self._parallel_children_by_request[str(request_id)] = [child.request_id for child, _, _ in requests]
 
+        registered_ids: list[str] = []
+        submitted_ids: list[str] = []
         try:
-            await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+            for child_request, parent, index in requests:
+                self.output_processor.add_request(
+                    request=child_request,
+                    prompt=prompt_text,
+                    parent_req=parent,
+                    request_index=index,
+                    queue=None,
+                )
+                registered_ids.append(child_request.request_id)
+                await self._llm_client(replica_id).add_request_async(
+                    child_request,
+                    **submit_kwargs,
+                )
+                submitted_ids.append(child_request.request_id)
         except Exception:
+            if submitted_ids:
+                try:
+                    await self._llm_client(replica_id).abort_requests_async(submitted_ids)
+                except Exception as abort_error:
+                    logger.warning(
+                        "[StagePool] Failed to abort partially submitted parallel request %s: %s",
+                        request_id,
+                        abort_error,
+                    )
             self.release_binding(request_id)
             rollback = getattr(self.output_processor, "remove_request", None)
             if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
+                for registered_id in registered_ids:
+                    try:
+                        rollback(registered_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            registered_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
             raise
         return replica_id
 
@@ -1142,7 +1173,9 @@ class StagePool:
             if replica_id is None or self.clients[replica_id] is None:
                 logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
-            request_ids_by_replica.setdefault(replica_id, []).append(request_id)
+            request_ids_by_replica.setdefault(replica_id, []).extend(
+                self._parallel_children_by_request.get(str(request_id), [request_id])
+            )
 
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             client = self.clients[replica_id]

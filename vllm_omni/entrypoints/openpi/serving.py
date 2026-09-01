@@ -28,17 +28,64 @@ logger = init_logger(__name__)
 ActionOutput = np.ndarray | dict[str, np.ndarray]
 PolicyOutput = ActionOutput | dict[str, Any]
 
+_PARALLEL_POLICY_BATCH_KEYS = frozenset(
+    {
+        "pred_trajectories",
+        "pred_rotations",
+        "actions",
+        "rotations",
+        "normalized_controls",
+        "action_noise",
+        "action_expert_invocation_batch_size",
+    }
+)
+
+
+def _completion_multimodal_outputs(result: Any) -> list[Mapping[str, Any]]:
+    completions = getattr(result, "outputs", None) or []
+    outputs = [
+        output
+        for completion in completions
+        if isinstance((output := getattr(completion, "multimodal_output", None)), Mapping)
+    ]
+    if outputs:
+        return outputs
+    output = getattr(result, "multimodal_output", None)
+    return [output] if isinstance(output, Mapping) else []
+
+
+def _concatenate_policy_values(values: list[Any]) -> Any:
+    try:
+        import torch
+
+        if all(isinstance(value, torch.Tensor) for value in values):
+            return torch.cat(values, dim=0)
+    except ImportError:  # pragma: no cover - torch is a runtime dependency
+        pass
+    if all(isinstance(value, np.ndarray) for value in values):
+        return np.concatenate(values, axis=0)
+    arrays = [np.asarray(value) for value in values]
+    return np.concatenate(arrays, axis=0)
+
+
+def _aggregate_multimodal_outputs(result: Any) -> Mapping[str, Any] | None:
+    outputs = _completion_multimodal_outputs(result)
+    if not outputs:
+        return None
+    if len(outputs) == 1:
+        return outputs[0]
+    keys = set(outputs[0])
+    if any(set(output) != keys for output in outputs[1:]):
+        raise RuntimeError("Parallel policy completions returned different output fields")
+    aggregated: dict[str, Any] = {}
+    for key in keys:
+        values = [output[key] for output in outputs]
+        aggregated[key] = _concatenate_policy_values(values) if key in _PARALLEL_POLICY_BATCH_KEYS else values
+    return aggregated
+
 
 def _multimodal_output(result: Any) -> Mapping[str, Any] | None:
-    output = getattr(result, "multimodal_output", None)
-    if isinstance(output, Mapping):
-        return output
-    completions = getattr(result, "outputs", None) or []
-    if completions:
-        output = getattr(completions[0], "multimodal_output", None)
-        if isinstance(output, Mapping):
-            return output
-    return None
+    return _aggregate_multimodal_outputs(result)
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -46,7 +93,7 @@ def _to_builtin_container(value: Any) -> Any:
         return OmegaConf.to_container(value, resolve=True)
     if isinstance(value, Mapping):
         return {key: _to_builtin_container(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_to_builtin_container(item) for item in value]
     return value
 
@@ -65,7 +112,7 @@ def _to_policy_wire_value(value: Any) -> Any:
         return np.asarray(value, dtype=np.float32)
     if isinstance(value, Mapping):
         return {str(key): _to_policy_wire_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_to_policy_wire_value(item) for item in value]
     return value
 
@@ -145,10 +192,7 @@ class ServingRealtimeRobotOpenPI:
             self.policy_server_config.values,
         )
         if self.policy_server_config.engine_request_type != "diffusion" and self.request_adapter is None:
-            raise ValueError(
-                "Non-diffusion OpenPI policies must declare "
-                "policy_server_config.request_adapter"
-            )
+            raise ValueError("Non-diffusion OpenPI policies must declare policy_server_config.request_adapter")
 
     @classmethod
     def create_policy_server(
@@ -289,7 +333,8 @@ class ServingRealtimeRobotOpenPI:
             output["actions"] = {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         else:
             output["actions"] = np.asarray(actions, dtype=np.float32)
-        completions = getattr(result, "outputs", None)
-        if completions and getattr(completions[0], "text", None):
-            output.setdefault("reasoning", completions[0].text)
+        completions = getattr(result, "outputs", None) or []
+        reasoning = [completion.text for completion in completions if getattr(completion, "text", None)]
+        if reasoning:
+            output.setdefault("reasoning", reasoning[0] if len(reasoning) == 1 else reasoning)
         return output

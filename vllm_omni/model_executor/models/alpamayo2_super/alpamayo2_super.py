@@ -27,6 +27,18 @@ from vllm.transformers_utils.processor import cached_get_processor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 
+_BATCHED_POLICY_OUTPUT_KEYS = frozenset(
+    {
+        "pred_trajectories",
+        "pred_rotations",
+        "actions",
+        "rotations",
+        "normalized_controls",
+        "action_noise",
+        "action_expert_invocation_batch_size",
+    }
+)
+
 
 class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
     """Use the processor and extended tokenizer shipped with Super."""
@@ -56,8 +68,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
     The autoregressive Qwen3-VL prefix stays entirely native to vLLM. Once
     ``<|traj_future_start|>`` is emitted, the model gathers that request's
     paged KV prefix and gives it to the released, non-causal action expert for
-    fixed-step flow matching. Policy inference is intentionally single-request
-    for now; ordinary VQA requests retain the normal vLLM batching path.
+    fixed-step flow matching. Parallel samples are separate vLLM requests so
+    every trajectory is conditioned on its own sampled VLM reasoning.
     """
 
     have_multimodal_outputs = True
@@ -86,7 +98,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self._compiled_expert: nn.Module | None = None
         self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
-        self._force_future_end = False
+        self._force_future_end_indices: tuple[int, ...] = ()
+        self._force_future_start_indices: tuple[int, ...] = ()
+        self._pending_policy_groups: dict[str, dict[str, dict[str, Any]]] = {}
 
     @property
     def future_start_id(self) -> int:
@@ -101,46 +115,28 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def future_end_id(self) -> int:
         return int(self.alpamayo_config.traj_ids["future_end"])
 
-    def _policy_observation(self, sampling_extra_args: object) -> Mapping[str, Any] | None:
+    def _policy_observations(
+        self,
+        sampling_extra_args: object,
+    ) -> list[Mapping[str, Any] | None]:
         if not isinstance(sampling_extra_args, list):
-            return None
-        policy_requests = [
-            extra
-            for extra in sampling_extra_args
-            if isinstance(extra, Mapping) and isinstance(extra.get("robot_obs"), Mapping)
-        ]
-        if len(policy_requests) > 1:
-            raise RuntimeError("Alpamayo 2 Super policy inference currently supports max_num_seqs=1")
-        if not policy_requests:
-            return None
-        if len(sampling_extra_args) != 1:
-            raise RuntimeError("Alpamayo 2 Super policy inference cannot share a batch")
-        observation = policy_requests[0].get("robot_obs")
-        return observation if isinstance(observation, Mapping) else None
+            return []
+        observations: list[Mapping[str, Any] | None] = []
+        for extra in sampling_extra_args:
+            observation = extra.get("robot_obs") if isinstance(extra, Mapping) else None
+            observations.append(observation if isinstance(observation, Mapping) else None)
+        return observations
 
     @staticmethod
-    def _add_request_batch_to_policy_outputs(
-        outputs: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        """Keep the request dimension distinct from the trajectory dimension.
-
-        The generic output router treats the leading tensor dimension as a
-        request- or token-batch dimension. Policy inference is limited to one
-        request, so expose that dimension explicitly instead of allowing K to
-        be mistaken for a scheduler batch size and sliced to one trajectory.
-        """
-        request_batched = {
-            "pred_trajectories",
-            "pred_rotations",
-            "actions",
-            "rotations",
-            "normalized_controls",
-            "action_noise",
-        }
-        return {
-            key: value.unsqueeze(0) if key in request_batched else value
-            for key, value in outputs.items()
-        }
+    def _request_positions(
+        positions: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """Select one request's position rows from a flattened runner batch."""
+        if positions.ndim == 2 and positions.shape[0] == 3:
+            return positions[:, start:end]
+        return positions.reshape(-1)[start:end]
 
     def prepare_runner_inputs(
         self,
@@ -222,6 +218,28 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return repeated
 
     @staticmethod
+    def _combine_prefix_caches(caches: Sequence[DynamicCache]) -> DynamicCache:
+        """Right-pad distinct VLM prefixes into one expert batch."""
+        if not caches:
+            raise ValueError("At least one VLM prefix is required")
+        max_length = max(cache.get_seq_length() for cache in caches)
+        combined = DynamicCache()
+        for layer_index in range(len(caches[0].layers)):
+            keys: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+            for cache in caches:
+                layer = cache.layers[layer_index]
+                pad_length = max_length - layer.keys.shape[-2]
+                keys.append(torch.nn.functional.pad(layer.keys, (0, 0, 0, pad_length)))
+                values.append(torch.nn.functional.pad(layer.values, (0, 0, 0, pad_length)))
+            combined.update(
+                torch.cat(keys, dim=0).contiguous(),
+                torch.cat(values, dim=0).contiguous(),
+                layer_index,
+            )
+        return combined
+
+    @staticmethod
     def _observation_tensor(value: Any, *, device: torch.device) -> torch.Tensor:
         tensor = torch.as_tensor(value, device=device, dtype=torch.float32)
         while tensor.ndim > 1 and tensor.shape[0] == 1:
@@ -251,8 +269,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         effective_max_len = max_cache_len or minimum_length
         if effective_max_len < minimum_length:
             raise ValueError(
-                "static action cache is too short: need at least "
-                f"{minimum_length} tokens, got {effective_max_len}"
+                f"static action cache is too short: need at least {minimum_length} tokens, got {effective_max_len}"
             )
         static_cache = StaticCache(
             config=self.expert.expert.config,
@@ -305,13 +322,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         max_cache_len: int | None,
         device: torch.device,
         dtype: torch.dtype,
+        prefix_lengths: Sequence[int] | None = None,
     ) -> torch.Tensor:
         minimum_length = prefix_length + suffix_length
         mask_length = max_cache_len or minimum_length
         if mask_length < minimum_length:
             raise ValueError(
-                "static action cache is too short: need at least "
-                f"{minimum_length} tokens, got {mask_length}"
+                f"static action cache is too short: need at least {minimum_length} tokens, got {mask_length}"
             )
         attention_mask = torch.full(
             (sample_count, 1, suffix_length, mask_length),
@@ -319,7 +336,18 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             device=device,
             dtype=dtype,
         )
-        attention_mask[..., :minimum_length] = 0
+        if prefix_lengths is None:
+            attention_mask[..., :minimum_length] = 0
+        else:
+            if len(prefix_lengths) != sample_count:
+                raise ValueError("Expert prefix lengths must align with the action batch")
+            for index, valid_prefix_length in enumerate(prefix_lengths):
+                attention_mask[index, ..., :valid_prefix_length] = 0
+                attention_mask[
+                    index,
+                    ...,
+                    prefix_length : prefix_length + suffix_length,
+                ] = 0
         return attention_mask
 
     def _run_manual_action_graph(
@@ -390,9 +418,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         static_cache,
                         state["cache_position"][0],
                     )
-                    velocity = self.expert.action_out_proj(
-                        output.last_hidden_state[:, -suffix_length:]
-                    )
+                    velocity = self.expert.action_out_proj(output.last_hidden_state[:, -suffix_length:])
                     graph_action = graph_action + velocity.float().view_as(graph_action) / inference_steps
                 return graph_action
 
@@ -428,18 +454,24 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         state["graph"].replay()
         return state["output"].clone()
 
-    def _sample_actions(
+    def _sample_actions_batch(
         self,
         *,
         caches: list[torch.Tensor],
-        block_table: torch.Tensor,
-        seq_len: int,
-        positions: torch.Tensor,
-        observation: Mapping[str, Any],
-        extra_args: Mapping[str, Any],
+        block_tables: Sequence[torch.Tensor],
+        seq_lens: Sequence[int],
+        positions: Sequence[torch.Tensor],
+        observations: Sequence[Mapping[str, Any]],
+        extra_args: Sequence[Mapping[str, Any]],
     ) -> dict[str, torch.Tensor]:
         device = caches[0].device
-        profile_action = bool(extra_args.get("_profile_action", False)) and device.type == "cuda"
+        sample_count = len(observations)
+        if not (sample_count == len(block_tables) == len(seq_lens) == len(positions) == len(extra_args)):
+            raise ValueError("Batched expert inputs must have matching lengths")
+        if sample_count < 1:
+            raise ValueError("The action expert batch must not be empty")
+        first_extra = extra_args[0]
+        profile_action = bool(first_extra.get("_profile_action", False)) and device.type == "cuda"
         profile_events: list[torch.cuda.Event] = []
 
         def record_profile_event() -> None:
@@ -449,30 +481,35 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 profile_events.append(event)
 
         record_profile_event()
-        sample_count = int(extra_args.get("num_traj_samples", 1))
-        inference_steps = int(extra_args.get("diffusion_steps", 10))
-        temperature = float(extra_args.get("action_temperature", 1.0))
-        if sample_count < 1 or inference_steps < 1:
+        if any(int(extra.get("num_traj_samples", 1)) != 1 for extra in extra_args):
+            raise ValueError("Each parallel VLM branch must request one expert trajectory")
+        inference_steps = int(first_extra.get("diffusion_steps", 10))
+        temperature = float(first_extra.get("action_temperature", 1.0))
+        if inference_steps < 1:
             raise ValueError("num_traj_samples and diffusion_steps must be positive")
+        for extra in extra_args[1:]:
+            if (
+                int(extra.get("diffusion_steps", 10)) != inference_steps
+                or float(extra.get("action_temperature", 1.0)) != temperature
+            ):
+                raise ValueError("Batched expert branches must use identical diffusion settings")
 
-        prefix = self._repeat_cache(
-            self._gather_prefix_cache(caches, block_table, seq_len),
-            sample_count,
-        )
+        individual_prefixes = [
+            self._gather_prefix_cache(caches, block_table, seq_len)
+            for block_table, seq_len in zip(block_tables, seq_lens, strict=True)
+        ]
+        prefix_lengths = [prefix.get_seq_length() for prefix in individual_prefixes]
+        prefix = self._combine_prefix_caches(individual_prefixes)
+        if bool(first_extra.get("_batch_action_expert", True)) is False and sample_count > 1:
+            raise ValueError("Sequential expert mode must submit one VLM branch per expert call")
         record_profile_event()
         prefix_len = prefix.get_seq_length()
         action_dims = tuple(int(dim) for dim in self.expert.action_space.get_action_space_dims())
         suffix_length = action_dims[0]
-        static_cache_max_len_value = extra_args.get("_static_expert_cache_max_len")
-        static_cache_max_len = (
-            int(static_cache_max_len_value)
-            if static_cache_max_len_value is not None
-            else None
-        )
-        manual_action_cudagraph = bool(extra_args.get("_manual_action_cudagraph", False))
-        static_expert_cache = bool(
-            extra_args.get("_static_expert_cache", manual_action_cudagraph)
-        )
+        static_cache_max_len_value = first_extra.get("_static_expert_cache_max_len")
+        static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
+        manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
+        static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply
@@ -482,25 +519,33 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 prefix_len + suffix_length,
             )
 
-        generator = None
-        if (sampling_seed := extra_args.get("_sampling_seed")) is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(sampling_seed))
-        action = torch.randn(
-            sample_count,
-            *action_dims,
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
+        noise_rows: list[torch.Tensor] = []
+        for extra in extra_args:
+            generator = None
+            if (sampling_seed := extra.get("_sampling_seed")) is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(sampling_seed))
+            noise_rows.append(
+                torch.randn(
+                    1,
+                    *action_dims,
+                    device=device,
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+            )
+        action = torch.cat(noise_rows, dim=0)
+        initial_noise = (
+            action.clone() if any(bool(extra.get("_return_action_noise", False)) for extra in extra_args) else None
         )
-        initial_noise = action.clone() if bool(extra_args.get("_return_action_noise", False)) else None
         action = action * temperature
 
-        last_position = self._action_boundary_position(positions, device=device)
+        last_position = torch.cat(
+            [self._action_boundary_position(value, device=device) for value in positions],
+            dim=1,
+        )
         expert_positions = (
-            last_position[:, None, :]
-            + 1
-            + torch.arange(suffix_length, device=device)[None, None, :]
+            last_position[:, :, None] + 1 + torch.arange(suffix_length, device=device)[None, None, :]
         ).expand(3, sample_count, suffix_length)
         weight_dtype = self.expert.action_out_proj.weight.dtype
         attention_mask = self._make_action_attention_mask(
@@ -510,6 +555,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             max_cache_len=(static_cache_max_len if static_expert_cache else None),
             device=device,
             dtype=weight_dtype,
+            prefix_lengths=prefix_lengths,
         )
         expert_cache: DynamicCache | StaticCache = prefix
         expert_cache_position = None
@@ -528,7 +574,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         record_profile_event()
 
         expert = self.expert.expert
-        if bool(extra_args.get("_compile_expert", False)):
+        if bool(first_extra.get("_compile_expert", False)):
             if self._compiled_expert is None:
                 self._compiled_expert = torch.compile(
                     self.expert.expert,
@@ -569,25 +615,22 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     self._rewind_static_action_cache(expert_cache, prefix_len)
                 else:
                     expert_cache.crop(prefix_len)
-                velocity = self.expert.action_out_proj(
-                    outputs.last_hidden_state[:, -suffix_length:]
-                )
-                action = (
-                    action
-                    + velocity.float().view(sample_count, *action_dims) / inference_steps
-                )
+                velocity = self.expert.action_out_proj(outputs.last_hidden_state[:, -suffix_length:])
+                action = action + velocity.float().view(sample_count, *action_dims) / inference_steps
         record_profile_event()
 
-        history_xyz = self._observation_tensor(observation["ego_history_xyz"], device=device)
-        history_rot = self._observation_tensor(observation["ego_history_rot"], device=device)
-        if history_xyz.ndim != 2 or history_xyz.shape[-1] != 3:
-            raise ValueError(f"ego_history_xyz must have shape (T, 3), got {tuple(history_xyz.shape)}")
-        if history_rot.ndim != 3 or history_rot.shape[-2:] != (3, 3):
-            raise ValueError(
-                f"ego_history_rot must have shape (T, 3, 3), got {tuple(history_rot.shape)}"
-            )
-        repeated_history_xyz = history_xyz.unsqueeze(0).expand(sample_count, -1, -1)
-        repeated_history_rot = history_rot.unsqueeze(0).expand(sample_count, -1, -1, -1)
+        history_xyz_rows = [
+            self._observation_tensor(observation["ego_history_xyz"], device=device) for observation in observations
+        ]
+        history_rot_rows = [
+            self._observation_tensor(observation["ego_history_rot"], device=device) for observation in observations
+        ]
+        if any(value.ndim != 2 or value.shape[-1] != 3 for value in history_xyz_rows):
+            raise ValueError("Every ego_history_xyz must have shape (T, 3)")
+        if any(value.ndim != 3 or value.shape[-2:] != (3, 3) for value in history_rot_rows):
+            raise ValueError("Every ego_history_rot must have shape (T, 3, 3)")
+        repeated_history_xyz = torch.stack(history_xyz_rows)
+        repeated_history_rot = torch.stack(history_rot_rows)
         pred_xyz, pred_rot = self.expert.action_space.action_to_traj(
             action,
             repeated_history_xyz,
@@ -616,7 +659,59 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
         if initial_noise is not None:
             result["action_noise"] = initial_noise
+        result["action_expert_invocation_batch_size"] = torch.full(
+            (sample_count,),
+            sample_count,
+            device=device,
+            dtype=torch.int32,
+        )
         return result
+
+    def _sample_actions(
+        self,
+        *,
+        caches: list[torch.Tensor],
+        block_table: torch.Tensor,
+        seq_len: int,
+        positions: torch.Tensor,
+        observation: Mapping[str, Any],
+        extra_args: Mapping[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        """Compatibility wrapper for one sequential expert invocation."""
+        return self._sample_actions_batch(
+            caches=caches,
+            block_tables=[block_table],
+            seq_lens=[seq_len],
+            positions=[positions],
+            observations=[observation],
+            extra_args=[extra_args],
+        )
+
+    @staticmethod
+    def _parallel_group_info(
+        request_id: str,
+        extra_args: Mapping[str, Any],
+    ) -> tuple[str, int, int]:
+        expected = int(extra_args.get("_parallel_sample_count", 1))
+        if expected <= 1:
+            return request_id, 0, 1
+        child_index, separator, parent_id = request_id.partition("_")
+        if not separator or not child_index.isdigit() or not parent_id:
+            raise RuntimeError("Parallel Alpamayo request IDs must use vLLM's '<index>_<parent>' form")
+        index = int(child_index)
+        if index >= expected:
+            raise RuntimeError("Parallel Alpamayo child index exceeds its sample count")
+        return parent_id, index, expected
+
+    @staticmethod
+    def _split_batched_policy_output(
+        output: Mapping[str, torch.Tensor],
+        index: int,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value[index : index + 1] if key in _BATCHED_POLICY_OUTPUT_KEYS else value
+            for key, value in output.items()
+        }
 
     def forward(
         self,
@@ -644,39 +739,124 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         positions: torch.Tensor,
         sampling_extra_args: object = None,
         runner_kv_cache_context: RunnerKVCacheContext | None = None,
+        request_token_spans: Sequence[tuple[int, int]] | None = None,
         **_: Any,
     ) -> IntermediateTensors | OmniOutput:
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
-        observation = self._policy_observation(sampling_extra_args)
-        trigger = (
-            observation is not None
-            and input_ids is not None
-            # A speculative verification block can contain an unaccepted
-            # future_start after its first token. Once the verifier samples
-            # the boundary, the runner feeds it back as the first token of a
-            # draft-free decode step. CUDA-graph padding can make numel > 1.
-            and input_ids.numel() > 0
-            and int(input_ids.reshape(-1)[0]) == self.future_start_id
-        )
-        multimodal_outputs: dict[str, torch.Tensor] = {}
-        if trigger:
-            if runner_kv_cache_context is None:
-                raise RuntimeError("Super action generation requires runner KV-cache access")
-            if len(runner_kv_cache_context.request_ids) != 1:
-                raise RuntimeError("Super action generation currently supports one request")
-            extra = sampling_extra_args[0] if isinstance(sampling_extra_args, list) else {}
-            multimodal_outputs = self._add_request_batch_to_policy_outputs(
-                self._sample_actions(
-                    caches=runner_kv_cache_context.caches,
-                    block_table=runner_kv_cache_context.block_table[0],
-                    seq_len=runner_kv_cache_context.sequence_lengths[0],
-                    positions=positions,
-                    observation=observation,
-                    extra_args=extra,
+        observations = self._policy_observations(sampling_extra_args)
+        multimodal_outputs: dict[str, list[torch.Tensor | None]] = {}
+        triggered_indices: list[int] = []
+        if observations and input_ids is not None:
+            request_count = len(observations)
+            if request_token_spans is None:
+                if request_count != 1:
+                    raise RuntimeError("Super batched policy inference requires request_token_spans")
+                request_token_spans = [(0, input_ids.numel())]
+            if len(request_token_spans) != request_count:
+                raise RuntimeError("Super request token spans and runner requests must align")
+
+            flat_input_ids = input_ids.reshape(-1)
+            extras = sampling_extra_args if isinstance(sampling_extra_args, list) else []
+            trigger_mask = [
+                observation is not None and end > start and int(flat_input_ids[start]) == self.future_start_id
+                for observation, (start, end) in zip(observations, request_token_spans, strict=True)
+            ]
+            if any(trigger_mask):
+                if runner_kv_cache_context is None:
+                    raise RuntimeError("Super action generation requires runner KV-cache access")
+                if len(runner_kv_cache_context.request_ids) != request_count:
+                    raise RuntimeError("Super policy arguments and runner requests must align")
+            per_request_outputs: list[dict[str, torch.Tensor] | None] = [None] * request_count
+            touched_groups: set[str] = set()
+            for index, (observation, span) in enumerate(zip(observations, request_token_spans, strict=True)):
+                start, end = span
+                # A speculative verification block can contain an unaccepted
+                # future_start after its first token. The accepted boundary is
+                # fed back as the first token of a draft-free request span.
+                if not trigger_mask[index]:
+                    continue
+                assert observation is not None
+                assert runner_kv_cache_context is not None
+                extra = extras[index]
+                if not isinstance(extra, Mapping):
+                    raise RuntimeError("Super policy sampling arguments must be mappings")
+                request_id = runner_kv_cache_context.request_ids[index]
+                group_id, child_index, expected = self._parallel_group_info(
+                    request_id,
+                    extra,
                 )
+                if expected == 1 or not bool(extra.get("_batch_action_expert", True)):
+                    per_request_outputs[index] = self._sample_actions(
+                        caches=runner_kv_cache_context.caches,
+                        block_table=runner_kv_cache_context.block_table[index],
+                        seq_len=runner_kv_cache_context.sequence_lengths[index],
+                        positions=self._request_positions(positions, start, end),
+                        observation=observation,
+                        extra_args=extra,
+                    )
+                    triggered_indices.append(index)
+                    continue
+
+                group = self._pending_policy_groups.setdefault(group_id, {})
+                group.setdefault(
+                    request_id,
+                    {
+                        "child_index": child_index,
+                        "expected": expected,
+                        "block_table": runner_kv_cache_context.block_table[index].clone(),
+                        "seq_len": runner_kv_cache_context.sequence_lengths[index],
+                        "positions": self._request_positions(positions, start, end).clone(),
+                        "observation": observation,
+                        "extra_args": extra,
+                    },
+                )
+                touched_groups.add(group_id)
+
+            request_index_by_id = (
+                {request_id: index for index, request_id in enumerate(runner_kv_cache_context.request_ids)}
+                if runner_kv_cache_context is not None
+                else {}
             )
-            self._force_future_end = True
+            waiting_indices: set[int] = set()
+            for group_id in touched_groups:
+                group = self._pending_policy_groups[group_id]
+                expected_values = {int(entry["expected"]) for entry in group.values()}
+                if len(expected_values) != 1:
+                    raise RuntimeError("Parallel Alpamayo children disagree on sample count")
+                expected = expected_values.pop()
+                all_members_scheduled = all(request_id in request_index_by_id for request_id in group)
+                if len(group) < expected or not all_members_scheduled:
+                    waiting_indices.update(
+                        request_index_by_id[request_id] for request_id in group if request_id in request_index_by_id
+                    )
+                    continue
+
+                ordered = sorted(group.items(), key=lambda item: int(item[1]["child_index"]))
+                batched_output = self._sample_actions_batch(
+                    caches=runner_kv_cache_context.caches,
+                    block_tables=[entry["block_table"] for _, entry in ordered],
+                    seq_lens=[int(entry["seq_len"]) for _, entry in ordered],
+                    positions=[entry["positions"] for _, entry in ordered],
+                    observations=[entry["observation"] for _, entry in ordered],
+                    extra_args=[entry["extra_args"] for _, entry in ordered],
+                )
+                for batch_index, (request_id, _) in enumerate(ordered):
+                    request_index = request_index_by_id[request_id]
+                    per_request_outputs[request_index] = self._split_batched_policy_output(
+                        batched_output,
+                        batch_index,
+                    )
+                    triggered_indices.append(request_index)
+                del self._pending_policy_groups[group_id]
+
+            output_keys = {key for output in per_request_outputs if output is not None for key in output}
+            multimodal_outputs = {
+                key: [output.get(key) if output is not None else None for output in per_request_outputs]
+                for key in output_keys
+            }
+            self._force_future_end_indices = tuple(triggered_indices)
+            self._force_future_start_indices = tuple(sorted(waiting_indices))
         text_hidden_states = hidden_states[0] if isinstance(hidden_states, list | tuple) else hidden_states
         return OmniOutput(
             text_hidden_states=text_hidden_states,
@@ -687,15 +867,22 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         logits = super().compute_logits(hidden_states)
-        if self._force_future_end:
-            self._force_future_end = False
-            selected = logits[..., self.future_end_id].clone()
-            logits.fill_(-torch.inf)
-            logits[..., self.future_end_id] = selected
-        else:
-            traj_ids = self.alpamayo_config.traj_ids
-            start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
-            logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
+        force_end_indices = self._force_future_end_indices
+        force_start_indices = self._force_future_start_indices
+        self._force_future_end_indices = ()
+        self._force_future_start_indices = ()
+        traj_ids = self.alpamayo_config.traj_ids
+        start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
+        logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
+        for force_indices, token_id in (
+            (force_start_indices, self.future_start_id),
+            (force_end_indices, self.future_end_id),
+        ):
+            if not force_indices:
+                continue
+            indices = torch.as_tensor(force_indices, device=logits.device, dtype=torch.long)
+            logits[indices] = -torch.inf
+            logits[indices, token_id] = 0
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

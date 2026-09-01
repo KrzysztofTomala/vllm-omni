@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from transformers import AutoConfig
 from vllm import SamplingParams
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
 
@@ -25,7 +26,7 @@ def _wire_value(value: Any) -> Any:
         return value.item()
     if isinstance(value, Mapping):
         return {str(key): _wire_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_wire_value(item) for item in value]
     return value
 
@@ -62,7 +63,9 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         )
 
     @staticmethod
-    def _frames(observation: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def _frames(
+        observation: Mapping[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
         frames = observation.get("image_frames", observation.get("images"))
         if frames is None:
             raise KeyError("Super observations require image_frames or images")
@@ -73,9 +76,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         camera_indices = torch.as_tensor(observation["camera_indices"], dtype=torch.int64)
         frames_per_camera = int(observation.get("num_frames_per_camera", 4))
         if frame_tensor.ndim == 4:
-            frame_tensor = frame_tensor.unflatten(
-                0, (camera_indices.numel(), frames_per_camera)
-            )
+            frame_tensor = frame_tensor.unflatten(0, (camera_indices.numel(), frames_per_camera))
         return frame_tensor, camera_indices, frames_per_camera
 
     def _policy_prompt(self, observation: Mapping[str, Any]) -> tuple[list[int], list[torch.Tensor]]:
@@ -120,6 +121,10 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         reset: bool,
     ) -> OpenPIEngineRequest:
         prompt_ids, images = self._policy_prompt(observation)
+        sample_count = int(self.policy_config.get("num_trajectory_samples", 1))
+        if sample_count < 1:
+            raise ValueError("num_trajectory_samples must be positive")
+        sampling_seed = int(self.policy_config.get("seed", 42))
         extra_args = {
             "reset": reset,
             "session_id": session_id,
@@ -129,33 +134,32 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                     "ego_history_rot": observation["ego_history_rot"],
                 }
             ),
-            "num_traj_samples": int(self.policy_config.get("num_trajectory_samples", 1)),
+            # vLLM's native parallel-sampling path creates one independently
+            # decoded VLM completion per trajectory.  Each child invokes the
+            # action expert once, conditioned on its own reasoning prefix.
+            "num_traj_samples": 1,
+            "_parallel_sample_count": sample_count,
+            "_batch_action_expert": bool(self.policy_config.get("batch_action_expert", True)),
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
-            "_sampling_seed": int(self.policy_config.get("seed", 42)),
-            "_static_expert_cache": bool(
-                self.policy_config.get("static_expert_cache", False)
-            ),
+            "_static_expert_cache": bool(self.policy_config.get("static_expert_cache", False)),
             "_compile_expert": bool(self.policy_config.get("compile_actions", False)),
-            "_manual_action_cudagraph": bool(
-                self.policy_config.get("manual_action_cudagraph", False)
-            ),
-            "_static_expert_cache_max_len": int(
-                self.policy_config.get("static_expert_cache_max_len", 4800)
-            ),
+            "_manual_action_cudagraph": bool(self.policy_config.get("manual_action_cudagraph", False)),
+            "_static_expert_cache_max_len": int(self.policy_config.get("static_expert_cache_max_len", 4800)),
         }
         return OpenPIEngineRequest(
             prompt={
                 "prompt_token_ids": prompt_ids,
                 "multi_modal_data": {"image": images},
-                "multi_modal_uuids": {
-                    "image": [f"{request_id}:image:{index}" for index in range(len(images))]
-                },
+                "multi_modal_uuids": {"image": [f"{request_id}:image:{index}" for index in range(len(images))]},
                 "mm_processor_kwargs": {"device": "cuda"},
             },
             sampling_params=SamplingParams(
+                n=sample_count,
+                seed=sampling_seed,
                 temperature=float(self.policy_config.get("temperature", 0.6)),
                 top_p=float(self.policy_config.get("top_p", 0.98)),
                 max_tokens=int(self.policy_config.get("max_tokens", 128)),
+                output_kind=RequestOutputKind.FINAL_ONLY,
                 # ``future_start`` triggers the in-model action expert on the
                 # following decode step. Stop only after that hook forces the
                 # terminal ``future_end`` token and publishes its payload.
@@ -181,9 +185,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "question": question,
         }
         messages = build_text_task_messages(data, self.model_config, "vqa")
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompt_ids = self.tokenizer.encode(prompt)
         return OpenPIEngineRequest(
             prompt={
@@ -260,12 +262,8 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 "ego_history_rot": torch.as_tensor(observation["ego_history_rot"]),
             }
             if task == "auto_labeling":
-                trajectory_data["ego_future_xyz"] = self._normalize_future_tensor(
-                    future_xyz, rotations=False
-                )
-                trajectory_data["ego_future_rot"] = self._normalize_future_tensor(
-                    future_rot, rotations=True
-                )
+                trajectory_data["ego_future_xyz"] = self._normalize_future_tensor(future_xyz, rotations=False)
+                trajectory_data["ego_future_rot"] = self._normalize_future_tensor(future_rot, rotations=True)
             prompt_ids = fuse_traj_tokens(
                 self.history_tokenizer,
                 self.future_tokenizer,

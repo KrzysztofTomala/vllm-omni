@@ -49,7 +49,9 @@ def _engine_with_policy_config(policy_config=None):
 
 class RecordingEngine:
     def __init__(self):
-        self.od_config = SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+        self.od_config = SimpleNamespace(
+            model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG}
+        )
         self.generate_calls = []
 
     def get_diffusion_od_config(self):
@@ -142,7 +144,9 @@ def test_policy_server_config_reads_omegaconf_stage_config():
             SimpleNamespace(
                 stage_type="diffusion",
                 engine_args=SimpleNamespace(
-                    model_config=OmegaConf.create({"policy_server_config": {"custom_model_key": "from-omegaconf"}})
+                    model_config=OmegaConf.create(
+                        {"policy_server_config": {"custom_model_key": "from-omegaconf"}}
+                    )
                 ),
             )
         ],
@@ -186,7 +190,9 @@ def test_policy_server_config_allows_explicit_empty_config():
 
 def test_policy_server_config_reads_engine_model_config():
     policy_config = {"custom_model_key": "custom-value"}
-    engine_client = SimpleNamespace(model_config=SimpleNamespace(policy_server_config=policy_config))
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(policy_server_config=policy_config)
+    )
 
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
 
@@ -355,7 +361,10 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
     assert engine.saw_overlap is True
 
     sampling_params = [call["sampling_params_list"][0] for call in engine.generate_calls]
-    assert [params.extra_args["session_id"] for params in sampling_params] == ["default", "default"]
+    assert [params.extra_args["session_id"] for params in sampling_params] == [
+        "default",
+        "default",
+    ]
     assert [params.extra_args["reset"] for params in sampling_params] == [True, True]
 
 
@@ -471,3 +480,32 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+def test_parallel_policy_completions_are_aggregated_in_completion_order():
+    policy_config = {
+        **TEST_POLICY_SERVER_CONFIG,
+        "structured_policy_result": True,
+    }
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_engine_with_policy_config(policy_config)
+    )
+    result = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                text=f"reasoning-{index}",
+                multimodal_output={
+                    "actions": torch.full((1, 2, 3), float(index)),
+                    "rotations": torch.full((1, 2, 3, 3), float(index)),
+                },
+            )
+            for index in range(3)
+        ]
+    )
+
+    output = serving._extract_policy_output(result)
+
+    assert output["actions"].shape == (3, 2, 3)
+    assert output["rotations"].shape == (3, 2, 3, 3)
+    assert output["actions"][:, 0, 0].tolist() == [0.0, 1.0, 2.0]
+    assert output["reasoning"] == ["reasoning-0", "reasoning-1", "reasoning-2"]
