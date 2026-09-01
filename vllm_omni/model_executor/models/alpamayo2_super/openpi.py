@@ -17,6 +17,9 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
 
 
+_ACTION_EXPERT_MAX_BATCH_SIZE_ENV = "NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE"
+
+
 def _wire_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
@@ -125,6 +128,30 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         if sample_count < 1:
             raise ValueError("num_trajectory_samples must be positive")
         sampling_seed = int(self.policy_config.get("seed", 42))
+        precision = str(
+            self.policy_config.get("precision")
+            or os.getenv("NIM_PRECISION")
+            or os.getenv("NIM_ALPAMAYO_PRECISION")
+            or "bf16"
+        ).strip().lower()
+        user_batch_size = os.getenv(_ACTION_EXPERT_MAX_BATCH_SIZE_ENV)
+        configured_batch_size = self.policy_config.get("action_expert_max_batch_size")
+        # Three samples is the largest BF16 action-expert batch qualified on an
+        # 80 GB H100. Keep FP8 fully batched by default. A user's environment
+        # override takes priority over the profile configuration in both modes.
+        if user_batch_size is not None:
+            action_expert_max_batch_size = int(user_batch_size)
+        elif configured_batch_size is not None:
+            action_expert_max_batch_size = int(configured_batch_size)
+        elif precision == "bf16":
+            action_expert_max_batch_size = min(sample_count, 3)
+        else:
+            action_expert_max_batch_size = sample_count
+        if action_expert_max_batch_size < 1:
+            raise ValueError(
+                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and "
+                "action_expert_max_batch_size must be positive"
+            )
         extra_args = {
             "reset": reset,
             "session_id": session_id,
@@ -140,6 +167,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "num_traj_samples": 1,
             "_parallel_sample_count": sample_count,
             "_batch_action_expert": bool(self.policy_config.get("batch_action_expert", True)),
+            "_action_expert_max_batch_size": action_expert_max_batch_size,
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
             "_static_expert_cache": bool(self.policy_config.get("static_expert_cache", False)),
             "_compile_expert": bool(self.policy_config.get("compile_actions", False)),

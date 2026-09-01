@@ -1039,7 +1039,6 @@ async def test_stage_pool_submit_initial_fans_out_parallel_sampling() -> None:
     request = SimpleNamespace(
         request_id="req-parallel",
         external_req_id="req-parallel",
-        params=params,
         sampling_params=params,
         prompt_token_ids=[1, 2],
     )
@@ -1054,6 +1053,7 @@ async def test_stage_pool_submit_initial_fans_out_parallel_sampling() -> None:
     ]
     assert [child.sampling_params.n for child in submitted] == [1, 1, 1]
     assert [child.sampling_params.seed for child in submitted] == [17, 18, 19]
+    assert [child.sampling_params.extra_args["num_traj_samples"] for child in submitted] == [1, 1, 1]
     registrations = [kwargs for _, kwargs in output_processor.add_request_calls]
     assert [registration["request_index"] for registration in registrations] == [0, 1, 2]
     assert all(registration["parent_req"] is registrations[0]["parent_req"] for registration in registrations)

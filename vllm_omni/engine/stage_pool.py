@@ -974,12 +974,18 @@ class StagePool:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
         parent_request: ParentRequest | None = None
         requests = [(request, None, 0)]
-        params = getattr(request, "params", None)
+        # ``params`` is the authoritative stage-level SamplingParams. Request
+        # layouts differ across vLLM releases (``params`` versus
+        # ``sampling_params``), so do not rediscover it from the request.
         if int(getattr(params, "n", 1)) > 1:
+            request.sampling_params = params
             parent_request = ParentRequest(request)
             requests = []
             for index in range(parent_request.n):
                 child_id, child_params = parent_request.get_child_info(index)
+                child_extra_args = dict(getattr(child_params, "extra_args", {}) or {})
+                child_extra_args["num_traj_samples"] = 1
+                child_params.extra_args = child_extra_args
                 child_request = copy(request)
                 child_request.request_id = child_id
                 child_request.sampling_params = child_params

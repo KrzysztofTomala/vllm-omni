@@ -22,10 +22,11 @@ ALPAMAYO2_SUPER_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
+            # Token budgets and stop tokens are request-specific: policy
+            # inference stops at future_end, meta-action at future_start, and
+            # auto-labeling/grounding must be allowed to finish text output.
             sampling_constraints={
                 "detokenize": True,
-                "stop_token_ids": [155683],
-                "max_tokens": 128,
             },
         ),
     ),

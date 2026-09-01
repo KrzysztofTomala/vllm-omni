@@ -208,14 +208,50 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def _repeat_cache(cache: DynamicCache, count: int) -> DynamicCache:
         if count == 1:
             return cache
-        repeated = DynamicCache()
-        for layer_index, layer in enumerate(cache.layers):
-            repeated.update(
-                layer.keys.repeat(count, 1, 1, 1),
-                layer.values.repeat(count, 1, 1, 1),
+        # Repeat each layer in place so the one-sample source layer can be
+        # released before the next layer is expanded. Building a second cache
+        # retained the complete source cache until all repeated layers existed,
+        # adding roughly one full dense prefix to the K-sample peak.
+        cache.batch_repeat_interleave(count)
+        return cache
+
+    @classmethod
+    def _gather_prefix_cache_batch(
+        cls,
+        caches: list[torch.Tensor],
+        block_tables: Sequence[torch.Tensor],
+        seq_lens: Sequence[int],
+    ) -> DynamicCache:
+        """Gather distinct paged prefixes directly into one dense batch.
+
+        Gathering every branch into a complete ``DynamicCache`` before
+        combining them retains both the six branch caches and the combined
+        cache. Constructing the batch one layer at a time keeps only one
+        layer's temporary tensors live in addition to the final cache.
+        """
+        if not block_tables or len(block_tables) != len(seq_lens):
+            raise ValueError("Batched prefix block tables and lengths must align")
+        max_length = max(int(seq_len) for seq_len in seq_lens)
+        combined = DynamicCache()
+        for layer_index, paged_layer in enumerate(caches):
+            keys: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+            for block_table, seq_len in zip(block_tables, seq_lens, strict=True):
+                gathered = cls._gather_prefix_cache(
+                    [paged_layer],
+                    block_table,
+                    int(seq_len),
+                )
+                layer = gathered.layers[0]
+                pad_length = max_length - int(seq_len)
+                keys.append(torch.nn.functional.pad(layer.keys, (0, 0, 0, pad_length)))
+                values.append(torch.nn.functional.pad(layer.values, (0, 0, 0, pad_length)))
+            combined.update(
+                torch.cat(keys, dim=0),
+                torch.cat(values, dim=0),
                 layer_index,
             )
-        return repeated
+        return combined
 
     @staticmethod
     def _combine_prefix_caches(caches: Sequence[DynamicCache]) -> DynamicCache:
@@ -494,12 +530,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 raise ValueError("Batched expert branches must use identical diffusion settings")
 
-        individual_prefixes = [
-            self._gather_prefix_cache(caches, block_table, seq_len)
-            for block_table, seq_len in zip(block_tables, seq_lens, strict=True)
-        ]
-        prefix_lengths = [prefix.get_seq_length() for prefix in individual_prefixes]
-        prefix = self._combine_prefix_caches(individual_prefixes)
+        prefix_lengths = [int(seq_len) for seq_len in seq_lens]
+        prefix = self._gather_prefix_cache_batch(caches, block_tables, seq_lens)
         if bool(first_extra.get("_batch_action_expert", True)) is False and sample_count > 1:
             raise ValueError("Sequential expert mode must submit one VLM branch per expert call")
         record_profile_event()
@@ -713,6 +745,27 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             for key, value in output.items()
         }
 
+    @staticmethod
+    def _concat_batched_policy_outputs(
+        outputs: Sequence[Mapping[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Join independently evaluated expert microbatches in sample order."""
+        if not outputs:
+            raise ValueError("At least one action-expert output is required")
+        keys = set(outputs[0])
+        if any(set(output) != keys for output in outputs[1:]):
+            raise RuntimeError("Action-expert microbatches returned different fields")
+        combined: dict[str, torch.Tensor] = {}
+        for key in keys:
+            values = [output[key] for output in outputs]
+            if key in _BATCHED_POLICY_OUTPUT_KEYS:
+                combined[key] = torch.cat(values, dim=0)
+            elif key == "action_profile_ms":
+                combined[key] = torch.stack(values).sum(dim=0)
+            else:
+                combined[key] = values[0]
+        return combined
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -833,14 +886,28 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 ordered = sorted(group.items(), key=lambda item: int(item[1]["child_index"]))
-                batched_output = self._sample_actions_batch(
-                    caches=runner_kv_cache_context.caches,
-                    block_tables=[entry["block_table"] for _, entry in ordered],
-                    seq_lens=[int(entry["seq_len"]) for _, entry in ordered],
-                    positions=[entry["positions"] for _, entry in ordered],
-                    observations=[entry["observation"] for _, entry in ordered],
-                    extra_args=[entry["extra_args"] for _, entry in ordered],
-                )
+                configured_batch_sizes = {
+                    int(entry["extra_args"].get("_action_expert_max_batch_size", expected)) for _, entry in ordered
+                }
+                if len(configured_batch_sizes) != 1:
+                    raise RuntimeError("Parallel Alpamayo children disagree on expert batch size")
+                max_batch_size = configured_batch_sizes.pop()
+                if max_batch_size < 1:
+                    raise ValueError("action_expert_max_batch_size must be positive")
+                microbatch_outputs = []
+                for begin in range(0, len(ordered), max_batch_size):
+                    chunk = ordered[begin : begin + max_batch_size]
+                    microbatch_outputs.append(
+                        self._sample_actions_batch(
+                            caches=runner_kv_cache_context.caches,
+                            block_tables=[entry["block_table"] for _, entry in chunk],
+                            seq_lens=[int(entry["seq_len"]) for _, entry in chunk],
+                            positions=[entry["positions"] for _, entry in chunk],
+                            observations=[entry["observation"] for _, entry in chunk],
+                            extra_args=[entry["extra_args"] for _, entry in chunk],
+                        )
+                    )
+                batched_output = self._concat_batched_policy_outputs(microbatch_outputs)
                 for batch_index, (request_id, _) in enumerate(ordered):
                     request_index = request_index_by_id[request_id]
                     per_request_outputs[request_index] = self._split_batched_policy_output(

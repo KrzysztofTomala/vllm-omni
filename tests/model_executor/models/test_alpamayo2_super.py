@@ -72,7 +72,7 @@ def test_super_pipeline_is_single_stage_policy() -> None:
     assert ALPAMAYO2_SUPER_PIPELINE.model_type == "alpamayo2_super"
     assert len(ALPAMAYO2_SUPER_PIPELINE.stages) == 1
     assert ALPAMAYO2_SUPER_PIPELINE.stages[0].model_stage == "policy"
-    assert ALPAMAYO2_SUPER_PIPELINE.stages[0].sampling_constraints["stop_token_ids"] == [155683]
+    assert ALPAMAYO2_SUPER_PIPELINE.stages[0].sampling_constraints == {"detokenize": True}
 
 
 def test_super_gathers_standard_paged_kv_layout() -> None:
@@ -122,6 +122,52 @@ def test_super_gathers_concatenated_paged_kv_layout() -> None:
     assert gathered.get_seq_length() == 5
     torch.testing.assert_close(gathered.layers[0].keys, expected_key.unsqueeze(0))
     torch.testing.assert_close(gathered.layers[0].values, expected_value.unsqueeze(0))
+
+
+def test_super_repeats_dense_prefix_in_place() -> None:
+    cache = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
+        [torch.arange(2 * 2 * 2 * 1 * 1, dtype=torch.float32).reshape(2, 2, 2, 1, 1)],
+        torch.tensor([0, 1]),
+        seq_len=3,
+    )
+    original_key = cache.layers[0].keys.clone()
+    original_value = cache.layers[0].values.clone()
+
+    repeated = Alpamayo2SuperForConditionalGeneration._repeat_cache(cache, 3)
+
+    assert repeated is cache
+    assert repeated.layers[0].keys.shape[0] == 3
+    torch.testing.assert_close(repeated.layers[0].keys, original_key.repeat_interleave(3, dim=0))
+    torch.testing.assert_close(repeated.layers[0].values, original_value.repeat_interleave(3, dim=0))
+
+
+def test_super_gathers_batched_prefixes_one_layer_at_a_time() -> None:
+    cache = torch.arange(
+        2 * 4 * 2 * 1 * 2,
+        dtype=torch.float32,
+    ).reshape(2, 4, 2, 1, 2)
+    block_tables = [torch.tensor([0, 1]), torch.tensor([2, 3])]
+    seq_lens = [3, 4]
+
+    combined = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_batch(
+        [cache],
+        block_tables,
+        seq_lens,
+    )
+
+    first = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache([cache], block_tables[0], seq_lens[0])
+    second = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache([cache], block_tables[1], seq_lens[1])
+    expected_keys = torch.cat(
+        [torch.nn.functional.pad(first.layers[0].keys, (0, 0, 0, 1)), second.layers[0].keys],
+        dim=0,
+    )
+    expected_values = torch.cat(
+        [torch.nn.functional.pad(first.layers[0].values, (0, 0, 0, 1)), second.layers[0].values],
+        dim=0,
+    )
+    assert combined.get_seq_length() == 4
+    torch.testing.assert_close(combined.layers[0].keys, expected_keys)
+    torch.testing.assert_close(combined.layers[0].values, expected_values)
 
 
 def test_super_static_action_cache_refreshes_prefix_and_rewinds_cursor() -> None:
@@ -394,3 +440,68 @@ def test_super_batched_action_expert_rendezvous_waits_for_every_vlm_child(
     ]
     assert model._force_future_end_indices == (0, 1, 2)
     assert model._pending_policy_groups == {}
+
+
+def test_super_batched_action_expert_honors_microbatch_limit(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+
+    def sample_actions_batch(**kwargs):
+        calls.append(kwargs)
+        markers = torch.tensor(kwargs["seq_lens"], dtype=torch.float32)
+        batch_size = len(markers)
+        return {
+            "actions": markers[:, None, None].expand(-1, 64, 3).clone(),
+            "rotations": markers[:, None, None, None].expand(-1, 64, 3, 3).clone(),
+            "action_expert_invocation_batch_size": torch.full((batch_size,), batch_size, dtype=torch.int32),
+        }
+
+    monkeypatch.setattr(model, "_sample_actions_batch", sample_actions_batch)
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.arange(7, dtype=torch.int32)[:, None],
+        sequence_lengths=(101, 102, 103, 104, 105, 106, 107),
+        request_ids=tuple(f"{index}_parent" for index in range(7)),
+    )
+    extras = [
+        {
+            "robot_obs": {"branch": index},
+            "_parallel_sample_count": 7,
+            "_batch_action_expert": True,
+            "_action_expert_max_batch_size": 3,
+        }
+        for index in range(7)
+    ]
+
+    output = model.make_omni_output(
+        torch.zeros(7, 8),
+        input_ids=torch.full((7,), 7),
+        positions=torch.arange(21).reshape(3, 7),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(index, index + 1) for index in range(7)],
+    )
+
+    assert [call["seq_lens"] for call in calls] == [
+        [101, 102, 103],
+        [104, 105, 106],
+        [107],
+    ]
+    assert [item[0, 0, 0].item() for item in output.multimodal_outputs["actions"]] == [
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+    ]
+    assert [item.item() for item in output.multimodal_outputs["action_expert_invocation_batch_size"]] == [
+        3,
+        3,
+        3,
+        3,
+        3,
+        3,
+        1,
+    ]

@@ -79,6 +79,7 @@ def test_meta_action_request_fuses_history_and_stops_before_policy(text_task_cal
 
     assert request.prompt["prompt_token_ids"] == [91, 92]
     assert len(request.prompt["multi_modal_data"]["image"]) == 4
+    assert request.sampling_params.max_tokens == 512
     assert request.sampling_params.stop_token_ids == [155681]
     assert text_task_calls[0][1] == "meta_action"
 
@@ -88,6 +89,8 @@ def test_vqa_request_bypasses_generic_string_prompt_parser(text_task_calls):
 
     assert "prompt" not in request.prompt
     assert request.prompt["prompt_token_ids"] == [18, 2]
+    assert request.sampling_params.max_tokens == 256
+    assert request.sampling_params.stop_token_ids == []
     assert len(request.prompt["multi_modal_data"]["image"]) == 4
     data, task = text_task_calls[0]
     assert task == "vqa"
@@ -107,12 +110,15 @@ def test_auto_labeling_request_normalizes_future_trajectory(text_task_calls):
     assert fused_data["ego_future_xyz"].shape == (1, 1, 64, 3)
     assert fused_data["ego_future_rot"].shape == (1, 1, 64, 3, 3)
     assert request.sampling_params.max_tokens == 1024
+    assert request.sampling_params.stop_token_ids == []
 
 
 def test_grounding_uses_vqa_prompt_without_trajectory_fusion(text_task_calls):
     request = _adapter().build_text_task_request(_observation(), task="grounding", request_id="grounding-1")
 
     assert request.prompt["prompt_token_ids"] == [25, 2]
+    assert request.sampling_params.max_tokens == 512
+    assert request.sampling_params.stop_token_ids == []
     assert len(text_task_calls) == 1
     data, task = text_task_calls[0]
     assert task == "vqa"
@@ -135,9 +141,76 @@ def test_policy_request_uses_independent_vllm_completions(monkeypatch):
     assert request.sampling_params.output_kind == RequestOutputKind.FINAL_ONLY
     assert request.sampling_params.seed == 100
     assert request.sampling_params.temperature == 0.7
+    assert request.sampling_params.max_tokens == 128
+    assert request.sampling_params.stop_token_ids == [155683]
     # Each VLM child owns one expert result. This must not be 3, which would
     # recreate three trajectories from a single sampled reasoning string.
     assert request.sampling_params.extra_args["num_traj_samples"] == 1
     assert request.sampling_params.extra_args["_parallel_sample_count"] == 3
     assert request.sampling_params.extra_args["_batch_action_expert"] is True
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 3
     assert "_sampling_seed" not in request.sampling_params.extra_args
+
+
+def test_policy_request_caps_default_action_expert_batch_at_three(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {"num_trajectory_samples": 7}
+    monkeypatch.setenv("NIM_PRECISION", "bf16")
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.n == 7
+    assert request.sampling_params.extra_args["_parallel_sample_count"] == 7
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 3
+
+
+def test_policy_request_keeps_fp8_fully_batched_by_default(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {"num_trajectory_samples": 7}
+    monkeypatch.setenv("NIM_PRECISION", "fp8")
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 7
+
+
+def test_policy_request_user_expert_batch_override_has_priority(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {
+        "num_trajectory_samples": 7,
+        "action_expert_max_batch_size": 1,
+    }
+    monkeypatch.setenv("NIM_PRECISION", "bf16")
+    monkeypatch.setenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", "6")
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 6
+
+
+def test_policy_request_profile_expert_batch_override_has_priority(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {
+        "num_trajectory_samples": 7,
+        "precision": "bf16",
+        "action_expert_max_batch_size": 1,
+    }
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 1
