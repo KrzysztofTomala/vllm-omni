@@ -214,3 +214,70 @@ def test_policy_request_profile_expert_batch_override_has_priority(monkeypatch):
     )
 
     assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 1
+
+
+def test_policy_request_profile_precision_has_priority_over_environment(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {
+        "num_trajectory_samples": 7,
+        "precision": "fp8",
+    }
+    monkeypatch.setenv("NIM_PRECISION", "bf16")
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 7
+
+
+def test_policy_request_supports_legacy_precision_environment(monkeypatch):
+    adapter = _adapter()
+    adapter.policy_config = {"num_trajectory_samples": 7}
+    monkeypatch.delenv("NIM_PRECISION", raising=False)
+    monkeypatch.setenv("NIM_ALPAMAYO_PRECISION", "fp8")
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    request = adapter.build_request(
+        _observation(), request_id="policy-1", session_id="session-1", reset=True
+    )
+
+    assert request.sampling_params.extra_args["_action_expert_max_batch_size"] == 7
+
+
+@pytest.mark.parametrize("value", ["not-an-int", "0", "-1"])
+def test_policy_request_rejects_invalid_user_expert_batch_override(
+    monkeypatch, value
+):
+    adapter = _adapter()
+    adapter.policy_config = {"num_trajectory_samples": 7}
+    monkeypatch.setenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", value)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    with pytest.raises(
+        ValueError, match="NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE"
+    ):
+        adapter.build_request(
+            _observation(), request_id="policy-1", session_id="session-1", reset=True
+        )
+
+
+@pytest.mark.parametrize("value", ["not-an-int", 0, -1])
+def test_policy_request_rejects_invalid_profile_expert_batch_override(
+    monkeypatch, value
+):
+    adapter = _adapter()
+    adapter.policy_config = {
+        "num_trajectory_samples": 7,
+        "action_expert_max_batch_size": value,
+    }
+    monkeypatch.delenv("NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(adapter, "_policy_prompt", lambda _observation: ([1, 2], []))
+
+    with pytest.raises(ValueError, match="action_expert_max_batch_size"):
+        adapter.build_request(
+            _observation(), request_id="policy-1", session_id="session-1", reset=True
+        )

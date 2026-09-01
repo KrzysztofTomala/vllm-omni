@@ -16,7 +16,6 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
 
-
 _ACTION_EXPERT_MAX_BATCH_SIZE_ENV = "NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE"
 
 
@@ -139,18 +138,24 @@ class Alpamayo2SuperOpenPIRequestAdapter:
         # Three samples is the largest BF16 action-expert batch qualified on an
         # 80 GB H100. Keep FP8 fully batched by default. A user's environment
         # override takes priority over the profile configuration in both modes.
-        if user_batch_size is not None:
-            action_expert_max_batch_size = int(user_batch_size)
-        elif configured_batch_size is not None:
-            action_expert_max_batch_size = int(configured_batch_size)
-        elif precision == "bf16":
-            action_expert_max_batch_size = min(sample_count, 3)
-        else:
-            action_expert_max_batch_size = sample_count
+        try:
+            if user_batch_size is not None:
+                action_expert_max_batch_size = int(user_batch_size)
+            elif configured_batch_size is not None:
+                action_expert_max_batch_size = int(configured_batch_size)
+            elif precision == "bf16":
+                action_expert_max_batch_size = min(sample_count, 3)
+            else:
+                action_expert_max_batch_size = sample_count
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and "
+                "action_expert_max_batch_size must be positive integers"
+            ) from exc
         if action_expert_max_batch_size < 1:
             raise ValueError(
                 f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and "
-                "action_expert_max_batch_size must be positive"
+                "action_expert_max_batch_size must be positive integers"
             )
         extra_args = {
             "reset": reset,
