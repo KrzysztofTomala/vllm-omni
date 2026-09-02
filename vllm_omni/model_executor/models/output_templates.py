@@ -13,3 +13,4 @@ class OmniOutput(NamedTuple):
     multimodal_outputs: OmniPayload | None = None
     intermediate_tensors: IntermediateTensors | None = None
     next_token_id: torch.Tensor | None = None
+    aux_hidden_states: list[torch.Tensor] | None = None

@@ -308,7 +308,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"static action cache is too short: need at least {minimum_length} tokens, got {effective_max_len}"
             )
         static_cache = StaticCache(
-            config=self.expert.expert.config,
+            config=self.expert.config.llm_config,
             max_cache_len=effective_max_len,
         )
         cache_position = torch.arange(
@@ -500,6 +500,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         observations: Sequence[Mapping[str, Any]],
         extra_args: Sequence[Mapping[str, Any]],
     ) -> dict[str, torch.Tensor]:
+        target_cache_layers = int(self.expert.config.llm_config.num_hidden_layers)
+        if len(caches) < target_cache_layers:
+            raise RuntimeError(
+                "Alpamayo action generation received fewer target KV-cache "
+                f"layers than expected: got {len(caches)}, expected {target_cache_layers}"
+            )
+        # vLLM 0.28 appends speculative-draft caches after the target model's
+        # layers. The action expert is conditioned only on the target prefix.
+        caches = caches[:target_cache_layers]
         device = caches[0].device
         sample_count = len(observations)
         if not (sample_count == len(block_tables) == len(seq_lens) == len(positions) == len(extra_args)):
@@ -786,7 +795,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def make_omni_output(
         self,
-        hidden_states: torch.Tensor | IntermediateTensors,
+        hidden_states: torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]],
         *,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor,
@@ -924,10 +933,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             }
             self._force_future_end_indices = tuple(triggered_indices)
             self._force_future_start_indices = tuple(sorted(waiting_indices))
-        text_hidden_states = hidden_states[0] if isinstance(hidden_states, list | tuple) else hidden_states
+        if isinstance(hidden_states, list | tuple):
+            text_hidden_states = hidden_states[0]
+            aux_hidden_states = hidden_states[1]
+        else:
+            text_hidden_states = hidden_states
+            aux_hidden_states = None
         return OmniOutput(
             text_hidden_states=text_hidden_states,
             multimodal_outputs=multimodal_outputs,
+            aux_hidden_states=aux_hidden_states,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor:

@@ -55,6 +55,8 @@ class Alpamayo2SuperConfig(Qwen3VLConfig):
             vision_config=vision_config,
             **kwargs,
         )
+        # vLLM's DFlash proposer still uses the Qwen2-style attribute name.
+        self.image_token_index = self.image_token_id
         self.vlm_config = dict(vlm_config or {})
         self.expert_config = dict(expert_config or {})
         self.hist_traj_tokenizer_cfg = dict(hist_traj_tokenizer_cfg or {})

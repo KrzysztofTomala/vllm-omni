@@ -65,6 +65,7 @@ def test_super_config_flattens_nested_qwen_config(tmp_path) -> None:
     config = Alpamayo2SuperConfig.from_pretrained(tmp_path)
     assert config.text_config.hidden_size == 1024
     assert config.vision_config.out_hidden_size == 1024
+    assert config.image_token_index == config.image_token_id == 151655
     assert config.traj_ids["future_start"] == 155681
 
 
@@ -329,6 +330,50 @@ def test_super_action_ignores_terminal_later_in_verification_block(monkeypatch) 
     assert calls == []
     assert output.multimodal_outputs == {}
     assert model._force_future_end_indices == ()
+
+
+def test_super_preserves_aux_hidden_states_for_dflash() -> None:
+    model = _minimal_policy_model()
+    text_hidden_states = torch.zeros(1, 8)
+    aux_hidden_states = [torch.ones(1, 8), torch.full((1, 8), 2.0)]
+
+    output = model.make_omni_output(
+        (text_hidden_states, aux_hidden_states),
+        positions=torch.arange(3).reshape(3, 1),
+    )
+
+    assert output.text_hidden_states is text_hidden_states
+    assert output.aux_hidden_states is aux_hidden_states
+
+
+def test_super_excludes_speculative_draft_cache_from_action_prefix(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    model.expert = SimpleNamespace(
+        config=SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=2)),
+    )
+    received = []
+
+    def capture_target_caches(caches, _block_tables, _seq_lens):
+        received.extend(caches)
+        raise RuntimeError("captured target caches")
+
+    monkeypatch.setattr(model, "_gather_prefix_cache_batch", capture_target_caches)
+    target_caches = [torch.zeros(1), torch.ones(1)]
+    draft_cache = torch.full((1,), 2.0)
+
+    with pytest.raises(RuntimeError, match="captured target caches"):
+        model._sample_actions_batch(
+            caches=[*target_caches, draft_cache],
+            block_tables=[torch.zeros(1, dtype=torch.int32)],
+            seq_lens=[1],
+            positions=[torch.zeros(3, 1, dtype=torch.long)],
+            observations=[{}],
+            extra_args=[{}],
+        )
+
+    assert len(received) == 2
+    assert received[0] is target_caches[0]
+    assert received[1] is target_caches[1]
 
 
 def test_super_action_routes_independent_batched_policy_children(monkeypatch) -> None:

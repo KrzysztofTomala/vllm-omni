@@ -42,6 +42,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -50,6 +51,18 @@ from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentio
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
+
+
+def _unpack_hidden_states_for_speculation(
+    model_output: OmniOutput | tuple[torch.Tensor, list[torch.Tensor]],
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if isinstance(model_output, OmniOutput):
+        aux_hidden_states = model_output.aux_hidden_states
+        if aux_hidden_states is None:
+            raise RuntimeError("Speculative decoding requires auxiliary hidden states")
+        return model_output.text_hidden_states, aux_hidden_states
+    hidden_states, aux_hidden_states = model_output
+    return hidden_states, aux_hidden_states
 
 
 def _mask_model_owned_terminal_drafts(
@@ -1310,7 +1323,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                hidden_states, aux_hidden_states = _unpack_hidden_states_for_speculation(model_output)
             else:
                 # Common case.
                 hidden_states = model_output

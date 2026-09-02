@@ -5,16 +5,34 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
     _mask_model_owned_terminal_drafts,
+    _unpack_hidden_states_for_speculation,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_unpack_hidden_states_for_speculation_from_omni_output() -> None:
+    hidden_states = torch.zeros(1, 8)
+    aux_hidden_states = [torch.ones(1, 8)]
+    output = OmniOutput(hidden_states, aux_hidden_states=aux_hidden_states)
+
+    actual_hidden, actual_aux = _unpack_hidden_states_for_speculation(output)
+
+    assert actual_hidden is hidden_states
+    assert actual_aux is aux_hidden_states
+
+
+def test_unpack_hidden_states_for_speculation_requires_aux_output() -> None:
+    with pytest.raises(RuntimeError, match="requires auxiliary hidden states"):
+        _unpack_hidden_states_for_speculation(OmniOutput(torch.zeros(1, 8)))
 
 
 def test_mask_model_owned_terminal_drafts() -> None:
