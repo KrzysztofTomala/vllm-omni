@@ -263,10 +263,18 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model = object.__new__(Alpamayo2SuperForConditionalGeneration)
     nn.Module.__init__(model)
     model.alpamayo_config = SimpleNamespace(
-        traj_ids={"future_start": 7, "future_end": 9},
+        traj_ids={
+            "history_id0": 10,
+            "future_id0": 20,
+            "future_start": 7,
+            "future_end": 9,
+        },
+        traj_vocab_size=4,
     )
     model._force_future_end_indices = ()
     model._force_future_start_indices = ()
+    model._mask_text_eos_indices = ()
+    model._text_eos_token_ids = (2, 3)
     model._pending_policy_groups = {}
     return model
 
@@ -344,6 +352,45 @@ def test_super_preserves_aux_hidden_states_for_dflash() -> None:
 
     assert output.text_hidden_states is text_hidden_states
     assert output.aux_hidden_states is aux_hidden_states
+
+
+def test_super_masks_text_eos_only_for_trajectory_rows(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    model.make_omni_output(
+        torch.zeros(3, 24),
+        input_ids=torch.tensor([5, 5, 5]),
+        positions=torch.arange(9).reshape(3, 3),
+        sampling_extra_args=[{"robot_obs": {}}, {}, {"robot_obs": {}}],
+        request_token_spans=[(0, 1), (1, 2), (2, 3)],
+    )
+
+    logits = model.compute_logits(torch.zeros(3, 24))
+
+    assert torch.isneginf(logits[0, 2:4]).all()
+    assert torch.equal(logits[1, 2:4], torch.zeros(2))
+    assert torch.isneginf(logits[2, 2:4]).all()
+    assert torch.equal(logits[:, model.future_start_id], torch.zeros(3))
+    assert model._mask_text_eos_indices == ()
+
+
+def test_super_forced_action_boundary_overrides_eos_mask(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    model._text_eos_token_ids = (2, model.future_end_id)
+    model._mask_text_eos_indices = (0,)
+    model._force_future_end_indices = (0,)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+
+    logits = model.compute_logits(torch.zeros(1, 24))
+
+    assert torch.isneginf(logits[0]).sum() == logits.shape[-1] - 1
+    assert logits[0, model.future_end_id] == 0
 
 
 def test_super_excludes_speculative_draft_cache_from_action_prefix(monkeypatch) -> None:

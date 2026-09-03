@@ -100,7 +100,17 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._force_future_end_indices: tuple[int, ...] = ()
         self._force_future_start_indices: tuple[int, ...] = ()
+        self._mask_text_eos_indices: tuple[int, ...] = ()
         self._pending_policy_groups: dict[str, dict[str, dict[str, Any]]] = {}
+        generation_config = vllm_config.model_config.try_get_generation_config()
+        text_eos_ids = generation_config.get("eos_token_id")
+        if text_eos_ids is None:
+            text_eos_ids = getattr(self.alpamayo_config.text_config, "eos_token_id", None)
+        if isinstance(text_eos_ids, int):
+            text_eos_ids = [text_eos_ids]
+        self._text_eos_token_ids = tuple(
+            int(token_id) for token_id in (text_eos_ids or []) if int(token_id) != self.future_start_id
+        )
 
     @property
     def future_start_id(self) -> int:
@@ -807,6 +817,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         observations = self._policy_observations(sampling_extra_args)
+        # The released OSS model does not allow an ordinary text EOS to end
+        # trajectory reasoning. Generation must continue until future_start,
+        # which transfers control to the action expert. Keep this per request
+        # so text-only tasks retain their normal EOS behavior in mixed batches.
+        self._mask_text_eos_indices = tuple(
+            index for index, observation in enumerate(observations) if observation is not None
+        )
         multimodal_outputs: dict[str, list[torch.Tensor | None]] = {}
         triggered_indices: list[int] = []
         if observations and input_ids is not None:
@@ -951,11 +968,19 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         logits = super().compute_logits(hidden_states)
         force_end_indices = self._force_future_end_indices
         force_start_indices = self._force_future_start_indices
+        mask_text_eos_indices = self._mask_text_eos_indices
         self._force_future_end_indices = ()
         self._force_future_start_indices = ()
+        self._mask_text_eos_indices = ()
         traj_ids = self.alpamayo_config.traj_ids
         start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
         logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
+        if mask_text_eos_indices and self._text_eos_token_ids:
+            indices = torch.as_tensor(mask_text_eos_indices, device=logits.device, dtype=torch.long)
+            logits[
+                indices[:, None],
+                torch.as_tensor(self._text_eos_token_ids, device=logits.device, dtype=torch.long),
+            ] = -torch.inf
         for force_indices, token_id in (
             (force_start_indices, self.future_start_id),
             (force_end_indices, self.future_end_id),
