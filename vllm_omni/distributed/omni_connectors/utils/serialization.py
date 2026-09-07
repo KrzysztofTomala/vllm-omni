@@ -43,6 +43,12 @@ class OmniMsgpackEncoder:
 
     def encode(self, obj: Any) -> bytes:
         """Encode an object to bytes."""
+        # msgspec serializes dataclasses without calling enc_hook, which would
+        # drop extension attributes such as spec_decode_metrics. Normalize a
+        # top-level CompletionOutput explicitly; nested completions in a
+        # RequestOutput are handled by _encode_request_output.
+        if isinstance(obj, CompletionOutput):
+            obj = self._encode_completion_output(obj)
         return self.encoder.encode(obj)
 
     def _enc_hook(self, obj: Any) -> Any:
@@ -161,7 +167,7 @@ class OmniMsgpackEncoder:
         return result
 
     def _encode_completion_output(self, obj: CompletionOutput) -> dict[str, Any]:
-        """Encode CompletionOutput to dict, preserving multimodal payloads."""
+        """Encode CompletionOutput, preserving dynamically attached payloads."""
         result = asdict(obj)
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
@@ -170,6 +176,14 @@ class OmniMsgpackEncoder:
                 result["multimodal_output"] = dict(mm_output)
             else:
                 result["multimodal_output"] = mm_output
+        spec_decode_metrics = getattr(obj, "spec_decode_metrics", None)
+        if spec_decode_metrics is not None:
+            if hasattr(spec_decode_metrics, "to_dict"):
+                result["spec_decode_metrics"] = spec_decode_metrics.to_dict()
+            elif isinstance(spec_decode_metrics, Mapping):
+                result["spec_decode_metrics"] = dict(spec_decode_metrics)
+            else:
+                result["spec_decode_metrics"] = spec_decode_metrics
         return result
 
 
@@ -302,9 +316,12 @@ class OmniMsgpackDecoder:
     def _decode_completion_output(self, obj: dict[str, Any]) -> CompletionOutput:
         """Decode dict to CompletionOutput using msgspec.convert."""
         mm_output = obj.pop("multimodal_output", None)
+        spec_decode_metrics = obj.pop("spec_decode_metrics", None)
         co = msgspec.convert(obj, CompletionOutput)
         if mm_output is not None:
             setattr(co, "multimodal_output", mm_output)
+        if spec_decode_metrics is not None:
+            setattr(co, "spec_decode_metrics", spec_decode_metrics)
         return co
 
     def _decode_request_output(self, obj: dict[str, Any]) -> RequestOutput:

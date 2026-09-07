@@ -125,6 +125,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Cumulative speculative-decoding statistics for this request. Populated
+    # only when the stage enables per-request metrics.
+    spec_decode_metrics: dict[str, Any] | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

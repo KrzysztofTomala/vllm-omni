@@ -81,6 +81,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
+        self._init_per_request_spec_decode_metrics()
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
@@ -388,6 +389,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                self._observe_per_request_spec_decode_metrics(
+                    request,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=(
+                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                        if scheduler_output.num_invalid_spec_tokens
+                        else 0
+                    ),
+                )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -403,6 +414,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             kv_transfer_params = None
             status_before_stop = request.status
             finish_reason = None
+            request_finished = False
             routed_experts = None
 
             # Check for stop and update request status.
@@ -442,6 +454,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason = request.get_finished_reason()
                 is_segment_finished = True
                 finished = self._handle_stopped_request(request)
+                request_finished = finished
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -494,6 +507,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        spec_decode_metrics=self._per_request_spec_decode_metrics_snapshot(
+                            request, finished=request_finished
+                        ),
                     )
                 )
             else:
@@ -518,6 +534,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # [Main] Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            spec_metrics = {
+                request.request_id: self._per_request_spec_decode_metrics_snapshot(request, finished=True)
+                for request in requests
+            }
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
@@ -527,6 +547,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        spec_decode_metrics=spec_metrics[request.request_id],
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

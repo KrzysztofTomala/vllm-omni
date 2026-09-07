@@ -82,6 +82,7 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        self.spec_decode_metrics: dict[str, Any] | None = None
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -256,6 +257,9 @@ class OmniRequestState(RequestState):
         else:
             base_output.cumulative_token_ids = list(token_ids)
 
+        if finish_reason is not None and self.spec_decode_metrics is not None:
+            setattr(base_output, "spec_decode_metrics", dict(self.spec_decode_metrics))
+
         # Attach cumulative_text only at the final step for inter-stage use.
         if finish_reason is not None and hasattr(self.detokenizer, "output_text"):
             base_output.cumulative_text = self.detokenizer.output_text
@@ -278,6 +282,8 @@ class OmniRequestState(RequestState):
                 output.cumulative_token_ids = base_output.cumulative_token_ids
                 if hasattr(base_output, "cumulative_text"):
                     output.cumulative_text = base_output.cumulative_text
+                if finish_reason is not None and self.spec_decode_metrics is not None:
+                    setattr(output, "spec_decode_metrics", dict(self.spec_decode_metrics))
 
                 # DELTA mode: drain modality keys (e.g. audio) so the next
                 # step only sees freshly accumulated data for those keys.
@@ -496,6 +502,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                spec_decode_metrics = getattr(eco, "spec_decode_metrics", None)
+                if spec_decode_metrics is not None:
+                    req_state.spec_decode_metrics = dict(spec_decode_metrics)
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type

@@ -10,9 +10,14 @@ import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 
-from vllm_omni.outputs.output_modality import OutputModalityNames
-from vllm_omni.outputs.output_processor import OmniRequestState
+from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
+from vllm_omni.outputs.output_processor import (
+    MultimodalOutputProcessor,
+    OmniRequestState,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -210,6 +215,62 @@ def test_cumulative_token_ids_is_a_copy():
     s = _make_state(RequestOutputKind.DELTA)
     out = s._new_completion_output([42], None, None)
     assert out.cumulative_token_ids is not _DETOK.output_token_ids
+
+
+@pytest.mark.parametrize("with_multimodal_output", [False, True])
+def test_completion_output_includes_spec_decode_metrics(with_multimodal_output: bool):
+    """Metrics reach both plain and multimodal completion outputs."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.spec_decode_metrics = {
+        "num_draft_tokens": 7,
+        "num_accepted_draft_tokens": 4,
+        "num_spec_steps": 1,
+        "draft_acceptance_rate": 4 / 7,
+        "mean_acceptance_length": 5.0,
+    }
+    if with_multimodal_output:
+        s.add_multimodal_tensor(torch.ones(2), mm_type=AUDIO)
+
+    out = s._new_completion_output([42], FinishReason.STOP, None)
+
+    assert out.spec_decode_metrics == s.spec_decode_metrics
+    assert out.spec_decode_metrics is not s.spec_decode_metrics
+
+
+def test_output_processor_propagates_engine_spec_decode_metrics(monkeypatch):
+    """Text routing captures the engine payload before upstream processing."""
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.TEXT
+    processor.request_states = {state.request_id: state}
+    metrics = {
+        "num_draft_tokens": 7,
+        "num_accepted_draft_tokens": 4,
+        "num_spec_steps": 1,
+        "draft_acceptance_rate": 4 / 7,
+        "mean_acceptance_length": 5.0,
+    }
+    upstream_result = MagicMock()
+
+    def process_upstream(self, outputs, **_kwargs):
+        assert outputs[0].request_id == state.request_id
+        assert self.request_states[state.request_id].spec_decode_metrics == metrics
+        return upstream_result
+
+    monkeypatch.setattr(VLLMOutputProcessor, "process_outputs", process_upstream)
+
+    result = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id=state.request_id,
+                new_token_ids=[42],
+                finish_reason=FinishReason.STOP,
+                spec_decode_metrics=metrics,
+            )
+        ]
+    )
+
+    assert result is upstream_result
 
 
 # ---------------------------------------------------------------------------

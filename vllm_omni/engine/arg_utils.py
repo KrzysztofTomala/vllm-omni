@@ -208,8 +208,16 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    per_request_spec_decode_metrics: str = "none"
 
     def __post_init__(self) -> None:
+        self.per_request_spec_decode_metrics = self.per_request_spec_decode_metrics.strip().lower()
+        if self.per_request_spec_decode_metrics not in {"none", "summary", "detailed"}:
+            raise ValueError(
+                "per_request_spec_decode_metrics must be one of "
+                "'none', 'summary', or 'detailed'; got "
+                f"{self.per_request_spec_decode_metrics!r}"
+            )
         if self.worker_cls is None:
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -380,6 +388,7 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            per_request_spec_decode_metrics=self.per_request_spec_decode_metrics,
         )
         return omni_config
 

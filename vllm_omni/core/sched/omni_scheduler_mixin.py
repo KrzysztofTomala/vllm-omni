@@ -8,9 +8,10 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.metrics.spec_decode import RequestSpecDecodeMetrics
 
 logger = init_logger(__name__)
 
@@ -39,6 +40,54 @@ except ValueError:
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    def _init_per_request_spec_decode_metrics(self) -> None:
+        """Initialize the request-scoped speculative metrics configuration."""
+        self.spec_decode_metrics_level = getattr(
+            self.vllm_config.model_config,
+            "per_request_spec_decode_metrics",
+            "none",
+        )
+
+    def add_request(self, request: Request) -> None:
+        """Admit a request and initialize Omni-owned speculative metrics."""
+        is_new = request.request_id not in self.requests
+        super().add_request(request)
+        if (
+            is_new
+            and self.spec_decode_metrics_level != "none"
+            and getattr(request, "spec_decode_metrics", None) is None
+        ):
+            request.spec_decode_metrics = RequestSpecDecodeMetrics.new(int(self.num_spec_tokens or 0))
+
+    def _observe_per_request_spec_decode_metrics(
+        self,
+        request: Request,
+        *,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        num_invalid_spec_tokens: int = 0,
+    ) -> None:
+        """Accumulate one speculative verification step for a request."""
+        metrics = getattr(request, "spec_decode_metrics", None)
+        if metrics is not None:
+            metrics.observe(
+                num_draft_tokens=num_draft_tokens - num_invalid_spec_tokens,
+                num_accepted=num_accepted_tokens,
+                detailed=self.spec_decode_metrics_level == "detailed",
+            )
+
+    def _per_request_spec_decode_metrics_snapshot(
+        self,
+        request: Request,
+        *,
+        finished: bool,
+    ) -> dict[str, Any] | None:
+        """Return the public terminal metrics payload for a request."""
+        if not finished:
+            return None
+        metrics = getattr(request, "spec_decode_metrics", None)
+        return metrics.to_dict() if metrics is not None else None
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""

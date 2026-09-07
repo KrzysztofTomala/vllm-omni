@@ -43,6 +43,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
+        self._init_per_request_spec_decode_metrics()
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
@@ -481,6 +482,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                self._observe_per_request_spec_decode_metrics(
+                    request,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=(
+                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                        if scheduler_output.num_invalid_spec_tokens
+                        else 0
+                    ),
+                )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -494,6 +505,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
+            request_finished = False
             routed_experts = None
 
             # Diffusion request: completes in one step; mark finished and free resources
@@ -517,6 +529,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                request_finished = finished
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -570,6 +583,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        spec_decode_metrics=self._per_request_spec_decode_metrics_snapshot(
+                            request, finished=request_finished
+                        ),
                     )
                 )
             else:
@@ -601,6 +617,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     events=request.take_events(),
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
+                    spec_decode_metrics=self._per_request_spec_decode_metrics_snapshot(request, finished=finished),
                 )
             )
             stopped_running_reqs.add(request)
@@ -617,6 +634,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            spec_metrics = {
+                request.request_id: self._per_request_spec_decode_metrics_snapshot(request, finished=True)
+                for request in requests
+            }
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
@@ -626,6 +647,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        spec_decode_metrics=spec_metrics[request.request_id],
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

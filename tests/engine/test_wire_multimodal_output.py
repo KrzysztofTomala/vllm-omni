@@ -53,6 +53,27 @@ def test_empty_multimodal_roundtrip():
     assert decoded.outputs[0].multimodal_output is None
 
 
+def test_spec_decode_metrics_roundtrip():
+    """Per-request speculative metrics survive engine IPC."""
+    metrics = {
+        "num_draft_tokens": 14,
+        "num_accepted_draft_tokens": 10,
+        "num_spec_steps": 2,
+        "draft_acceptance_rate": 10 / 14,
+        "mean_acceptance_length": 6.0,
+    }
+    eco = OmniEngineCoreOutput(
+        request_id="req-spec",
+        new_token_ids=[1],
+        finish_reason=None,
+        spec_decode_metrics=metrics,
+    )
+
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[eco]))
+
+    assert decoded.outputs[0].spec_decode_metrics == metrics
+
+
 def test_multiple_tensor_keys_roundtrip():
     """Multiple tensor keys survive roundtrip."""
     hidden = torch.randn(10, 4096)
