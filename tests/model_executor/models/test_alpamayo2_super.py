@@ -76,6 +76,25 @@ def test_super_pipeline_is_single_stage_policy() -> None:
     assert ALPAMAYO2_SUPER_PIPELINE.stages[0].sampling_constraints == {"detokenize": True}
 
 
+def test_super_action_noise_can_be_recreated_after_inference() -> None:
+    extra_args = [{"_sampling_seed": 42}, {"_sampling_seed": 43}]
+
+    action = Alpamayo2SuperForConditionalGeneration._recreate_action_noise(
+        extra_args,
+        action_dims=(4, 3),
+        device=torch.device("cpu"),
+    )
+    receipt = Alpamayo2SuperForConditionalGeneration._recreate_action_noise(
+        extra_args,
+        action_dims=(4, 3),
+        device=torch.device("cpu"),
+    )
+
+    assert receipt.data_ptr() != action.data_ptr()
+    torch.testing.assert_close(receipt, action, rtol=0, atol=0)
+    assert not torch.equal(action[0], action[1])
+
+
 def test_super_gathers_standard_paged_kv_layout() -> None:
     blocks = 3
     block_size = 2

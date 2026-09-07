@@ -303,6 +303,32 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return positions[:, :1].to(device)
         return positions.reshape(-1)[:1].repeat(3, 1).to(device)
 
+    @staticmethod
+    def _recreate_action_noise(
+        extra_args: Sequence[Mapping[str, Any]],
+        *,
+        action_dims: tuple[int, ...],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Recreate independently seeded noise after trajectory inference."""
+        noise_rows: list[torch.Tensor] = []
+        for extra in extra_args:
+            sampling_seed = extra.get("_sampling_seed")
+            generator = None
+            if sampling_seed is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(sampling_seed))
+            noise_rows.append(
+                torch.randn(
+                    1,
+                    *action_dims,
+                    device=device,
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+            )
+        return torch.cat(noise_rows, dim=0)
+
     def _make_static_action_cache(
         self,
         cache: DynamicCache,
@@ -586,9 +612,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
             )
         action = torch.cat(noise_rows, dim=0)
-        initial_noise = (
-            action.clone() if any(bool(extra.get("_return_action_noise", False)) for extra in extra_args) else None
-        )
+        return_initial_noise = any(bool(extra.get("_return_action_noise", False)) for extra in extra_args)
+        if return_initial_noise and any(extra.get("_sampling_seed") is None for extra in extra_args):
+            raise ValueError("Action-noise diagnostics require a sampling seed")
         action = action * temperature
 
         last_position = torch.cat(
@@ -708,8 +734,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 device=device,
                 dtype=torch.float32,
             )
-        if initial_noise is not None:
-            result["action_noise"] = initial_noise
+        if return_initial_noise:
+            # Recreate the receipt only after trajectory computation. Keeping
+            # the original GPU tensor alive changes allocator reuse during the
+            # expert pass and can perturb otherwise deterministic trajectories.
+            result["action_noise"] = self._recreate_action_noise(
+                extra_args,
+                action_dims=action_dims,
+                device=device,
+            )
         result["action_expert_invocation_batch_size"] = torch.full(
             (sample_count,),
             sample_count,
