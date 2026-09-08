@@ -12,6 +12,8 @@ from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as a
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
     alpamayo_flash_attention_3_forward,
+    compile_action_expert,
+    expert_fa3_attention,
     expert_fa3_supports,
     resolve_expert_attention_backend,
 )
@@ -217,6 +219,124 @@ def test_super_static_action_cache_refreshes_prefix_and_rewinds_cursor() -> None
     assert target_layer.cumulative_length.item() == 2
 
 
+def _random_paged_caches(layout, *, layers, blocks, block_size, kv_heads, head_dim, dtype, generator):
+    """Build random paged K/V layers in one of the supported vLLM layouts."""
+    caches = []
+    for _ in range(layers):
+        if layout == "fa_rank4":
+            shape = (blocks, kv_heads, block_size, 2 * head_dim)
+        elif layout == "rank5_kv_first":
+            shape = (2, blocks, block_size, kv_heads, head_dim)
+        elif layout == "rank5_kv_second":
+            shape = (blocks, 2, block_size, kv_heads, head_dim)
+        else:
+            raise AssertionError(layout)
+        caches.append(torch.randn(*shape, generator=generator).to(dtype))
+    return caches
+
+
+def _sentinel_static_cache(*, layers, rows, kv_heads, max_len, head_dim, dtype):
+    """A StaticCache stand-in prefilled with a sentinel so untouched positions are visible."""
+    return SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                keys=torch.full((rows, kv_heads, max_len, head_dim), -7.0, dtype=dtype),
+                values=torch.full((rows, kv_heads, max_len, head_dim), -9.0, dtype=dtype),
+                cumulative_length=torch.tensor([max_len]),
+            )
+            for _ in range(layers)
+        ]
+    )
+
+
+@pytest.mark.parametrize("layout", ["fa_rank4", "rank5_kv_first", "rank5_kv_second"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[37], [32], [5], [37, 37], [48, 16, 33], [37, 50, 21]],
+    ids=["one-row", "block-multiple", "sub-block", "equal-rows", "mixed-multiples", "three-rows"],
+)
+def test_super_direct_static_gather_matches_dynamic_cache_path(layout, dtype, seq_lens) -> None:
+    block_size = 16
+    kv_heads = 2
+    head_dim = 4
+    layers = 2
+    blocks = 16
+    suffix_length = 8
+    rows = len(seq_lens)
+    generator = torch.Generator().manual_seed(1234)
+    caches = _random_paged_caches(
+        layout,
+        layers=layers,
+        blocks=blocks,
+        block_size=block_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        generator=generator,
+    )
+    # Distinct random block tables per row; every row uses a partial last block.
+    block_tables = [
+        torch.randperm(blocks, generator=generator)[: (seq_len + block_size - 1) // block_size] for seq_len in seq_lens
+    ]
+    prefix_len = max(seq_lens)
+    max_len = prefix_len + suffix_length
+    cache_kwargs = dict(layers=layers, rows=rows, kv_heads=kv_heads, max_len=max_len, head_dim=head_dim, dtype=dtype)
+
+    expected = _sentinel_static_cache(**cache_kwargs)
+    dense = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_batch(caches, block_tables, seq_lens)
+    Alpamayo2SuperForConditionalGeneration._copy_action_prefix(expected, dense, prefix_len)
+
+    direct = _sentinel_static_cache(**cache_kwargs)
+    Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(caches, block_tables, seq_lens, direct)
+
+    for expected_layer, direct_layer in zip(expected.layers, direct.layers, strict=True):
+        assert torch.equal(direct_layer.keys, expected_layer.keys)
+        assert torch.equal(direct_layer.values, expected_layer.values)
+        assert torch.equal(direct_layer.cumulative_length, expected_layer.cumulative_length)
+        assert direct_layer.cumulative_length.item() == prefix_len
+        for row, seq_len in enumerate(seq_lens):
+            # Right padding is zero; nothing past the batch prefix length is written.
+            assert torch.all(direct_layer.keys[row, :, seq_len:prefix_len] == 0)
+            assert torch.all(direct_layer.values[row, :, seq_len:prefix_len] == 0)
+            assert torch.all(direct_layer.keys[row, :, prefix_len:] == -7.0)
+            assert torch.all(direct_layer.values[row, :, prefix_len:] == -9.0)
+    # The gathered rows match the per-request reference gather exactly.
+    for row, (block_table, seq_len) in enumerate(zip(block_tables, seq_lens, strict=True)):
+        reference = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(caches, block_table, seq_len)
+        for layer_index, direct_layer in enumerate(direct.layers):
+            assert torch.equal(direct_layer.keys[row, :, :seq_len], reference.layers[layer_index].keys[0])
+            assert torch.equal(direct_layer.values[row, :, :seq_len], reference.layers[layer_index].values[0])
+
+
+def test_super_direct_static_gather_rejects_mismatched_cache() -> None:
+    caches = _random_paged_caches(
+        "fa_rank4",
+        layers=1,
+        blocks=4,
+        block_size=2,
+        kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        generator=torch.Generator().manual_seed(0),
+    )
+    too_short = _sentinel_static_cache(layers=1, rows=1, kv_heads=1, max_len=3, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="cannot hold 1 prefixes of up to 5 tokens"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], too_short
+        )
+    wrong_rows = _sentinel_static_cache(layers=1, rows=2, kv_heads=1, max_len=8, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="cannot hold 1 prefixes"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], wrong_rows
+        )
+    wrong_layers = _sentinel_static_cache(layers=2, rows=1, kv_heads=1, max_len=8, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="has 2 layers, expected 1"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], wrong_layers
+        )
+
+
 def test_super_fixed_action_mask_hides_unused_static_cache() -> None:
     mask = Alpamayo2SuperForConditionalGeneration._make_action_attention_mask(
         sample_count=1,
@@ -352,6 +472,309 @@ def test_super_flash_attention_3_fallback_forwards_sdpa_arguments(monkeypatch) -
     assert calls[0][1]["is_causal"] is False
 
 
+_FA3_OP_NAME = "alpamayo2_super::expert_fa3_attention"
+
+
+def _fa3_cpu_reference(query, key, value, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale):
+    """CPU kernel honoring the op contract: attend to the first ``cu_seqlens_k[1]`` keys."""
+    assert query.shape[2] == max_seqlen_q and key.shape[2] == max_seqlen_k
+    assert cu_seqlens_q.tolist() == [0, max_seqlen_q]
+    valid_key_length = int(cu_seqlens_k[1])
+    groups = query.shape[1] // key.shape[1]
+    keys = key[:, :, :valid_key_length].repeat_interleave(groups, dim=1)
+    values = value[:, :, :valid_key_length].repeat_interleave(groups, dim=1)
+    output = torch.nn.functional.scaled_dot_product_attention(query, keys, values, scale=softmax_scale)
+    return output.transpose(1, 2).contiguous()
+
+
+def _register_fa3_cpu_reference() -> None:
+    # The production op is CUDA-only; give it a CPU kernel once per process.
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(_FA3_OP_NAME, "CPU"):
+        expert_fa3_attention.register_kernel("cpu")(_fa3_cpu_reference)
+
+
+def _force_fa3_predicate(monkeypatch) -> None:
+    """Let the shape predicate accept CPU float32 so the op path is exercised off-GPU."""
+    original = expert_fa3_supports
+    monkeypatch.setattr(
+        alpamayo2_super_module,
+        "expert_fa3_supports",
+        lambda **kwargs: original(**{**kwargs, "device_type": "cuda", "dtype": torch.bfloat16}),
+    )
+
+
+def test_super_expert_fa3_custom_op_registered_with_fake_impl() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    assert torch.ops.alpamayo2_super.expert_fa3_attention.default is expert_fa3_attention._opoverload
+    assert torch._C._dispatch_has_kernel_for_dispatch_key(_FA3_OP_NAME, "CUDA")
+    with FakeTensorMode():
+        query = torch.empty(1, 16, 64, 128, dtype=torch.bfloat16)
+        key = torch.empty(1, 8, 4800, 128, dtype=torch.bfloat16)
+        cu_seqlens = torch.empty(2, dtype=torch.int32)
+        output = torch.ops.alpamayo2_super.expert_fa3_attention(query, key, key, cu_seqlens, cu_seqlens, 64, 4800, 0.1)
+    assert output.shape == (1, 64, 16, 128)
+    assert output.dtype == torch.bfloat16
+    assert output.device == query.device
+
+    _register_fa3_cpu_reference()
+    torch.manual_seed(0)
+    query = torch.randn(1, 4, 2, 8)
+    key = torch.randn(1, 2, 6, 8)
+    args = (
+        query,
+        key,
+        key,
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([0, 5], dtype=torch.int32),
+        2,
+        6,
+        0.5,
+    )
+    torch.library.opcheck(expert_fa3_attention, args, test_utils=("test_schema", "test_faketensor"))
+
+
+def test_super_expert_fa3_impl_passes_kernel_views_and_varlen_lengths(monkeypatch) -> None:
+    import vllm.vllm_flash_attn as vllm_flash_attn
+
+    calls = []
+
+    def fake_varlen(q, k, v, max_seqlen_q, cu_seqlens_q, max_seqlen_k, cu_seqlens_k, **kwargs):
+        calls.append((q, k, v, max_seqlen_q, cu_seqlens_q, max_seqlen_k, cu_seqlens_k, kwargs))
+        return torch.arange(q.numel(), dtype=q.dtype).view(q.shape)
+
+    monkeypatch.setattr(vllm_flash_attn, "flash_attn_varlen_func", fake_varlen)
+    query = torch.randn(1, 4, 3, 8)
+    key = torch.randn(1, 2, 16, 8)
+    value = torch.randn(1, 2, 16, 8)
+    cu_seqlens_q = torch.tensor([0, 3], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 9], dtype=torch.int32)
+
+    output = alpamayo2_super_module._expert_fa3_attention_impl(
+        query, key, value, cu_seqlens_q, cu_seqlens_k, 3, 16, 0.25
+    )
+
+    ((q, k, v, max_seqlen_q, got_cu_q, max_seqlen_k, got_cu_k, kwargs),) = calls
+    # Varlen layout (tokens, heads, head_dim) taken as views of the HF tensors.
+    assert q.shape == (3, 4, 8) and k.shape == (16, 2, 8) and v.shape == (16, 2, 8)
+    assert q.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
+    assert k.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+    assert v.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+    torch.testing.assert_close(q, query.transpose(1, 2).reshape(3, 4, 8))
+    assert (max_seqlen_q, max_seqlen_k) == (3, 16)
+    assert got_cu_q is cu_seqlens_q and got_cu_k is cu_seqlens_k
+    assert kwargs == {"softmax_scale": 0.25, "causal": False, "fa_version": 3}
+    assert output.shape == (1, 3, 4, 8)
+    torch.testing.assert_close(output.reshape(3, 4, 8), torch.arange(96, dtype=torch.float32).view(3, 4, 8))
+
+
+def test_super_flash_attention_3_calls_op_with_device_side_lengths(monkeypatch) -> None:
+    _force_fa3_predicate(monkeypatch)
+    calls = []
+
+    def fake_op(*args):
+        calls.append(args)
+        query = args[0]
+        return query.new_zeros((1, query.shape[2], query.shape[1], query.shape[-1]))
+
+    monkeypatch.setattr(alpamayo2_super_module, "expert_fa3_attention", fake_op)
+    module = SimpleNamespace(is_causal=False, num_key_value_groups=2)
+    query = torch.randn(1, 4, 3, 8)
+    key = torch.randn(1, 2, 16, 8)
+
+    output, weights = alpamayo_flash_attention_3_forward(
+        module, query, key, key, None, scaling=0.25, is_causal=False, cache_position=torch.arange(9, 12)
+    )
+
+    assert weights is None and output.shape == (1, 3, 4, 8)
+    ((got_query, got_key, got_value, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale),) = calls
+    assert got_query is query and got_key is key and got_value is key
+    assert cu_seqlens_q.dtype == cu_seqlens_k.dtype == torch.int32
+    assert cu_seqlens_q.tolist() == [0, 3]
+    # Valid keys = last cache position + 1, not the StaticCache allocation.
+    assert cu_seqlens_k.tolist() == [0, 12]
+    assert (max_seqlen_q, max_seqlen_k) == (3, 16)
+    assert softmax_scale == 0.25
+
+    # Without cache_position every allocated key is valid; scaling defaults to 1/sqrt(head_dim).
+    alpamayo_flash_attention_3_forward(module, query, key, key, None, is_causal=False)
+    _, _, _, _, cu_seqlens_k, _, _, softmax_scale = calls[1]
+    assert cu_seqlens_k.tolist() == [0, 16]
+    assert softmax_scale == pytest.approx(8**-0.5)
+
+
+def test_super_flash_attention_3_fallback_never_reaches_op(monkeypatch) -> None:
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    _force_fa3_predicate(monkeypatch)
+    monkeypatch.setattr(
+        alpamayo2_super_module,
+        "expert_fa3_attention",
+        lambda *args: pytest.fail("unsupported shapes must take SDPA, not the FA3 op"),
+    )
+    torch.manual_seed(0)
+    module = SimpleNamespace(is_causal=False, num_key_value_groups=1)
+    query = torch.randn(2, 4, 3, 8)
+    key = torch.randn(2, 4, 16, 8)
+
+    # Two prefix rows (navigation CFG) and causal attention both fall back.
+    for is_causal, rows in ((False, 2), (True, 1)):
+        output, _ = alpamayo_flash_attention_3_forward(
+            module, query[:rows], key[:rows], key[:rows], None, is_causal=is_causal
+        )
+        expected, _ = sdpa_attention_forward(module, query[:rows], key[:rows], key[:rows], None, is_causal=is_causal)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_super_flash_attention_3_op_matches_sdpa_over_valid_keys(monkeypatch) -> None:
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    _register_fa3_cpu_reference()
+    _force_fa3_predicate(monkeypatch)
+    torch.manual_seed(0)
+    module = SimpleNamespace(is_causal=False, num_key_value_groups=2)
+    query = torch.randn(1, 4, 3, 8)
+    key = torch.randn(1, 2, 16, 8)
+    value = torch.randn(1, 2, 16, 8)
+    valid_key_length = 11
+
+    output, weights = alpamayo_flash_attention_3_forward(
+        module, query, key, value, None, is_causal=False, cache_position=torch.arange(8, valid_key_length)
+    )
+    expected, _ = sdpa_attention_forward(
+        module, query, key[:, :, :valid_key_length], value[:, :, :valid_key_length], None, is_causal=False
+    )
+
+    assert weights is None
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
+def _tiny_expert_decoder(attn_implementation: str):
+    """Two-layer Qwen3-VL text decoder shaped like the released expert (GQA, MRoPE)."""
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+
+    torch.manual_seed(0)
+    config = Qwen3VLTextConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        vocab_size=32,
+        rope_parameters={
+            "mrope_interleaved": True,
+            "mrope_section": [4, 2, 2],
+            "rope_type": "default",
+            "rope_theta": 1e4,
+        },
+    )
+    config._attn_implementation = attn_implementation
+    decoder = Qwen3VLTextModel(config).eval()
+    del decoder.embed_tokens
+    return decoder
+
+
+def _tiny_expert_static_inputs(decoder, *, prefix_length=8, suffix_length=4, max_cache_len=16):
+    from transformers import DynamicCache, StaticCache
+
+    config = decoder.config
+    prefix = DynamicCache(config=config)
+    for layer_index in range(config.num_hidden_layers):
+        prefix.update(torch.randn(1, 2, prefix_length, 16), torch.randn(1, 2, prefix_length, 16), layer_index)
+    static_cache = StaticCache(config=config, max_cache_len=max_cache_len)
+    for layer_index, layer in enumerate(prefix.layers):
+        static_cache.update(layer.keys, layer.values, layer_index)
+    attention_mask = torch.full((1, 1, suffix_length, max_cache_len), torch.finfo(torch.float32).min)
+    attention_mask[..., : prefix_length + suffix_length] = 0
+    positions = (torch.arange(suffix_length) + prefix_length)[None, None].expand(3, 1, suffix_length).contiguous()
+    return dict(
+        inputs_embeds=torch.randn(1, suffix_length, 64),
+        position_ids=positions,
+        past_key_values=static_cache,
+        attention_mask=attention_mask,
+        cache_position=torch.arange(prefix_length, prefix_length + suffix_length),
+        use_cache=True,
+        is_causal=False,
+    )
+
+
+def _run_tiny_expert_step(decoder, inputs, *, prefix_length=8):
+    # Mirrors one flow-matching step of _run_manual_action_graph: forward, then
+    # rewind the StaticCache write cursor so the suffix is overwritten next step.
+    with torch.inference_mode():
+        output = decoder(**inputs).last_hidden_state
+    for layer in inputs["past_key_values"].layers:
+        layer.cumulative_length.fill_(prefix_length)
+    return output
+
+
+def test_super_compiled_expert_traces_fa3_expert_without_graph_breaks(monkeypatch) -> None:
+    _register_fa3_cpu_reference()
+    _force_fa3_predicate(monkeypatch)
+    decoder = _tiny_expert_decoder("alpamayo_fa3")
+    inputs = _tiny_expert_static_inputs(decoder)
+    expected = _run_tiny_expert_step(decoder, inputs)
+    torch._dynamo.reset()
+    try:
+        explanation = torch._dynamo.explain(_run_tiny_expert_step)(decoder, inputs)
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+        assert explanation.graph_count == 1
+        fa3_nodes = [
+            node
+            for graph in explanation.graphs
+            for node in graph.graph.nodes
+            if node.op == "call_function" and "expert_fa3_attention" in str(node.target)
+        ]
+        # One opaque attention node per layer: the layer loop unrolled into a single frame.
+        assert len(fa3_nodes) == decoder.config.num_hidden_layers
+
+        compiled = compile_action_expert(decoder)
+        output = _run_tiny_expert_step(compiled, inputs)
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+        # Same static shapes and cache: the replay reuses the single compiled graph.
+        torch.testing.assert_close(_run_tiny_expert_step(compiled, inputs), output, rtol=0, atol=0)
+    finally:
+        torch._dynamo.reset()
+
+
+def test_super_compiled_expert_traces_cfg_dynamic_cache_without_graph_breaks() -> None:
+    from transformers import DynamicCache
+
+    # Navigation CFG runs two prefix rows through a DynamicCache on SDPA; the
+    # fullgraph compile must hold there too instead of raising at startup.
+    decoder = _tiny_expert_decoder("alpamayo_fa3")
+    prefix_length, suffix_length = 8, 4
+    cache = DynamicCache(config=decoder.config)
+    for layer_index in range(decoder.config.num_hidden_layers):
+        cache.update(torch.randn(2, 2, prefix_length, 16), torch.randn(2, 2, prefix_length, 16), layer_index)
+    inputs = dict(
+        inputs_embeds=torch.randn(2, suffix_length, 64),
+        position_ids=(torch.arange(suffix_length) + prefix_length)[None, None].expand(3, 2, suffix_length).contiguous(),
+        past_key_values=cache,
+        attention_mask=torch.zeros(2, 1, suffix_length, prefix_length + suffix_length),
+        cache_position=None,
+        use_cache=True,
+        is_causal=False,
+    )
+
+    def step(model):
+        with torch.inference_mode():
+            output = model(**inputs).last_hidden_state
+        cache.crop(prefix_length)
+        return output
+
+    torch._dynamo.reset()
+    try:
+        explanation = torch._dynamo.explain(step)(decoder)
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+        assert explanation.graph_count == 1
+    finally:
+        torch._dynamo.reset()
+
+
 def test_super_resolves_fa3_expert_backend_when_available() -> None:
     assert resolve_expert_attention_backend("alpamayo_fa3", fa3_available=True, allow_fallback=False) == "alpamayo_fa3"
     assert resolve_expert_attention_backend("alpamayo_fa3", fa3_available=True, allow_fallback=True) == "alpamayo_fa3"
@@ -418,6 +841,7 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._nav_twin_prefill_lengths = {}
     model._logits_request_count = None
     model._compiled_expert = None
+    model._action_graphs = {}
     model.expert_attention_backend_requested = "sdpa"
     model.expert_attention_backend = "sdpa"
     model._decode_cudagraph_observation = -1
@@ -543,6 +967,7 @@ def test_super_excludes_speculative_draft_cache_from_action_prefix(monkeypatch) 
     model = _minimal_policy_model()
     model.expert = SimpleNamespace(
         config=SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=2)),
+        action_space=SimpleNamespace(get_action_space_dims=lambda: (2, 1)),
     )
     received = []
 
@@ -1396,6 +1821,192 @@ def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> No
             unguided_seq_lens=[1, 1],
             unguided_positions=[torch.full((3, 1), 8)],
         )
+
+
+def _manual_graph_extras(steps: int = 2) -> list[dict]:
+    return [
+        {
+            "_sampling_seed": 5,
+            "diffusion_steps": steps,
+            "_manual_action_cudagraph": True,
+            "_static_expert_cache": True,
+            "_static_expert_cache_max_len": 16,
+        }
+    ]
+
+
+def _run_manual_graph_sample(model, block_table, seq_len):
+    return model._sample_actions_batch(
+        caches=[_cfg_test_cache()],
+        block_tables=[block_table],
+        seq_lens=[seq_len],
+        positions=[torch.full((3, 1), 10)],
+        observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+        extra_args=_manual_graph_extras(),
+    )
+
+
+def _fake_action_graph_state(max_len: int = 16) -> dict:
+    """A captured-graph state as ``_run_manual_action_graph`` stores it, with a CPU stand-in graph."""
+    replays: list[int] = []
+    return {
+        "cache": SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    keys=torch.zeros(1, 1, max_len, 1),
+                    values=torch.zeros(1, 1, max_len, 1),
+                    cumulative_length=torch.tensor([max_len]),
+                )
+            ]
+        ),
+        "action": torch.zeros(1, 2, 1),
+        "positions": torch.zeros(3, 1, 2, dtype=torch.long),
+        "attention_mask": torch.zeros(1, 1, 2, max_len, dtype=torch.bfloat16),
+        "cache_position": torch.zeros(2, dtype=torch.long),
+        "graph": SimpleNamespace(replay=lambda: replays.append(1)),
+        "output": torch.tensor([[[42.0], [43.0]]]),
+        "replays": replays,
+    }
+
+
+def test_super_manual_graph_first_shape_builds_dense_prefix(monkeypatch) -> None:
+    model = _cfg_test_model()
+    model._action_graphs = {}
+    captured: dict = {}
+
+    def fake_manual_graph(**kwargs):
+        captured.update(kwargs)
+        return kwargs["action"]
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_manual_graph)
+    monkeypatch.setattr(
+        model,
+        "_gather_prefix_cache_into_static",
+        lambda *_args, **_kwargs: pytest.fail("An unknown graph shape must not gather into a StaticCache"),
+    )
+
+    _run_manual_graph_sample(model, torch.tensor([1, 2]), 2)
+
+    assert isinstance(captured["prefix"], alpamayo2_super_module.DynamicCache)
+    assert captured["prefix"].get_seq_length() == 2
+    assert captured["prefix_length"] == 2
+    assert captured["static_cache_max_len"] == 16
+
+
+def test_super_manual_graph_reuses_state_and_gathers_prefix_directly(monkeypatch) -> None:
+    model = _cfg_test_model()
+    state = _fake_action_graph_state()
+    key = model._action_graph_key(
+        action_shape=(1, 2, 1),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 1, 2),
+        attention_mask_shape=(1, 1, 2, 16),
+        inference_steps=2,
+    )
+    model._action_graphs = {key: state}
+    monkeypatch.setattr(
+        model,
+        "_gather_prefix_cache_batch",
+        lambda *_args, **_kwargs: pytest.fail("A known graph shape must not build a DynamicCache"),
+    )
+    monkeypatch.setattr(
+        model,
+        "_make_static_action_cache",
+        lambda *_args, **_kwargs: pytest.fail("A known graph shape must not create a new StaticCache"),
+    )
+    monkeypatch.setattr(
+        model,
+        "_copy_action_prefix",
+        lambda *_args, **_kwargs: pytest.fail("The direct gather replaces _copy_action_prefix"),
+    )
+
+    first = _run_manual_graph_sample(model, torch.tensor([1, 2]), 2)
+    second = _run_manual_graph_sample(model, torch.tensor([5, 3]), 2)
+
+    assert len(model._action_graphs) == 1
+    assert model._action_graphs[key] is state
+    assert state["replays"] == [1, 1]
+    layer = state["cache"].layers[0]
+    # The second request's prefix (blocks 5 and 3) replaced the first one in place.
+    assert layer.keys.flatten().tolist()[:3] == [5.0, 3.0, 0.0]
+    assert layer.values.flatten().tolist()[:3] == [5.0, 3.0, 0.0]
+    assert layer.cumulative_length.tolist() == [2]
+    assert state["cache_position"].tolist() == [2, 3]
+    assert state["attention_mask"].shape == (1, 1, 2, 16)
+    torch.testing.assert_close(first["normalized_controls"], state["output"])
+    torch.testing.assert_close(second["normalized_controls"], state["output"])
+    assert first["normalized_controls"].data_ptr() != state["output"].data_ptr()
+
+
+def test_super_manual_graph_requires_dense_prefix_for_new_state() -> None:
+    model = _cfg_test_model()
+    model._action_graphs = {}
+    with pytest.raises(RuntimeError, match="dense prefix cache is required"):
+        model._run_manual_action_graph(
+            expert=model.expert.expert,
+            prefix=None,
+            prefix_length=2,
+            action=torch.zeros(1, 2, 1),
+            expert_positions=torch.zeros(3, 1, 2, dtype=torch.long),
+            attention_mask=torch.zeros(1, 1, 2, 16, dtype=torch.bfloat16),
+            inference_steps=2,
+            suffix_length=2,
+            static_cache_max_len=16,
+        )
+
+
+def test_super_manual_graph_state_lookup_matches_traced_key() -> None:
+    """The planned-shape key used before gathering equals the key traced from real tensors."""
+    action = torch.zeros(3, 2, 1)
+    positions = torch.zeros(3, 3, 2, dtype=torch.long)
+    mask = torch.zeros(3, 1, 2, 16, dtype=torch.bfloat16)
+    traced = Alpamayo2SuperForConditionalGeneration._action_graph_key(
+        action_shape=tuple(action.shape),
+        action_dtype=action.dtype,
+        device=action.device,
+        positions_shape=tuple(positions.shape),
+        attention_mask_shape=tuple(mask.shape),
+        inference_steps=10,
+    )
+    planned = Alpamayo2SuperForConditionalGeneration._action_graph_key(
+        action_shape=(3, *(2, 1)),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 3, 2),
+        attention_mask_shape=(3, 1, 2, 16),
+        inference_steps=10,
+    )
+    assert traced == planned
+    assert hash(traced) == hash(planned)
+
+
+def test_super_sample_actions_compiles_expert_once_through_helper(monkeypatch) -> None:
+    model = _cfg_test_model()
+    compiled_experts = []
+
+    def fake_compile(expert):
+        compiled_experts.append(expert)
+        return expert
+
+    monkeypatch.setattr(alpamayo2_super_module, "compile_action_expert", fake_compile)
+    observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
+    extras = [{"_sampling_seed": 1, "diffusion_steps": 2, "_compile_expert": True}]
+    kwargs = dict(
+        caches=[_cfg_test_cache()],
+        block_tables=[torch.tensor([1])],
+        seq_lens=[1],
+        positions=[torch.full((3, 1), 10)],
+        observations=observations,
+        extra_args=extras,
+    )
+
+    first = model._sample_actions_batch(**kwargs)
+    second = model._sample_actions_batch(**kwargs)
+
+    assert compiled_experts == [model.expert.expert]
+    assert model._compiled_expert is model.expert.expert
+    torch.testing.assert_close(first["normalized_controls"], second["normalized_controls"], rtol=0, atol=0)
 
 
 def test_super_action_output_reports_attention_backend_and_decode_graph_state() -> None:
