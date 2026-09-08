@@ -37,6 +37,7 @@ _PARALLEL_POLICY_BATCH_KEYS = frozenset(
         "normalized_controls",
         "action_noise",
         "action_expert_invocation_batch_size",
+        "action_expert_attention_fa3",
     }
 )
 

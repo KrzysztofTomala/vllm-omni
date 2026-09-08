@@ -497,6 +497,8 @@ def test_parallel_policy_completions_are_aggregated_in_completion_order():
                 multimodal_output={
                     "actions": torch.full((1, 2, 3), float(index)),
                     "rotations": torch.full((1, 2, 3, 3), float(index)),
+                    "action_expert_attention_fa3": torch.tensor([index % 2], dtype=torch.int32),
+                    "action_expert_attention_backend_configured": torch.tensor(1, dtype=torch.int32),
                 },
             )
             for index in range(3)
@@ -509,3 +511,8 @@ def test_parallel_policy_completions_are_aggregated_in_completion_order():
     assert output["rotations"].shape == (3, 2, 3, 3)
     assert output["actions"][:, 0, 0].tolist() == [0.0, 1.0, 2.0]
     assert output["reasoning"] == ["reasoning-0", "reasoning-1", "reasoning-2"]
+    # Per-sample report keys concatenate like the trajectories; request-level
+    # scalars stay one entry per completion.
+    assert output["action_expert_attention_fa3"].shape == (3,)
+    assert output["action_expert_attention_fa3"].tolist() == [0, 1, 0]
+    assert len(output["action_expert_attention_backend_configured"]) == 3
