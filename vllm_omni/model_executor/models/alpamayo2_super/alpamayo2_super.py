@@ -86,6 +86,70 @@ def expert_fa3_supports(
     )
 
 
+def _expert_fa3_attention_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run vLLM's FA3 varlen kernel on one non-causal ``(1, heads, seq, dim)`` sample.
+
+    ``torch.ops._vllm_fa3_C.fwd`` has no fake implementation, so calling it
+    directly is a Dynamo graph break that splits every expert layer into
+    separately compiled frames. Wrapping it in a custom op with a fake kernel
+    lets the compiled expert trace through attention as one opaque node while
+    eager execution (and manual CUDA-graph capture) still launches the real
+    kernel. Callers decide FA3 eligibility in eager Python beforehand
+    (``expert_fa3_supports``), so this op only sees dropout-free non-causal
+    half-precision CUDA inputs. Returns ``(1, max_seqlen_q, query_heads, head_dim)``.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    query_heads, head_dim = query.shape[1], query.shape[-1]
+    # With one sample the batch dimension merges into the sequence for free,
+    # so these are views: the kernel only requires a unit stride on head_dim.
+    output = flash_attn_varlen_func(
+        query.transpose(1, 2).reshape(-1, query_heads, head_dim),
+        key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1]),
+        value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1]),
+        max_seqlen_q,
+        cu_seqlens_q,
+        max_seqlen_k,
+        cu_seqlens_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+    )
+    return output.view(1, max_seqlen_q, query_heads, head_dim)
+
+
+def _expert_fa3_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return query.new_empty((1, query.shape[2], query.shape[1], query.shape[-1]))
+
+
+# CUDA-only: eligibility (device, dtype, one row, non-causal) is decided by
+# ``expert_fa3_supports`` in eager Python before the op is reached.
+expert_fa3_attention = torch.library.custom_op(
+    "alpamayo2_super::expert_fa3_attention",
+    mutates_args=(),
+    device_types="cuda",
+)(_expert_fa3_attention_impl)
+expert_fa3_attention.register_fake(_expert_fa3_attention_fake)
+
+
 def alpamayo_flash_attention_3_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -107,7 +171,9 @@ def alpamayo_flash_attention_3_forward(
     StaticCache allocates more K/V tokens than are valid. ``cache_position``
     supplies the live sequence length to FA3 through device-side cumulative
     lengths, preserving CUDA-graph replay without a host synchronization.
-    Shapes outside ``expert_fa3_supports`` fall back to HF SDPA.
+    Shapes outside ``expert_fa3_supports`` fall back to HF SDPA; supported ones
+    launch the kernel through the ``expert_fa3_attention`` custom op so the
+    compiled expert traces through attention without a graph break.
     """
 
     effective_is_causal = bool(is_causal) if is_causal is not None else bool(getattr(module, "is_causal", True))
@@ -143,8 +209,6 @@ def alpamayo_flash_attention_3_forward(
             f"got query={query.dtype}, key={key.dtype}, value={value.dtype}"
         )
 
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
-
     query_length = query.shape[2]
     allocated_key_length = key.shape[2]
     cache_position = kwargs.get("cache_position")
@@ -158,20 +222,18 @@ def alpamayo_flash_attention_3_forward(
         valid_key_length = cache_position.reshape(-1)[-1].to(dtype=torch.int32) + 1
     cu_seqlens_q = torch.stack((valid_key_length.new_zeros(()), valid_key_length.new_full((), query_length)))
     cu_seqlens_k = torch.stack((valid_key_length.new_zeros(()), valid_key_length))
-    output = flash_attn_varlen_func(
-        query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1]),
-        key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1]),
-        value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1]),
-        query_length,
+    softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
+    output = expert_fa3_attention(
+        query,
+        key,
+        value,
         cu_seqlens_q,
-        allocated_key_length,
         cu_seqlens_k,
-        dropout_p=dropout,
-        softmax_scale=scaling,
-        causal=False,
-        fa_version=3,
+        query_length,
+        allocated_key_length,
+        softmax_scale,
     )
-    return output.view(1, query_length, query.shape[1], query.shape[-1]), None
+    return output, None
 
 
 AttentionInterface.register(EXPERT_ATTENTION_BACKEND_FA3, alpamayo_flash_attention_3_forward)
@@ -247,6 +309,31 @@ def resolve_expert_attention_backend(
         EXPERT_ATTENTION_BACKEND_SDPA,
     )
     return EXPERT_ATTENTION_BACKEND_SDPA
+
+
+def compile_action_expert(expert: nn.Module) -> nn.Module:
+    """Compile the expert decoder stack as one Dynamo frame.
+
+    The decoder's layer loop unrolls into a single graph, so every layer's
+    ``layer_idx`` is a trace-time constant. With a graph break inside
+    attention, ``Cache.update`` and the attention call instead became shared
+    per-layer frames whose ``layer_idx`` guards recompiled once per layer,
+    exhausting ``torch._dynamo.config.recompile_limit`` and leaving the
+    remaining layers eager. ``fullgraph=True`` turns any future graph break
+    into a startup error that names the break instead of that silent
+    fallback. Shapes are static because ``_run_manual_action_graph`` fixes the
+    StaticCache, mask, and action suffix per captured graph; Inductor's own
+    CUDA graphs stay off since that method captures the whole integration.
+    Inference only: the FA3 op has no backward, and the model runner already
+    executes under ``torch.inference_mode``.
+    """
+    logger.info("Compiling the Alpamayo action expert as a single graph (fullgraph=True, static shapes)")
+    return torch.compile(
+        expert,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
 
 
 class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
@@ -1106,12 +1193,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         expert = self.expert.expert
         if bool(first_extra.get("_compile_expert", False)):
             if self._compiled_expert is None:
-                self._compiled_expert = torch.compile(
-                    self.expert.expert,
-                    fullgraph=False,
-                    dynamic=False,
-                    options={"triton.cudagraphs": False},
-                )
+                self._compiled_expert = compile_action_expert(self.expert.expert)
             expert = self._compiled_expert
         if manual_action_cudagraph:
             action = self._run_manual_action_graph(
