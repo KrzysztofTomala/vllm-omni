@@ -2514,3 +2514,39 @@ def test_pointwise_config_guard_wraps_inductor_autotuner(monkeypatch) -> None:
     assert triton_heuristics.cached_autotune([1024], configs, {}, HeuristicType.POINTWISE) == "autotuner"
     assert triton_heuristics.cached_autotune([1024], configs, {}, HeuristicType.REDUCTION) == "autotuner"
     assert seen == [(HeuristicType.POINTWISE, [128]), (HeuristicType.REDUCTION, [256, 128])]
+
+
+def _bare_pinned_host_processor():
+    from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import PinnedHostPixelValuesProcessor
+
+    processor = object.__new__(PinnedHostPixelValuesProcessor)
+    processor.image_token = "<|image_pad|>"
+    processor.image_token_id = 7
+    return processor
+
+
+def test_pinned_host_processor_placeholder_check_matches_base_semantics() -> None:
+    processor = _bare_pinned_host_processor()
+    text = ["a <|image_pad|><|image_pad|> b", "<|image_pad|>"]
+    ids = torch.tensor([[1, 7, 7, 2], [7, 0, 0, 0]])
+    processor._check_special_mm_tokens(text, {"input_ids": ids}, ["image", "video"])
+    processor._check_special_mm_tokens(text, {"input_ids": ids.tolist()}, ["image"])
+    with pytest.raises(ValueError, match="Mismatch in `image` token count"):
+        processor._check_special_mm_tokens(["<|image_pad|>"], {"input_ids": torch.tensor([[1, 2]])}, ["image"])
+
+
+def test_pinned_host_processor_leaves_host_pixel_values_alone(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    processor = _bare_pinned_host_processor()
+    host_values = torch.ones(4, 8, dtype=torch.float32)
+    calls = []
+    monkeypatch.setattr(
+        module.Qwen3VLProcessor,
+        "__call__",
+        lambda self, *a, **k: calls.append(k) or {"pixel_values": host_values, "input_ids": torch.tensor([[1]])},
+    )
+    outputs = processor(text=["x"], images=[])
+    # Host tensors are untouched (the GPU cast/copy only applies to CUDA outputs).
+    assert outputs["pixel_values"] is host_values
+    assert calls and calls[0]["text"] == ["x"]
