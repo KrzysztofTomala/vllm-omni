@@ -840,6 +840,11 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._pending_nav_twins = {}
     model._nav_twin_prefill_lengths = {}
     model._logits_request_count = None
+    model._logits_index_capacity = 6
+    model._logits_index_host = None
+    model._logits_index_device = None
+    model._logits_index_slot = 0
+    model._text_eos_token_ids_device = None
     model._compiled_expert = None
     model._action_graphs = {}
     model.expert_attention_backend_requested = "sdpa"
@@ -907,6 +912,122 @@ def test_super_action_ignores_terminal_later_in_verification_block(monkeypatch) 
 
     assert calls == []
     assert output.multimodal_outputs == {}
+    assert model._force_future_end_indices == ()
+
+
+class _NoDeviceReadTensor(torch.Tensor):
+    """Tensor stand-in whose every host-visible read raises.
+
+    Proves a code path never materializes device values on the host: only
+    metadata (shape, numel, device) may be touched.
+    """
+
+    def _forbidden(self, *_args, **_kwargs):
+        raise AssertionError("device tensor was read on the host")
+
+    __getitem__ = _forbidden
+    __int__ = _forbidden
+    __bool__ = _forbidden
+    __float__ = _forbidden
+    __iter__ = _forbidden
+    item = _forbidden
+    tolist = _forbidden
+    cpu = _forbidden
+    numpy = _forbidden
+
+
+def _guarded_input_ids(values):
+    return torch.tensor(values).as_subclass(_NoDeviceReadTensor)
+
+
+def test_super_action_trigger_uses_host_first_token_ids_without_reading_input_ids(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions", lambda **kwargs: calls.append(kwargs) or {"actions": torch.zeros(1)})
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        sequence_lengths=(101, 57),
+        request_ids=("request-0", "request-1"),
+    )
+
+    # input_ids must never be read: the runner-provided host ids decide.
+    output = model.make_omni_output(
+        torch.zeros(2, 8),
+        input_ids=_guarded_input_ids([5, 5]),
+        positions=torch.arange(6).reshape(3, 2),
+        sampling_extra_args=[{"robot_obs": {}}, {"robot_obs": {}}],
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 2)],
+        request_first_token_ids=(7, 5),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["seq_len"] == 101
+    assert output.multimodal_outputs["actions"][1] is None
+    assert model._force_future_end_indices == (0,)
+
+    # The single-request span default also stays off the device.
+    calls.clear()
+    model.make_omni_output(
+        torch.zeros(1, 8),
+        input_ids=_guarded_input_ids([5]),
+        positions=torch.arange(3).reshape(3, 1),
+        sampling_extra_args=[{"robot_obs": {}}],
+        runner_kv_cache_context=RunnerKVCacheContext(
+            caches=[],
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            sequence_lengths=(101,),
+            request_ids=("request-0",),
+        ),
+        request_first_token_ids=(7,),
+    )
+    assert len(calls) == 1
+
+    with pytest.raises(RuntimeError, match="first token ids"):
+        model.make_omni_output(
+            torch.zeros(2, 8),
+            input_ids=_guarded_input_ids([7, 7]),
+            positions=torch.arange(6).reshape(3, 2),
+            sampling_extra_args=[{"robot_obs": {}}, {"robot_obs": {}}],
+            runner_kv_cache_context=context,
+            request_token_spans=[(0, 1), (1, 2)],
+            request_first_token_ids=(7,),
+        )
+
+
+def test_super_action_trigger_falls_back_to_input_ids_without_host_ids(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions", lambda **kwargs: calls.append(kwargs) or {"actions": torch.zeros(1)})
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        sequence_lengths=(101, 57),
+        request_ids=("request-0", "request-1"),
+    )
+    kwargs = dict(
+        positions=torch.arange(6).reshape(3, 2),
+        sampling_extra_args=[{"robot_obs": {}}, {"robot_obs": {}}],
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    # No host ids (async scheduling, older runners): the device read decides.
+    model.make_omni_output(torch.zeros(2, 8), input_ids=torch.tensor([5, 7]), **kwargs)
+    assert len(calls) == 1
+    assert calls[0]["seq_len"] == 57
+    assert model._force_future_end_indices == (1,)
+
+    # Host ids, when present, are authoritative over the tensor contents.
+    calls.clear()
+    model.make_omni_output(
+        torch.zeros(2, 8),
+        input_ids=torch.tensor([7, 7]),
+        request_first_token_ids=(5, 5),
+        **kwargs,
+    )
+    assert calls == []
     assert model._force_future_end_indices == ()
 
 
@@ -1311,6 +1432,152 @@ def test_super_compute_logits_skips_forcing_when_rows_are_not_requests(monkeypat
     logits = model.compute_logits(torch.zeros(2, 24))
     assert logits[1, model.future_start_id] == 0
     assert torch.isneginf(logits[1, 5])
+
+
+def _reference_compute_logits(model, logits, *, mask_rows, start_rows, end_rows):
+    """The pre-staging compute_logits masking, kept as the equivalence oracle."""
+    logits = logits.clone()
+    traj_ids = model.alpamayo_config.traj_ids
+    start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
+    logits[..., start : start + int(model.alpamayo_config.traj_vocab_size)] = -torch.inf
+    if mask_rows and model._text_eos_token_ids:
+        indices = torch.as_tensor(mask_rows, device=logits.device, dtype=torch.long)
+        logits[indices[:, None], torch.as_tensor(model._text_eos_token_ids, device=logits.device)] = -torch.inf
+    for force_rows, token_id in ((start_rows, model.future_start_id), (end_rows, model.future_end_id)):
+        if not force_rows:
+            continue
+        indices = torch.as_tensor(force_rows, device=logits.device, dtype=torch.long)
+        logits[indices] = -torch.inf
+        logits[indices, token_id] = 0
+    return logits
+
+
+@pytest.mark.parametrize(
+    ("mask_rows", "start_rows", "end_rows"),
+    [
+        ((0, 2), (), ()),
+        ((), (1,), ()),
+        ((), (), (3,)),
+        ((0, 1, 2, 3), (1,), (2,)),
+        ((0, 3), (0,), (3,)),
+        ((), (), ()),
+    ],
+)
+def test_super_compute_logits_matches_reference_masking(monkeypatch, mask_rows, start_rows, end_rows) -> None:
+    model = _minimal_policy_model()
+    model._text_eos_token_ids = (2, 3, model.future_end_id)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    generator = torch.Generator().manual_seed(0)
+    hidden = torch.randn(4, 24, generator=generator)
+    expected = _reference_compute_logits(model, hidden, mask_rows=mask_rows, start_rows=start_rows, end_rows=end_rows)
+
+    # Run twice so the alternating host slots and the reused device buffer
+    # are both exercised; results must be bitwise identical every time.
+    for _ in range(2):
+        model._logits_request_count = 4
+        model._mask_text_eos_indices = mask_rows
+        model._force_future_start_indices = start_rows
+        model._force_future_end_indices = end_rows
+        assert torch.equal(model.compute_logits(hidden), expected)
+    assert model._force_future_end_indices == ()
+    assert model._mask_text_eos_indices == ()
+
+
+def test_super_compute_logits_grows_index_buffers_past_request_budget(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    model._logits_index_capacity = 2
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    hidden = torch.zeros(5, 24)
+    rows = (0, 1, 2, 3, 4)
+    expected = _reference_compute_logits(model, hidden, mask_rows=rows, start_rows=(1, 3), end_rows=(0,))
+
+    model._logits_request_count = 5
+    model._mask_text_eos_indices = rows
+    model._force_future_start_indices = (1, 3)
+    model._force_future_end_indices = (0,)
+    assert torch.equal(model.compute_logits(hidden), expected)
+    assert model._logits_index_host.shape == (2, 8)
+    assert model._logits_index_device.shape == (8,)
+
+
+def test_super_compute_logits_never_uploads_python_lists_per_step(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    real_as_tensor = torch.as_tensor
+
+    def guarded_as_tensor(*args, **kwargs):
+        if kwargs.get("device") is not None:
+            raise AssertionError("compute_logits must not build device tensors from Python lists")
+        return real_as_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "as_tensor", guarded_as_tensor)
+
+    model._logits_request_count = 3
+    model._mask_text_eos_indices = (0, 2)
+    model._force_future_start_indices = (1,)
+    model._force_future_end_indices = (2,)
+    logits = model.compute_logits(torch.zeros(3, 24))
+    assert torch.isneginf(logits[0, 2:4]).all()
+    assert logits[1, model.future_start_id] == 0
+    assert logits[2, model.future_end_id] == 0
+    eos_tensor = model._text_eos_token_ids_device[1]
+
+    # The EOS id tensor is built once; later steps must not allocate it again.
+    def no_new_tensors(*_args, **_kwargs):
+        raise AssertionError("EOS id tensor must be cached per device")
+
+    monkeypatch.setattr(torch, "tensor", no_new_tensors)
+    model._logits_request_count = 3
+    model._mask_text_eos_indices = (1,)
+    model.compute_logits(torch.zeros(3, 24))
+    assert model._text_eos_token_ids_device[1] is eos_tensor
+
+
+def test_omni_runner_reads_request_first_token_ids_from_host_batch() -> None:
+    import numpy as np
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    token_ids_cpu = np.zeros((3, 8), dtype=np.int32)
+    token_ids_cpu[0, :5] = [11, 12, 13, 14, 7]
+    token_ids_cpu[1, :3] = [21, 22, 23]
+    token_ids_cpu[2, :6] = [31, 32, 33, 34, 35, 36]
+    input_batch = SimpleNamespace(
+        req_ids=["a", "b", "c"],
+        token_ids_cpu=token_ids_cpu,
+        num_computed_tokens_cpu=np.array([4, 0, 5, 99], dtype=np.int32),
+        prev_sampled_token_ids=None,
+    )
+    runner = SimpleNamespace(use_async_scheduling=False, input_batch=input_batch)
+
+    # Synchronous scheduling: the first scheduled token of each request is the
+    # entry at num_computed_tokens (a decode step's last sampled token, a
+    # prefill's first prompt token).
+    assert OmniGPUModelRunner._compute_request_first_token_ids(runner) == (7, 21, 36)
+
+    # Async scheduling placeholders are only known on the device.
+    runner.use_async_scheduling = True
+    assert OmniGPUModelRunner._compute_request_first_token_ids(runner) is None
+    runner.use_async_scheduling = False
+    input_batch.prev_sampled_token_ids = torch.zeros(3, 1, dtype=torch.long)
+    assert OmniGPUModelRunner._compute_request_first_token_ids(runner) is None
+    input_batch.prev_sampled_token_ids = None
+    token_ids_cpu[1, 0] = -1
+    assert OmniGPUModelRunner._compute_request_first_token_ids(runner) is None
+
+    # Requests that exhausted the token table fall back too.
+    token_ids_cpu[1, 0] = 21
+    input_batch.num_computed_tokens_cpu[2] = 8
+    assert OmniGPUModelRunner._compute_request_first_token_ids(runner) is None
 
 
 def test_super_nav_cfg_rendezvous_waits_for_twins_then_runs_expert_with_pairs(monkeypatch) -> None:
