@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import DynamicCache, StaticCache
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -28,6 +30,11 @@ from vllm.transformers_utils.processor import cached_get_processor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
 
+try:
+    from vllm.forward_context import get_forward_context
+except ImportError:  # pragma: no cover - vLLM builds without a forward context
+    get_forward_context = None
+
 logger = init_logger(__name__)
 
 # Decode steps a guided child may wait for its unguided CFG twin before the
@@ -43,8 +50,203 @@ _BATCHED_POLICY_OUTPUT_KEYS = frozenset(
         "normalized_controls",
         "action_noise",
         "action_expert_invocation_batch_size",
+        "action_expert_attention_fa3",
     }
 )
+
+# HF attention implementation names the action expert may run with.
+EXPERT_ATTENTION_BACKEND_FA3 = "alpamayo_fa3"
+EXPERT_ATTENTION_BACKEND_SDPA = "sdpa"
+_EXPERT_ATTENTION_BACKENDS = frozenset({EXPERT_ATTENTION_BACKEND_FA3, EXPERT_ATTENTION_BACKEND_SDPA})
+
+
+def expert_fa3_supports(
+    *,
+    batch_rows: int,
+    dtype: torch.dtype,
+    device_type: str,
+    is_causal: bool,
+    dropout: float = 0.0,
+    gqa_divisible: bool = True,
+) -> bool:
+    """Return whether one expert invocation may take the FA3 kernel path.
+
+    The validated FA3 shape is a single prefix row (the varlen call carries one
+    device-side sequence length), non-causal, dropout-free half precision on
+    CUDA, with query heads that repeat the KV heads evenly. Anything else keeps
+    the previously validated SDPA behavior.
+    """
+    return (
+        int(batch_rows) == 1
+        and device_type == "cuda"
+        and dtype in (torch.float16, torch.bfloat16)
+        and not is_causal
+        and float(dropout) == 0.0
+        and bool(gqa_divisible)
+    )
+
+
+def alpamayo_flash_attention_3_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    is_causal: bool | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Run the single-sample action suffix through vLLM's bundled FA3.
+
+    The action expert has 64 non-causal query tokens attending to a much
+    longer VLM prefix. PyTorch SDPA selects its SM80 memory-efficient kernel
+    for that unequal-Q/K shape, while vLLM's FA3 varlen kernel is native to
+    Hopper and accepts the expert's GQA layout without repeating K/V heads.
+
+    StaticCache allocates more K/V tokens than are valid. ``cache_position``
+    supplies the live sequence length to FA3 through device-side cumulative
+    lengths, preserving CUDA-graph replay without a host synchronization.
+    Shapes outside ``expert_fa3_supports`` fall back to HF SDPA.
+    """
+
+    effective_is_causal = bool(is_causal) if is_causal is not None else bool(getattr(module, "is_causal", True))
+    use_fa3 = (
+        query.shape[0] == key.shape[0] == value.shape[0]
+        and key.shape == value.shape
+        and query.shape[-1] == key.shape[-1]
+        and expert_fa3_supports(
+            batch_rows=int(query.shape[0]),
+            dtype=query.dtype,
+            device_type=query.device.type,
+            is_causal=effective_is_causal,
+            dropout=dropout,
+            gqa_divisible=query.shape[1] % key.shape[1] == 0,
+        )
+    )
+    if not use_fa3:
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+            **kwargs,
+        )
+
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise RuntimeError(
+            "The Alpamayo action expert FA3 path requires query, key, and value to share one dtype; "
+            f"got query={query.dtype}, key={key.dtype}, value={value.dtype}"
+        )
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    query_length = query.shape[2]
+    allocated_key_length = key.shape[2]
+    cache_position = kwargs.get("cache_position")
+    if cache_position is None:
+        valid_key_length = torch.scalar_tensor(
+            allocated_key_length,
+            device=query.device,
+            dtype=torch.int32,
+        )
+    else:
+        valid_key_length = cache_position.reshape(-1)[-1].to(dtype=torch.int32) + 1
+    cu_seqlens_q = torch.stack((valid_key_length.new_zeros(()), valid_key_length.new_full((), query_length)))
+    cu_seqlens_k = torch.stack((valid_key_length.new_zeros(()), valid_key_length))
+    output = flash_attn_varlen_func(
+        query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1]),
+        key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1]),
+        value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1]),
+        query_length,
+        cu_seqlens_q,
+        allocated_key_length,
+        cu_seqlens_k,
+        dropout_p=dropout,
+        softmax_scale=scaling,
+        causal=False,
+        fa_version=3,
+    )
+    return output.view(1, query_length, query.shape[1], query.shape[-1]), None
+
+
+AttentionInterface.register(EXPERT_ATTENTION_BACKEND_FA3, alpamayo_flash_attention_3_forward)
+
+
+def fa3_expert_attention_available() -> tuple[bool, str]:
+    """Report whether the ``alpamayo_fa3`` expert backend can run on this worker.
+
+    Returns ``(ok, reason)``. The reason names the first unmet requirement, or
+    the satisfied one, so startup logging and the fallback error can quote it.
+    vLLM ships FA3 for Hopper only; newer parts are accepted solely when the
+    bundled ``is_fa_version_supported`` helper vouches for version 3.
+    """
+    if EXPERT_ATTENTION_BACKEND_FA3 not in ALL_ATTENTION_FUNCTIONS:
+        return False, f"{EXPERT_ATTENTION_BACKEND_FA3!r} is not registered with transformers AttentionInterface"
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func  # noqa: F401
+    except ImportError as exc:
+        return False, f"vllm.vllm_flash_attn is unavailable: {exc}"
+    if not torch.cuda.is_available():
+        return False, "CUDA is unavailable"
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception as exc:  # pragma: no cover - driver/device query failure
+        return False, f"CUDA compute capability query failed: {exc}"
+    capability = f"{major}.{minor}"
+    if major == 9:
+        return True, f"FA3 available on compute capability {capability}"
+    if major > 9:
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+            if bool(is_fa_version_supported(3)):
+                return True, f"FA3 reported supported on compute capability {capability}"
+        except Exception:  # An absent helper or a failed probe both mean unsupported.
+            pass
+    return False, f"unsupported compute capability {capability} (FA3 requires 9.x)"
+
+
+def resolve_expert_attention_backend(
+    requested: str,
+    *,
+    fa3_available: bool,
+    allow_fallback: bool,
+    unavailable_reason: str | None = None,
+) -> str:
+    """Return the HF attention implementation the action expert will use.
+
+    ``requested`` is the ``expert_attention_backend`` policy-server setting.
+    An unavailable FA3 request fails loudly unless the deployment opted into
+    ``allow_expert_attention_fallback``, in which case SDPA is used and a
+    warning is logged so silent performance regressions cannot hide.
+    """
+    if requested not in _EXPERT_ATTENTION_BACKENDS:
+        raise ValueError(
+            f"Unknown Alpamayo expert_attention_backend {requested!r}; "
+            f"expected one of {sorted(_EXPERT_ATTENTION_BACKENDS)}"
+        )
+    if requested != EXPERT_ATTENTION_BACKEND_FA3 or fa3_available:
+        return requested
+    reason = unavailable_reason or "FA3 is unavailable on this worker"
+    if not allow_fallback:
+        raise RuntimeError(
+            f"expert_attention_backend={requested!r} was requested but {reason}. "
+            "Set allow_expert_attention_fallback: true in policy_server_config (or the "
+            "deployment's fallback switch) to run the action expert with "
+            f"{EXPERT_ATTENTION_BACKEND_SDPA!r} instead."
+        )
+    logger.warning(
+        "Alpamayo action expert attention backend %r is unavailable (%s); falling back to %r",
+        requested,
+        reason,
+        EXPERT_ATTENTION_BACKEND_SDPA,
+    )
+    return EXPERT_ATTENTION_BACKEND_SDPA
 
 
 class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
@@ -96,15 +298,46 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         from alpamayo2_super.models.expert import ExpertModel, ExpertModelConfig
 
         expert_config = ExpertModelConfig(**copy.deepcopy(self.alpamayo_config.expert_config))
-        # A non-causal 4D mask is required by the diffusion suffix. HF SDPA
-        # supports it without requiring the separately packaged flash-attn.
-        expert_config.llm_config._attn_implementation = "sdpa"
+        policy_config = getattr(self.alpamayo_config, "policy_server_config", None) or {}
+        if hasattr(policy_config, "model_dump"):
+            policy_config = policy_config.model_dump()
+        elif not isinstance(policy_config, Mapping):
+            policy_config = vars(policy_config)
+        # The diffusion suffix needs a non-causal 4D mask, which both HF SDPA
+        # and the registered FA3 path honor. Resolve the backend once so a
+        # requested-but-unavailable FA3 is a startup error, not a silent no-op.
+        self.expert_attention_backend_requested = str(
+            policy_config.get("expert_attention_backend", EXPERT_ATTENTION_BACKEND_SDPA)
+        )
+        fa3_available, fa3_reason = fa3_expert_attention_available()
+        self.expert_attention_backend = resolve_expert_attention_backend(
+            self.expert_attention_backend_requested,
+            fa3_available=fa3_available,
+            allow_fallback=bool(policy_config.get("allow_expert_attention_fallback", False)),
+            unavailable_reason=fa3_reason,
+        )
+        logger.info(
+            "Alpamayo action expert attention: requested=%s effective=%s (%s)",
+            self.expert_attention_backend_requested,
+            self.expert_attention_backend,
+            fa3_reason,
+        )
+        expert_config.llm_config._attn_implementation = self.expert_attention_backend
         self.expert = ExpertModel(
             expert_config,
             dtype=vllm_config.model_config.dtype,
         )
         self._compiled_expert: nn.Module | None = None
         self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
+        # -1 unknown, 0 uniform-decode steps seen only outside a FULL CUDA
+        # graph, 1 a FULL-mode uniform-decode forward was observed (capture).
+        self._decode_cudagraph_observation: int = -1
+        # vLLM's uniform-decode query length: one token per request plus the
+        # speculative draft tokens verified alongside it.
+        speculative_config = vllm_config.speculative_config
+        self._uniform_decode_query_len: int = 1 + (
+            int(speculative_config.num_speculative_tokens) if speculative_config is not None else 0
+        )
         self._force_future_end_indices: tuple[int, ...] = ()
         self._force_future_start_indices: tuple[int, ...] = ()
         self._mask_text_eos_indices: tuple[int, ...] = ()
@@ -817,9 +1050,34 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             device=device,
             dtype=torch.int32,
         )
+        # Whether this invocation ran the expert's attention through FA3. The
+        # same predicate gates the kernel, so CFG (two prefix rows) and any
+        # other unsupported shape report 0 even when FA3 is configured.
+        fa3_used = self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3 and expert_fa3_supports(
+            batch_rows=row_count,
+            dtype=weight_dtype,
+            device_type=device.type,
+            is_causal=not bool(self.expert.config.expert_non_causal_attention),
+        )
+        result["action_expert_attention_fa3"] = torch.full(
+            (sample_count,),
+            int(fa3_used),
+            device=device,
+            dtype=torch.int32,
+        )
         # Request-level scalars (identical for every sample of one request).
         result["nav_cfg_applied"] = torch.tensor(nav_cfg, device=device)
         result["nav_guidance_weight"] = torch.tensor(guidance_weight, device=device, dtype=torch.float32)
+        result["action_expert_attention_backend_configured"] = torch.tensor(
+            int(self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3),
+            device=device,
+            dtype=torch.int32,
+        )
+        result["decode_full_cudagraph_observed"] = torch.tensor(
+            self._decode_cudagraph_observation,
+            device=device,
+            dtype=torch.int32,
+        )
         return result
 
     def _sample_actions(
@@ -889,6 +1147,57 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 combined[key] = values[0]
         return combined
 
+    def _attn_metadata_is_uniform_decode(self, attn_metadata: Any) -> bool:
+        """Return whether the forward context's attention metadata is decode-shaped.
+
+        vLLM sizes every uniform-decode step, captured or real, with
+        ``max_query_len`` equal to the uniform-decode query length. The metadata
+        maps layer names to per-layer metadata (a list of such maps under
+        dual-batch overlap); only host-side ints are read, never device tensors.
+        """
+        groups = attn_metadata if isinstance(attn_metadata, list | tuple) else (attn_metadata,)
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            for metadata in group.values():
+                max_query_len = getattr(metadata, "max_query_len", None)
+                if isinstance(max_query_len, int) and max_query_len == self._uniform_decode_query_len:
+                    return True
+        return False
+
+    def _observe_decode_cudagraph_mode(self) -> None:
+        """Record whether uniform-decode steps run inside a FULL CUDA graph.
+
+        vLLM executes this Python forward during graph capture with the runtime
+        mode ``FULL`` and a ``uniform`` batch descriptor; graph replays skip
+        Python entirely. Piecewise or eager decode runs Python every step under
+        ``PIECEWISE``/``NONE`` with the descriptor relaxed to non-uniform, so a
+        step also counts as decode-shaped when its attention metadata carries
+        the uniform-decode query length. Observing ``FULL`` once proves full
+        decode graphs were captured and is sticky. This is diagnostics only and
+        never raises.
+        """
+        if get_forward_context is None or self._decode_cudagraph_observation == 1:
+            return
+        try:
+            context = get_forward_context()
+            mode = getattr(context, "cudagraph_runtime_mode", None)
+            if mode is None:
+                return
+            descriptor = getattr(context, "batch_descriptor", None)
+            uniform = getattr(descriptor, "uniform", None)
+            if uniform is None:
+                uniform = getattr(descriptor, "uniform_decode", False)
+            if not bool(uniform) and not self._attn_metadata_is_uniform_decode(getattr(context, "attn_metadata", None)):
+                return
+            mode_name = getattr(mode, "name", str(mode))
+            if mode_name == "FULL":
+                self._decode_cudagraph_observation = 1
+            elif mode_name in ("PIECEWISE", "NONE"):
+                self._decode_cudagraph_observation = 0
+        except Exception:  # Diagnostics must never break a decode step.
+            return
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -899,6 +1208,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         kwargs.pop("sampling_extra_args", None)
         kwargs.pop("runner_kv_cache_context", None)
+        self._observe_decode_cudagraph_mode()
         return super().forward(
             input_ids=input_ids,
             positions=positions,

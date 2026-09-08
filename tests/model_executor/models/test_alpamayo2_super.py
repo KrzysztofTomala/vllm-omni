@@ -11,6 +11,9 @@ from torch import nn
 from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as alpamayo2_super_module
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
+    alpamayo_flash_attention_3_forward,
+    expert_fa3_supports,
+    resolve_expert_attention_backend,
 )
 from vllm_omni.model_executor.models.alpamayo2_super.configuration_alpamayo2_super import (
     Alpamayo2SuperConfig,
@@ -279,6 +282,120 @@ def test_super_policy_does_not_export_vlm_hidden_prefix() -> None:
     assert not model.omni_pooler_payload_include_hidden
 
 
+def test_super_registers_fa3_expert_attention_with_transformers() -> None:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    assert "alpamayo_fa3" in ALL_ATTENTION_FUNCTIONS
+    assert ALL_ATTENTION_FUNCTIONS["alpamayo_fa3"] is alpamayo_flash_attention_3_forward
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({"dtype": torch.float16}, True),
+        ({"batch_rows": 3}, False),
+        ({"batch_rows": 2}, False),
+        ({"is_causal": True}, False),
+        ({"device_type": "cpu"}, False),
+        ({"dtype": torch.float32}, False),
+        ({"dropout": 0.1}, False),
+        ({"gqa_divisible": False}, False),
+    ],
+)
+def test_super_expert_fa3_supports_truth_table(overrides, expected) -> None:
+    kwargs = {
+        "batch_rows": 1,
+        "dtype": torch.bfloat16,
+        "device_type": "cuda",
+        "is_causal": False,
+    }
+    kwargs.update(overrides)
+
+    assert expert_fa3_supports(**kwargs) is expected
+
+
+def test_super_flash_attention_3_falls_back_to_sdpa_on_cpu() -> None:
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    torch.manual_seed(0)
+    module = SimpleNamespace(is_causal=False, num_key_value_groups=1)
+    query = torch.randn(1, 4, 2, 8)
+    key = torch.randn(1, 4, 5, 8)
+    value = torch.randn(1, 4, 5, 8)
+
+    output, weights = alpamayo_flash_attention_3_forward(module, query, key, value, None, is_causal=False)
+    expected, _ = sdpa_attention_forward(module, query, key, value, None, is_causal=False)
+
+    assert weights is None
+    assert output.shape == (1, 2, 4, 8)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_super_flash_attention_3_fallback_forwards_sdpa_arguments(monkeypatch) -> None:
+    expected = torch.randn(1, 2, 4, 3)
+    calls = []
+
+    def fake_sdpa(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected, None
+
+    monkeypatch.setattr(alpamayo2_super_module, "sdpa_attention_forward", fake_sdpa)
+    query = torch.randn(1, 4, 2, 3)
+    key = torch.randn(1, 2, 5, 3)
+
+    output, weights = alpamayo_flash_attention_3_forward(SimpleNamespace(), query, key, key, None, is_causal=False)
+
+    assert output is expected
+    assert weights is None
+    assert len(calls) == 1
+    assert calls[0][1]["is_causal"] is False
+
+
+def test_super_resolves_fa3_expert_backend_when_available() -> None:
+    assert resolve_expert_attention_backend("alpamayo_fa3", fa3_available=True, allow_fallback=False) == "alpamayo_fa3"
+    assert resolve_expert_attention_backend("alpamayo_fa3", fa3_available=True, allow_fallback=True) == "alpamayo_fa3"
+
+
+def test_super_unavailable_fa3_expert_backend_fails_without_fallback() -> None:
+    with pytest.raises(
+        RuntimeError, match="alpamayo_fa3.*unsupported compute capability.*allow_expert_attention_fallback"
+    ):
+        resolve_expert_attention_backend(
+            "alpamayo_fa3",
+            fa3_available=False,
+            allow_fallback=False,
+            unavailable_reason="unsupported compute capability 8.0",
+        )
+
+
+def test_super_unavailable_fa3_expert_backend_falls_back_with_warning(monkeypatch) -> None:
+    warning_logs = _capture_logs(monkeypatch, "warning")
+
+    effective = resolve_expert_attention_backend(
+        "alpamayo_fa3",
+        fa3_available=False,
+        allow_fallback=True,
+        unavailable_reason="CUDA is unavailable",
+    )
+
+    assert effective == "sdpa"
+    assert len(warning_logs) == 1
+    assert "alpamayo_fa3" in warning_logs[0]
+    assert "CUDA is unavailable" in warning_logs[0]
+    assert "sdpa" in warning_logs[0]
+
+
+def test_super_resolves_sdpa_expert_backend_regardless_of_fa3() -> None:
+    assert resolve_expert_attention_backend("sdpa", fa3_available=False, allow_fallback=False) == "sdpa"
+    assert resolve_expert_attention_backend("sdpa", fa3_available=True, allow_fallback=False) == "sdpa"
+
+
+def test_super_rejects_unknown_expert_attention_backend() -> None:
+    with pytest.raises(ValueError, match="flash_attention_2"):
+        resolve_expert_attention_backend("flash_attention_2", fa3_available=True, allow_fallback=True)
+
+
 def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model = object.__new__(Alpamayo2SuperForConditionalGeneration)
     nn.Module.__init__(model)
@@ -301,6 +418,10 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._nav_twin_prefill_lengths = {}
     model._logits_request_count = None
     model._compiled_expert = None
+    model.expert_attention_backend_requested = "sdpa"
+    model.expert_attention_backend = "sdpa"
+    model._decode_cudagraph_observation = -1
+    model._uniform_decode_query_len = 1
     return model
 
 
@@ -1275,3 +1396,205 @@ def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> No
             unguided_seq_lens=[1, 1],
             unguided_positions=[torch.full((3, 1), 8)],
         )
+
+
+def test_super_action_output_reports_attention_backend_and_decode_graph_state() -> None:
+    model = _cfg_test_model()
+
+    result = _run_cfg(model, weight=None, with_twins=False)
+
+    assert result["action_expert_attention_fa3"].dtype == torch.int32
+    assert result["action_expert_attention_fa3"].tolist() == [0, 0]
+    assert result["action_expert_attention_backend_configured"].dtype == torch.int32
+    assert result["action_expert_attention_backend_configured"].ndim == 0
+    assert result["action_expert_attention_backend_configured"].item() == 0
+    assert result["decode_full_cudagraph_observed"].dtype == torch.int32
+    assert result["decode_full_cudagraph_observed"].ndim == 0
+    assert result["decode_full_cudagraph_observed"].item() == -1
+
+    model.expert_attention_backend = "alpamayo_fa3"
+    model._decode_cudagraph_observation = 1
+    result = _run_cfg(model, weight=None, with_twins=False)
+
+    # Two prefix rows on CPU never satisfy the kernel predicate even though
+    # FA3 is the configured backend.
+    assert result["action_expert_attention_fa3"].tolist() == [0, 0]
+    assert result["action_expert_attention_backend_configured"].item() == 1
+    assert result["decode_full_cudagraph_observed"].item() == 1
+
+
+def test_super_action_output_fa3_flag_uses_expert_row_count(monkeypatch) -> None:
+    model = _cfg_test_model()
+    model.expert_attention_backend = "alpamayo_fa3"
+    predicate_calls = []
+
+    def fake_supports(**kwargs):
+        predicate_calls.append(kwargs)
+        return kwargs["batch_rows"] == 1
+
+    monkeypatch.setattr(alpamayo2_super_module, "expert_fa3_supports", fake_supports)
+
+    guided_pairs = _run_cfg(model, weight=3.0, with_twins=True)
+    single = model._sample_actions(
+        caches=[_cfg_test_cache()],
+        block_table=torch.tensor([1]),
+        seq_len=1,
+        positions=torch.full((3, 1), 10),
+        observation={"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)},
+        extra_args={"_sampling_seed": 1, "diffusion_steps": 2},
+    )
+
+    # Navigation CFG doubles the expert rows (two guided + two unguided), so
+    # the per-sample flag reports the eager two-row-per-sample path as 0.
+    assert predicate_calls[0]["batch_rows"] == 4
+    assert predicate_calls[0]["is_causal"] is False
+    assert predicate_calls[0]["dtype"] == torch.bfloat16
+    assert guided_pairs["action_expert_attention_fa3"].tolist() == [0, 0]
+    assert predicate_calls[1]["batch_rows"] == 1
+    assert single["action_expert_attention_fa3"].tolist() == [1]
+    assert single["action_expert_attention_backend_configured"].item() == 1
+
+
+def test_super_split_and_concat_handle_attention_report_keys() -> None:
+    first = {
+        "actions": torch.zeros(2, 2, 1),
+        "action_expert_attention_fa3": torch.tensor([1, 1], dtype=torch.int32),
+        "action_expert_attention_backend_configured": torch.tensor(1, dtype=torch.int32),
+        "decode_full_cudagraph_observed": torch.tensor(1, dtype=torch.int32),
+    }
+    second = {
+        "actions": torch.ones(1, 2, 1),
+        "action_expert_attention_fa3": torch.tensor([0], dtype=torch.int32),
+        "action_expert_attention_backend_configured": torch.tensor(1, dtype=torch.int32),
+        "decode_full_cudagraph_observed": torch.tensor(1, dtype=torch.int32),
+    }
+
+    combined = Alpamayo2SuperForConditionalGeneration._concat_batched_policy_outputs([first, second])
+
+    assert combined["action_expert_attention_fa3"].tolist() == [1, 1, 0]
+    assert combined["action_expert_attention_backend_configured"].ndim == 0
+    assert combined["decode_full_cudagraph_observed"].ndim == 0
+
+    split = Alpamayo2SuperForConditionalGeneration._split_batched_policy_output(combined, 2)
+
+    assert split["action_expert_attention_fa3"].tolist() == [0]
+    assert split["actions"].shape == (1, 2, 1)
+    assert split["action_expert_attention_backend_configured"].item() == 1
+    assert split["decode_full_cudagraph_observed"].item() == 1
+
+
+def _forward_with_context(model, monkeypatch, context_factory):
+    sentinel = object()
+    monkeypatch.setattr(
+        alpamayo2_super_module.Qwen3VLForConditionalGeneration,
+        "forward",
+        lambda self, **kwargs: sentinel,
+    )
+    monkeypatch.setattr(alpamayo2_super_module, "get_forward_context", context_factory)
+    output = model.forward(
+        input_ids=torch.tensor([[7]]),
+        positions=torch.zeros(3, 1, dtype=torch.long),
+        sampling_extra_args=[{}],
+        runner_kv_cache_context=None,
+    )
+    assert output is sentinel
+
+
+def _decode_context(mode_name, *, uniform=True, max_query_len=None, dbo=False):
+    """Forward context as vLLM 0.28 sets it: ``BatchDescriptor.uniform`` plus per-layer attention metadata."""
+    attn_metadata = {} if max_query_len is None else {"layers.0.attn": SimpleNamespace(max_query_len=max_query_len)}
+    return SimpleNamespace(
+        cudagraph_runtime_mode=SimpleNamespace(name=mode_name),
+        batch_descriptor=SimpleNamespace(uniform=uniform),
+        attn_metadata=[attn_metadata, dict(attn_metadata)] if dbo else attn_metadata,
+    )
+
+
+def test_super_forward_observes_full_decode_cudagraph_capture(monkeypatch) -> None:
+    model = _minimal_policy_model()
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("FULL"))
+
+    assert model._decode_cudagraph_observation == 1
+
+    # A later piecewise decode step (dispatched with a relaxed, non-uniform
+    # descriptor) cannot revoke the capture evidence.
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("PIECEWISE", uniform=False, max_query_len=1))
+
+    assert model._decode_cudagraph_observation == 1
+
+
+def test_super_forward_observes_legacy_uniform_decode_descriptor(monkeypatch) -> None:
+    model = _minimal_policy_model()
+
+    _forward_with_context(
+        model,
+        monkeypatch,
+        lambda: SimpleNamespace(
+            cudagraph_runtime_mode=SimpleNamespace(name="FULL"),
+            batch_descriptor=SimpleNamespace(uniform_decode=True),
+        ),
+    )
+
+    assert model._decode_cudagraph_observation == 1
+
+
+@pytest.mark.parametrize("mode_name", ["PIECEWISE", "NONE"])
+@pytest.mark.parametrize("dbo", [False, True])
+def test_super_forward_observes_decode_without_full_graph(monkeypatch, mode_name, dbo) -> None:
+    model = _minimal_policy_model()
+
+    # vLLM relaxes every non-FULL dispatch to uniform=False; the decode shape
+    # is visible only through the attention metadata's max_query_len.
+    _forward_with_context(
+        model, monkeypatch, lambda: _decode_context(mode_name, uniform=False, max_query_len=1, dbo=dbo)
+    )
+
+    assert model._decode_cudagraph_observation == 0
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("FULL"))
+
+    assert model._decode_cudagraph_observation == 1
+
+
+def test_super_forward_decode_shape_follows_speculative_query_length(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    model._uniform_decode_query_len = 3
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("PIECEWISE", uniform=False, max_query_len=1))
+    assert model._decode_cudagraph_observation == -1
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("PIECEWISE", uniform=False, max_query_len=3))
+    assert model._decode_cudagraph_observation == 0
+
+
+def test_super_forward_ignores_prefill_and_missing_forward_context(monkeypatch) -> None:
+    model = _minimal_policy_model()
+
+    def missing_context():
+        raise AssertionError("Forward context is not set")
+
+    _forward_with_context(model, monkeypatch, missing_context)
+    assert model._decode_cudagraph_observation == -1
+
+    # Non-uniform FULL batches and prefill-shaped piecewise steps say nothing
+    # about decode graphs.
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("FULL", uniform=False))
+    assert model._decode_cudagraph_observation == -1
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("PIECEWISE", uniform=False, max_query_len=512))
+    assert model._decode_cudagraph_observation == -1
+
+    _forward_with_context(model, monkeypatch, lambda: _decode_context("PIECEWISE", uniform=False))
+    assert model._decode_cudagraph_observation == -1
+
+    _forward_with_context(
+        model,
+        monkeypatch,
+        lambda: SimpleNamespace(cudagraph_runtime_mode=None, batch_descriptor=None, attn_metadata=None),
+    )
+    assert model._decode_cudagraph_observation == -1
+
+    monkeypatch.setattr(alpamayo2_super_module, "get_forward_context", None)
+    _forward_with_context(model, monkeypatch, None)
+    assert model._decode_cudagraph_observation == -1
