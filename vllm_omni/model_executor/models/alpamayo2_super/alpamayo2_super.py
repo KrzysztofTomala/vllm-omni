@@ -352,6 +352,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # its first token is forced (after multimodal placeholder expansion).
         self._nav_twin_prefill_lengths: dict[tuple[str, int], int] = {}
         self._logits_request_count: int | None = None
+        # compute_logits index staging (see _stage_logits_indices): row indices
+        # travel through a pinned host buffer into a preallocated device buffer
+        # instead of per-step pageable ``torch.as_tensor(list, device=cuda)``
+        # copies, which block the host until the forward has drained. At most
+        # three index lists (EOS mask, forced start, forced end) per step.
+        self._logits_index_capacity: int = 3 * max(1, int(vllm_config.scheduler_config.max_num_seqs))
+        self._logits_index_host: torch.Tensor | None = None
+        self._logits_index_device: torch.Tensor | None = None
+        self._logits_index_slot: int = 0
+        self._text_eos_token_ids_device: tuple[tuple[int, ...], torch.Tensor] | None = None
         generation_config = vllm_config.model_config.try_get_generation_config()
         text_eos_ids = generation_config.get("eos_token_id")
         if text_eos_ids is None:
@@ -1251,8 +1261,19 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         sampling_extra_args: object = None,
         runner_kv_cache_context: RunnerKVCacheContext | None = None,
         request_token_spans: Sequence[tuple[int, int]] | None = None,
+        request_first_token_ids: Sequence[int] | None = None,
         **_: Any,
     ) -> IntermediateTensors | OmniOutput:
+        """Detect the reasoning boundary and run the action expert.
+
+        ``request_first_token_ids`` carries each request's first scheduled
+        token for this step as host ints (the runner reads them from its CPU
+        token table under synchronous scheduling). When given, the
+        ``future_start`` trigger is decided without touching ``input_ids``, so
+        the hook no longer blocks on the forward every decode step. When
+        ``None`` (async scheduling placeholders, older runners) the trigger
+        falls back to reading the first token of each span from ``input_ids``.
+        """
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         observations = self._policy_observations(sampling_extra_args)
@@ -1274,12 +1295,24 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 request_token_spans = [(0, input_ids.numel())]
             if len(request_token_spans) != request_count:
                 raise RuntimeError("Super request token spans and runner requests must align")
+            if request_first_token_ids is not None and len(request_first_token_ids) != request_count:
+                raise RuntimeError("Super request first token ids and runner requests must align")
 
-            flat_input_ids = input_ids.reshape(-1)
+            # Host path: the runner already knows each span's first token.
+            # Fallback: a device->host read per request that waits for the
+            # forward to finish.
+            flat_input_ids = input_ids.reshape(-1) if request_first_token_ids is None else None
             extras = sampling_extra_args if isinstance(sampling_extra_args, list) else []
             trigger_mask = [
-                observation is not None and end > start and int(flat_input_ids[start]) == self.future_start_id
-                for observation, (start, end) in zip(observations, request_token_spans, strict=True)
+                observation is not None
+                and end > start
+                and (
+                    int(request_first_token_ids[index])
+                    if request_first_token_ids is not None
+                    else int(flat_input_ids[start])
+                )
+                == self.future_start_id
+                for index, (observation, (start, end)) in enumerate(zip(observations, request_token_spans, strict=True))
             ]
             if any(trigger_mask):
                 if runner_kv_cache_context is None:
@@ -1552,6 +1585,56 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             aux_hidden_states=aux_hidden_states,
         )
 
+    def _text_eos_token_ids_on(self, device: torch.device) -> torch.Tensor:
+        """Return the masked text EOS ids as a device tensor, built once per device."""
+        cached = self._text_eos_token_ids_device
+        if cached is None or cached[0] != self._text_eos_token_ids or cached[1].device != device:
+            cached = (
+                self._text_eos_token_ids,
+                torch.tensor(self._text_eos_token_ids, dtype=torch.long, device=device),
+            )
+            self._text_eos_token_ids_device = cached
+        return cached[1]
+
+    def _stage_logits_indices(
+        self,
+        device: torch.device,
+        index_lists: Sequence[Sequence[int]],
+    ) -> list[torch.Tensor]:
+        """Upload logits row-index lists to ``device`` with one asynchronous copy.
+
+        The lists are written into a pinned host buffer and copied into a
+        preallocated device buffer with ``non_blocking=True``; the returned
+        views alias that buffer and are valid until the next call. Two host
+        slots alternate so a step never overwrites the staging area of the
+        copy issued by the previous step, the same reuse discipline vLLM
+        applies to its own per-step input buffers. Buffers grow (rarely, and
+        only on the host-visible allocation path) when a step needs more rows
+        than the scheduler's request budget.
+        """
+        total = sum(len(indices) for indices in index_lists)
+        host = self._logits_index_host
+        device_buffer = self._logits_index_device
+        if host is None or device_buffer is None or host.shape[1] < total or device_buffer.device != device:
+            capacity = max(self._logits_index_capacity, total)
+            host = torch.empty(2, capacity, dtype=torch.long, pin_memory=device.type == "cuda")
+            device_buffer = torch.empty(capacity, dtype=torch.long, device=device)
+            self._logits_index_host = host
+            self._logits_index_device = device_buffer
+        slot = self._logits_index_slot
+        self._logits_index_slot = 1 - slot
+        staged = host[slot]
+        staged_np = staged.numpy()
+        views: list[torch.Tensor] = []
+        offset = 0
+        for indices in index_lists:
+            count = len(indices)
+            staged_np[offset : offset + count] = indices
+            views.append(device_buffer[offset : offset + count])
+            offset += count
+        device_buffer[:total].copy_(staged[:total], non_blocking=True)
+        return views
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -1567,12 +1650,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         traj_ids = self.alpamayo_config.traj_ids
         start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
         logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
-        if mask_text_eos_indices and self._text_eos_token_ids:
-            indices = torch.as_tensor(mask_text_eos_indices, device=logits.device, dtype=torch.long)
-            logits[
-                indices[:, None],
-                torch.as_tensor(self._text_eos_token_ids, device=logits.device, dtype=torch.long),
-            ] = -torch.inf
+        if not (mask_text_eos_indices and self._text_eos_token_ids):
+            mask_text_eos_indices = ()
         if (
             (force_start_indices or force_end_indices)
             and request_count is not None
@@ -1590,15 +1669,24 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
             force_start_indices = ()
             force_end_indices = ()
-        for force_indices, token_id in (
-            (force_start_indices, self.future_start_id),
-            (force_end_indices, self.future_end_id),
+        if not (mask_text_eos_indices or force_start_indices or force_end_indices):
+            return logits
+        # One host->device copy per step for every index list; the row views
+        # index the logits directly so no host synchronization happens here.
+        mask_rows, start_rows, end_rows = self._stage_logits_indices(
+            logits.device,
+            (mask_text_eos_indices, force_start_indices, force_end_indices),
+        )
+        if mask_text_eos_indices:
+            logits[mask_rows[:, None], self._text_eos_token_ids_on(logits.device)] = -torch.inf
+        for rows, token_id in (
+            (start_rows, self.future_start_id),
+            (end_rows, self.future_end_id),
         ):
-            if not force_indices:
+            if rows.numel() == 0:
                 continue
-            indices = torch.as_tensor(force_indices, device=logits.device, dtype=torch.long)
-            logits[indices] = -torch.inf
-            logits[indices, token_id] = 0
+            logits[rows] = -torch.inf
+            logits[rows, token_id] = 0
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

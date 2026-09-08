@@ -1312,6 +1312,32 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
+    def _compute_request_first_token_ids(self) -> tuple[int, ...] | None:
+        """Return each request's first scheduled token id for this step, from host state.
+
+        ``input_ids`` is gathered from ``input_batch.token_ids_cpu`` starting at
+        each request's ``num_computed_tokens``, so under synchronous scheduling
+        the first token of every request span is already known on the host
+        before the forward runs. Async scheduling leaves a placeholder for the
+        previous step's sampled token and fills the device copy later; then
+        ``None`` is returned and model hooks fall back to reading ``input_ids``.
+        """
+        if (
+            getattr(self, "use_async_scheduling", False)
+            or getattr(self.input_batch, "prev_sampled_token_ids", None) is not None
+        ):
+            return None
+        num_reqs = len(self.input_batch.req_ids)
+        token_ids_cpu = self.input_batch.token_ids_cpu
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        if num_reqs == 0 or (computed < 0).any() or (computed >= token_ids_cpu.shape[1]).any():
+            return None
+        first_token_ids = token_ids_cpu[np.arange(num_reqs), computed]
+        if (first_token_ids < 0).any():
+            # Placeholder for a token that only exists on the device yet.
+            return None
+        return tuple(int(token_id) for token_id in first_token_ids)
+
     def _sync_local_stage_payloads(self) -> None:
         """Move received full-payload stage inputs into model_intermediate_buffer."""
         cache = getattr(self, "_local_stage_payload_cache", None)
@@ -1357,6 +1383,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
+                # Host copy of each span's first token so terminal hooks can
+                # detect boundary tokens without a device->host read per step.
+                request_first_token_ids = self._compute_request_first_token_ids()
+                if request_first_token_ids is not None:
+                    model_kwargs_extra["request_first_token_ids"] = request_first_token_ids
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
                 # split, which can re-introduce the cross-request corruption this
