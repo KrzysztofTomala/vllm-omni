@@ -623,6 +623,107 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             dst_layer.cumulative_length.fill_(prefix_length)
 
     @staticmethod
+    def _select_paged_blocks(
+        cache: torch.Tensor,
+        block_ids: torch.Tensor,
+        layer_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather one layer's blocks with a single ``index_select``.
+
+        Returns ``(key_blocks, value_blocks)`` as views of the one gathered
+        tensor, both shaped ``[blocks, kv_heads, block_size, head_dim]`` for
+        every supported paged layout (see ``_gather_prefix_cache``).
+        """
+        if cache.ndim == 4 and cache.shape[-1] % 2 == 0:
+            # FlashAttention: [blocks, kv_heads, block_size, 2 * head_dim].
+            key_blocks, value_blocks = cache.index_select(0, block_ids).chunk(2, dim=-1)
+            return key_blocks, value_blocks
+        if cache.ndim == 5 and cache.shape[0] == 2:
+            # [2, blocks, block_size, kv_heads, head_dim].
+            selected = cache.index_select(1, block_ids)
+            return selected[0].permute(0, 2, 1, 3), selected[1].permute(0, 2, 1, 3)
+        if cache.ndim == 5 and cache.shape[1] == 2:
+            # [blocks, 2, block_size, kv_heads, head_dim].
+            selected = cache.index_select(0, block_ids)
+            return selected[:, 0].permute(0, 2, 1, 3), selected[:, 1].permute(0, 2, 1, 3)
+        raise RuntimeError(
+            "Alpamayo 2 Super requires a supported vLLM paged KV layout; "
+            f"layer {layer_index} has shape {tuple(cache.shape)}"
+        )
+
+    @staticmethod
+    def _copy_block_prefix(
+        dst_row: torch.Tensor,
+        blocks: torch.Tensor,
+        seq_len: int,
+        prefix_length: int,
+    ) -> None:
+        """Write exactly ``seq_len`` gathered positions into one static row.
+
+        ``dst_row`` is one ``[kv_heads, max_cache_len, head_dim]`` row of a
+        StaticCache layer and ``blocks`` the ``[blocks, kv_heads, block_size,
+        head_dim]`` gather of that row. Whole blocks land in one strided
+        ``copy_``, the partial tail block in a second, and the positions up to
+        the batch prefix length are zeroed to match right padding. Nothing
+        past ``prefix_length`` is touched.
+        """
+        block_size = blocks.shape[2]
+        full_blocks = seq_len // block_size
+        full_length = full_blocks * block_size
+        if full_blocks:
+            dst_row[:, :full_length].unflatten(1, (full_blocks, block_size)).copy_(
+                blocks[:full_blocks].permute(1, 0, 2, 3)
+            )
+        if seq_len > full_length:
+            dst_row[:, full_length:seq_len].copy_(blocks[full_blocks, :, : seq_len - full_length])
+        if seq_len < prefix_length:
+            dst_row[:, seq_len:prefix_length].zero_()
+
+    @classmethod
+    def _gather_prefix_cache_into_static(
+        cls,
+        caches: list[torch.Tensor],
+        block_tables: Sequence[torch.Tensor],
+        seq_lens: Sequence[int],
+        static_cache: StaticCache,
+    ) -> None:
+        """Gather paged prefixes straight into an existing expert StaticCache.
+
+        This replaces ``_gather_prefix_cache_batch`` followed by
+        ``_copy_action_prefix`` once a manual action graph exists: each layer
+        is one block ``index_select`` plus a handful of strided copies per
+        row, with no dense DynamicCache in between. The written content is
+        bitwise identical to the two-step path, including the zero right
+        padding of shorter rows, and the cumulative-length cursor is set the
+        same way.
+        """
+        if not block_tables or len(block_tables) != len(seq_lens):
+            raise ValueError("Batched prefix block tables and lengths must align")
+        if len(static_cache.layers) != len(caches):
+            raise ValueError(f"static action cache has {len(static_cache.layers)} layers, expected {len(caches)}")
+        lengths = [int(seq_len) for seq_len in seq_lens]
+        prefix_length = max(lengths)
+        # Block tables are int32 on the device; convert each row once rather
+        # than once per layer (dim 2 is block_size in every supported layout).
+        block_size = caches[0].shape[2]
+        row_block_ids = [
+            block_table[: (seq_len + block_size - 1) // block_size].to(dtype=torch.long)
+            for block_table, seq_len in zip(block_tables, lengths, strict=True)
+        ]
+        for layer_index, (paged_layer, static_layer) in enumerate(zip(caches, static_cache.layers, strict=True)):
+            dst_keys, dst_values = static_layer.keys, static_layer.values
+            if dst_keys.shape[0] != len(block_tables) or dst_keys.shape[2] < prefix_length:
+                raise ValueError(
+                    f"static action cache layer {layer_index} of shape {tuple(dst_keys.shape)} cannot hold "
+                    f"{len(block_tables)} prefixes of up to {prefix_length} tokens"
+                )
+            for row, (block_ids, seq_len) in enumerate(zip(row_block_ids, lengths, strict=True)):
+                key_blocks, value_blocks = cls._select_paged_blocks(paged_layer, block_ids, layer_index)
+                cls._copy_block_prefix(dst_keys[row], key_blocks, seq_len, prefix_length)
+                cls._copy_block_prefix(dst_values[row], value_blocks, seq_len, prefix_length)
+            static_layer.cumulative_length.fill_(prefix_length)
+
+    @staticmethod
     def _rewind_static_action_cache(
         cache: StaticCache,
         prefix_length: int | torch.Tensor,
@@ -676,7 +777,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self,
         *,
         expert: nn.Module,
-        prefix: DynamicCache,
+        prefix: DynamicCache | None,
+        prefix_length: int,
         action: torch.Tensor,
         expert_positions: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -684,19 +786,26 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         suffix_length: int,
         static_cache_max_len: int | None,
     ) -> torch.Tensor:
-        """Replay the fixed-shape ten-step expert integration in one graph."""
+        """Replay the fixed-shape ten-step expert integration in one graph.
 
-        prefix_length = prefix.get_seq_length()
-        key = (
-            tuple(action.shape),
-            action.dtype,
-            action.device,
-            tuple(expert_positions.shape),
-            tuple(attention_mask.shape),
-            inference_steps,
+        ``prefix`` is the dense VLM prefix to copy into the graph's StaticCache.
+        It is ``None`` when ``_sample_actions_batch`` already gathered the paged
+        prefix straight into that cache, which requires the graph state for
+        this shape to exist.
+        """
+
+        key = self._action_graph_key(
+            action_shape=tuple(action.shape),
+            action_dtype=action.dtype,
+            device=action.device,
+            positions_shape=tuple(expert_positions.shape),
+            attention_mask_shape=tuple(attention_mask.shape),
+            inference_steps=inference_steps,
         )
         state = self._action_graphs.get(key)
         if state is None:
+            if prefix is None:
+                raise RuntimeError("A dense prefix cache is required to create a new action graph state")
             static_cache = self._make_static_action_cache(
                 prefix,
                 suffix_length=suffix_length,
@@ -772,9 +881,35 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 dtype=torch.long,
             )
         )
-        self._copy_action_prefix(state["cache"], prefix, prefix_length)
+        if prefix is not None:
+            self._copy_action_prefix(state["cache"], prefix, prefix_length)
         state["graph"].replay()
         return state["output"].clone()
+
+    @staticmethod
+    def _action_graph_key(
+        *,
+        action_shape: tuple[int, ...],
+        action_dtype: torch.dtype,
+        device: torch.device,
+        positions_shape: tuple[int, ...],
+        attention_mask_shape: tuple[int, ...],
+        inference_steps: int,
+    ) -> tuple[Any, ...]:
+        """Identify one captured action graph by the shapes it was traced with.
+
+        ``_sample_actions_batch`` derives the same key from the planned shapes
+        before any expert tensor exists, so a known shape can gather its paged
+        prefix directly into the graph's StaticCache.
+        """
+        return (
+            tuple(action_shape),
+            action_dtype,
+            device,
+            tuple(positions_shape),
+            tuple(attention_mask_shape),
+            int(inference_steps),
+        )
 
     def _sample_actions_batch(
         self,
@@ -856,11 +991,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         all_positions = [*positions, *(unguided_positions or ())]
         row_count = len(all_block_tables)
         prefix_lengths = all_seq_lens
-        prefix = self._gather_prefix_cache_batch(caches, all_block_tables, all_seq_lens)
+        prefix_len = max(all_seq_lens)
         if bool(first_extra.get("_batch_action_expert", True)) is False and sample_count > 1:
             raise ValueError("Sequential expert mode must submit one VLM branch per expert call")
-        record_profile_event()
-        prefix_len = prefix.get_seq_length()
         action_dims = tuple(int(dim) for dim in self.expert.action_space.get_action_space_dims())
         suffix_length = action_dims[0]
         static_cache_max_len_value = first_extra.get("_static_expert_cache_max_len")
@@ -882,6 +1015,34 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 static_cache_max_len,
                 prefix_len + suffix_length,
             )
+
+        # Materialize the VLM prefix. Once the manual graph for this shape
+        # exists, the paged blocks are gathered straight into its StaticCache;
+        # the dense DynamicCache is built only for every other expert mode and
+        # for the first request of a new graph shape (which creates the state).
+        prefix: DynamicCache | None = None
+        graph_state: dict[str, Any] | None = None
+        if manual_action_cudagraph and static_expert_cache:
+            graph_state = self._action_graphs.get(
+                self._action_graph_key(
+                    action_shape=(row_count, *action_dims),
+                    action_dtype=torch.float32,
+                    device=device,
+                    positions_shape=(3, row_count, suffix_length),
+                    attention_mask_shape=(
+                        row_count,
+                        1,
+                        suffix_length,
+                        static_cache_max_len if static_cache_max_len is not None else prefix_len + suffix_length,
+                    ),
+                    inference_steps=inference_steps,
+                )
+            )
+        if graph_state is not None:
+            self._gather_prefix_cache_into_static(caches, all_block_tables, all_seq_lens, graph_state["cache"])
+        else:
+            prefix = self._gather_prefix_cache_batch(caches, all_block_tables, all_seq_lens)
+        record_profile_event()
 
         # One noise row per trajectory sample; the unguided twin rows share
         # their guided sample's action state.
@@ -923,7 +1084,10 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             dtype=weight_dtype,
             prefix_lengths=prefix_lengths,
         )
-        expert_cache: DynamicCache | StaticCache = prefix
+        # Every non-graph mode below runs on a dense prefix; the manual-graph
+        # path may arrive here with prefix None because it gathered directly
+        # into the graph state's StaticCache.
+        expert_cache: DynamicCache | StaticCache | None = prefix
         expert_cache_position = None
         if static_expert_cache and not manual_action_cudagraph:
             expert_cache = self._make_static_action_cache(
@@ -953,6 +1117,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             action = self._run_manual_action_graph(
                 expert=expert,
                 prefix=prefix,
+                prefix_length=prefix_len,
                 action=action,
                 expert_positions=expert_positions,
                 attention_mask=attention_mask,
@@ -961,6 +1126,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 static_cache_max_len=static_cache_max_len,
             )
         else:
+            assert expert_cache is not None, "eager expert modes require a dense DynamicCache prefix"
             for step in range(inference_steps):
                 timestep = action.new_full(
                     (sample_count,) + (1,) * len(action_dims),

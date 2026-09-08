@@ -217,6 +217,124 @@ def test_super_static_action_cache_refreshes_prefix_and_rewinds_cursor() -> None
     assert target_layer.cumulative_length.item() == 2
 
 
+def _random_paged_caches(layout, *, layers, blocks, block_size, kv_heads, head_dim, dtype, generator):
+    """Build random paged K/V layers in one of the supported vLLM layouts."""
+    caches = []
+    for _ in range(layers):
+        if layout == "fa_rank4":
+            shape = (blocks, kv_heads, block_size, 2 * head_dim)
+        elif layout == "rank5_kv_first":
+            shape = (2, blocks, block_size, kv_heads, head_dim)
+        elif layout == "rank5_kv_second":
+            shape = (blocks, 2, block_size, kv_heads, head_dim)
+        else:
+            raise AssertionError(layout)
+        caches.append(torch.randn(*shape, generator=generator).to(dtype))
+    return caches
+
+
+def _sentinel_static_cache(*, layers, rows, kv_heads, max_len, head_dim, dtype):
+    """A StaticCache stand-in prefilled with a sentinel so untouched positions are visible."""
+    return SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                keys=torch.full((rows, kv_heads, max_len, head_dim), -7.0, dtype=dtype),
+                values=torch.full((rows, kv_heads, max_len, head_dim), -9.0, dtype=dtype),
+                cumulative_length=torch.tensor([max_len]),
+            )
+            for _ in range(layers)
+        ]
+    )
+
+
+@pytest.mark.parametrize("layout", ["fa_rank4", "rank5_kv_first", "rank5_kv_second"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[37], [32], [5], [37, 37], [48, 16, 33], [37, 50, 21]],
+    ids=["one-row", "block-multiple", "sub-block", "equal-rows", "mixed-multiples", "three-rows"],
+)
+def test_super_direct_static_gather_matches_dynamic_cache_path(layout, dtype, seq_lens) -> None:
+    block_size = 16
+    kv_heads = 2
+    head_dim = 4
+    layers = 2
+    blocks = 16
+    suffix_length = 8
+    rows = len(seq_lens)
+    generator = torch.Generator().manual_seed(1234)
+    caches = _random_paged_caches(
+        layout,
+        layers=layers,
+        blocks=blocks,
+        block_size=block_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        generator=generator,
+    )
+    # Distinct random block tables per row; every row uses a partial last block.
+    block_tables = [
+        torch.randperm(blocks, generator=generator)[: (seq_len + block_size - 1) // block_size] for seq_len in seq_lens
+    ]
+    prefix_len = max(seq_lens)
+    max_len = prefix_len + suffix_length
+    cache_kwargs = dict(layers=layers, rows=rows, kv_heads=kv_heads, max_len=max_len, head_dim=head_dim, dtype=dtype)
+
+    expected = _sentinel_static_cache(**cache_kwargs)
+    dense = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_batch(caches, block_tables, seq_lens)
+    Alpamayo2SuperForConditionalGeneration._copy_action_prefix(expected, dense, prefix_len)
+
+    direct = _sentinel_static_cache(**cache_kwargs)
+    Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(caches, block_tables, seq_lens, direct)
+
+    for expected_layer, direct_layer in zip(expected.layers, direct.layers, strict=True):
+        assert torch.equal(direct_layer.keys, expected_layer.keys)
+        assert torch.equal(direct_layer.values, expected_layer.values)
+        assert torch.equal(direct_layer.cumulative_length, expected_layer.cumulative_length)
+        assert direct_layer.cumulative_length.item() == prefix_len
+        for row, seq_len in enumerate(seq_lens):
+            # Right padding is zero; nothing past the batch prefix length is written.
+            assert torch.all(direct_layer.keys[row, :, seq_len:prefix_len] == 0)
+            assert torch.all(direct_layer.values[row, :, seq_len:prefix_len] == 0)
+            assert torch.all(direct_layer.keys[row, :, prefix_len:] == -7.0)
+            assert torch.all(direct_layer.values[row, :, prefix_len:] == -9.0)
+    # The gathered rows match the per-request reference gather exactly.
+    for row, (block_table, seq_len) in enumerate(zip(block_tables, seq_lens, strict=True)):
+        reference = Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(caches, block_table, seq_len)
+        for layer_index, direct_layer in enumerate(direct.layers):
+            assert torch.equal(direct_layer.keys[row, :, :seq_len], reference.layers[layer_index].keys[0])
+            assert torch.equal(direct_layer.values[row, :, :seq_len], reference.layers[layer_index].values[0])
+
+
+def test_super_direct_static_gather_rejects_mismatched_cache() -> None:
+    caches = _random_paged_caches(
+        "fa_rank4",
+        layers=1,
+        blocks=4,
+        block_size=2,
+        kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        generator=torch.Generator().manual_seed(0),
+    )
+    too_short = _sentinel_static_cache(layers=1, rows=1, kv_heads=1, max_len=3, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="cannot hold 1 prefixes of up to 5 tokens"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], too_short
+        )
+    wrong_rows = _sentinel_static_cache(layers=1, rows=2, kv_heads=1, max_len=8, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="cannot hold 1 prefixes"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], wrong_rows
+        )
+    wrong_layers = _sentinel_static_cache(layers=2, rows=1, kv_heads=1, max_len=8, head_dim=2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="has 2 layers, expected 1"):
+        Alpamayo2SuperForConditionalGeneration._gather_prefix_cache_into_static(
+            caches, [torch.tensor([0, 1, 2])], [5], wrong_layers
+        )
+
+
 def test_super_fixed_action_mask_hides_unused_static_cache() -> None:
     mask = Alpamayo2SuperForConditionalGeneration._make_action_attention_mask(
         sample_count=1,
@@ -418,6 +536,7 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._nav_twin_prefill_lengths = {}
     model._logits_request_count = None
     model._compiled_expert = None
+    model._action_graphs = {}
     model.expert_attention_backend_requested = "sdpa"
     model.expert_attention_backend = "sdpa"
     model._decode_cudagraph_observation = -1
@@ -543,6 +662,7 @@ def test_super_excludes_speculative_draft_cache_from_action_prefix(monkeypatch) 
     model = _minimal_policy_model()
     model.expert = SimpleNamespace(
         config=SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=2)),
+        action_space=SimpleNamespace(get_action_space_dims=lambda: (2, 1)),
     )
     received = []
 
@@ -1396,6 +1516,164 @@ def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> No
             unguided_seq_lens=[1, 1],
             unguided_positions=[torch.full((3, 1), 8)],
         )
+
+
+def _manual_graph_extras(steps: int = 2) -> list[dict]:
+    return [
+        {
+            "_sampling_seed": 5,
+            "diffusion_steps": steps,
+            "_manual_action_cudagraph": True,
+            "_static_expert_cache": True,
+            "_static_expert_cache_max_len": 16,
+        }
+    ]
+
+
+def _run_manual_graph_sample(model, block_table, seq_len):
+    return model._sample_actions_batch(
+        caches=[_cfg_test_cache()],
+        block_tables=[block_table],
+        seq_lens=[seq_len],
+        positions=[torch.full((3, 1), 10)],
+        observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+        extra_args=_manual_graph_extras(),
+    )
+
+
+def _fake_action_graph_state(max_len: int = 16) -> dict:
+    """A captured-graph state as ``_run_manual_action_graph`` stores it, with a CPU stand-in graph."""
+    replays: list[int] = []
+    return {
+        "cache": SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    keys=torch.zeros(1, 1, max_len, 1),
+                    values=torch.zeros(1, 1, max_len, 1),
+                    cumulative_length=torch.tensor([max_len]),
+                )
+            ]
+        ),
+        "action": torch.zeros(1, 2, 1),
+        "positions": torch.zeros(3, 1, 2, dtype=torch.long),
+        "attention_mask": torch.zeros(1, 1, 2, max_len, dtype=torch.bfloat16),
+        "cache_position": torch.zeros(2, dtype=torch.long),
+        "graph": SimpleNamespace(replay=lambda: replays.append(1)),
+        "output": torch.tensor([[[42.0], [43.0]]]),
+        "replays": replays,
+    }
+
+
+def test_super_manual_graph_first_shape_builds_dense_prefix(monkeypatch) -> None:
+    model = _cfg_test_model()
+    model._action_graphs = {}
+    captured: dict = {}
+
+    def fake_manual_graph(**kwargs):
+        captured.update(kwargs)
+        return kwargs["action"]
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_manual_graph)
+    monkeypatch.setattr(
+        model,
+        "_gather_prefix_cache_into_static",
+        lambda *_args, **_kwargs: pytest.fail("An unknown graph shape must not gather into a StaticCache"),
+    )
+
+    _run_manual_graph_sample(model, torch.tensor([1, 2]), 2)
+
+    assert isinstance(captured["prefix"], alpamayo2_super_module.DynamicCache)
+    assert captured["prefix"].get_seq_length() == 2
+    assert captured["prefix_length"] == 2
+    assert captured["static_cache_max_len"] == 16
+
+
+def test_super_manual_graph_reuses_state_and_gathers_prefix_directly(monkeypatch) -> None:
+    model = _cfg_test_model()
+    state = _fake_action_graph_state()
+    key = model._action_graph_key(
+        action_shape=(1, 2, 1),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 1, 2),
+        attention_mask_shape=(1, 1, 2, 16),
+        inference_steps=2,
+    )
+    model._action_graphs = {key: state}
+    monkeypatch.setattr(
+        model,
+        "_gather_prefix_cache_batch",
+        lambda *_args, **_kwargs: pytest.fail("A known graph shape must not build a DynamicCache"),
+    )
+    monkeypatch.setattr(
+        model,
+        "_make_static_action_cache",
+        lambda *_args, **_kwargs: pytest.fail("A known graph shape must not create a new StaticCache"),
+    )
+    monkeypatch.setattr(
+        model,
+        "_copy_action_prefix",
+        lambda *_args, **_kwargs: pytest.fail("The direct gather replaces _copy_action_prefix"),
+    )
+
+    first = _run_manual_graph_sample(model, torch.tensor([1, 2]), 2)
+    second = _run_manual_graph_sample(model, torch.tensor([5, 3]), 2)
+
+    assert len(model._action_graphs) == 1
+    assert model._action_graphs[key] is state
+    assert state["replays"] == [1, 1]
+    layer = state["cache"].layers[0]
+    # The second request's prefix (blocks 5 and 3) replaced the first one in place.
+    assert layer.keys.flatten().tolist()[:3] == [5.0, 3.0, 0.0]
+    assert layer.values.flatten().tolist()[:3] == [5.0, 3.0, 0.0]
+    assert layer.cumulative_length.tolist() == [2]
+    assert state["cache_position"].tolist() == [2, 3]
+    assert state["attention_mask"].shape == (1, 1, 2, 16)
+    torch.testing.assert_close(first["normalized_controls"], state["output"])
+    torch.testing.assert_close(second["normalized_controls"], state["output"])
+    assert first["normalized_controls"].data_ptr() != state["output"].data_ptr()
+
+
+def test_super_manual_graph_requires_dense_prefix_for_new_state() -> None:
+    model = _cfg_test_model()
+    model._action_graphs = {}
+    with pytest.raises(RuntimeError, match="dense prefix cache is required"):
+        model._run_manual_action_graph(
+            expert=model.expert.expert,
+            prefix=None,
+            prefix_length=2,
+            action=torch.zeros(1, 2, 1),
+            expert_positions=torch.zeros(3, 1, 2, dtype=torch.long),
+            attention_mask=torch.zeros(1, 1, 2, 16, dtype=torch.bfloat16),
+            inference_steps=2,
+            suffix_length=2,
+            static_cache_max_len=16,
+        )
+
+
+def test_super_manual_graph_state_lookup_matches_traced_key() -> None:
+    """The planned-shape key used before gathering equals the key traced from real tensors."""
+    action = torch.zeros(3, 2, 1)
+    positions = torch.zeros(3, 3, 2, dtype=torch.long)
+    mask = torch.zeros(3, 1, 2, 16, dtype=torch.bfloat16)
+    traced = Alpamayo2SuperForConditionalGeneration._action_graph_key(
+        action_shape=tuple(action.shape),
+        action_dtype=action.dtype,
+        device=action.device,
+        positions_shape=tuple(positions.shape),
+        attention_mask_shape=tuple(mask.shape),
+        inference_steps=10,
+    )
+    planned = Alpamayo2SuperForConditionalGeneration._action_graph_key(
+        action_shape=(3, *(2, 1)),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 3, 2),
+        attention_mask_shape=(3, 1, 2, 16),
+        inference_steps=10,
+    )
+    assert traced == planned
+    assert hash(traced) == hash(planned)
 
 
 def test_super_action_output_reports_attention_backend_and_decode_graph_state() -> None:
