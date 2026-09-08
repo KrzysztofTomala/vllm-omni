@@ -2476,3 +2476,41 @@ def test_super_forward_ignores_prefill_and_missing_forward_context(monkeypatch) 
     monkeypatch.setattr(alpamayo2_super_module, "get_forward_context", None)
     _forward_with_context(model, monkeypatch, None)
     assert model._decode_cudagraph_observation == -1
+
+
+def test_pointwise_config_guard_drops_only_the_miscompiling_configuration() -> None:
+    from triton import Config
+
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    good = Config({"XBLOCK": 128}, num_warps=4, num_stages=1)
+    bad = Config({"XBLOCK": 256}, num_warps=4, num_stages=1)
+    other = Config({"XBLOCK": 256}, num_warps=8, num_stages=1)
+    kept = module.filter_pointwise_configs([good, bad, other])
+    assert [c.kwargs["XBLOCK"] for c in kept] == [128, 256]
+    assert [c.num_warps for c in kept] == [4, 8]
+    fallback = module.filter_pointwise_configs([bad])
+    assert len(fallback) == 1 and fallback[0].kwargs == {"XBLOCK": 128} and fallback[0].num_warps == 4
+    assert module.filter_pointwise_configs([]) == []
+
+
+def test_pointwise_config_guard_wraps_inductor_autotuner(monkeypatch) -> None:
+    from torch._inductor.runtime import triton_heuristics
+    from torch._inductor.runtime.hints import HeuristicType
+    from triton import Config
+
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    seen = []
+
+    def recorder(size_hints, configs, triton_meta, heuristic_type, *args, **kwargs):
+        seen.append((heuristic_type, [c.kwargs["XBLOCK"] for c in configs]))
+        return "autotuner"
+
+    monkeypatch.setattr(triton_heuristics, "cached_autotune", recorder)
+    assert module.install_inductor_pointwise_config_guard() is True
+    assert module.install_inductor_pointwise_config_guard() is False  # idempotent
+    configs = [Config({"XBLOCK": 256}, num_warps=4, num_stages=1), Config({"XBLOCK": 128}, num_warps=4, num_stages=1)]
+    assert triton_heuristics.cached_autotune([1024], configs, {}, HeuristicType.POINTWISE) == "autotuner"
+    assert triton_heuristics.cached_autotune([1024], configs, {}, HeuristicType.REDUCTION) == "autotuner"
+    assert seen == [(HeuristicType.POINTWISE, [128]), (HeuristicType.REDUCTION, [256, 128])]
