@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from transformers import DynamicCache, StaticCache
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
@@ -26,6 +27,12 @@ from vllm.transformers_utils.processor import cached_get_processor
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.runner_context import RunnerKVCacheContext
+
+logger = init_logger(__name__)
+
+# Decode steps a guided child may wait for its unguided CFG twin before the
+# expert runs guided-only. Overridden per request by ``_nav_cfg_max_hold_steps``.
+_NAV_CFG_DEFAULT_MAX_HOLD_STEPS = 128
 
 _BATCHED_POLICY_OUTPUT_KEYS = frozenset(
     {
@@ -102,6 +109,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self._force_future_start_indices: tuple[int, ...] = ()
         self._mask_text_eos_indices: tuple[int, ...] = ()
         self._pending_policy_groups: dict[str, dict[str, dict[str, Any]]] = {}
+        # Navigation CFG rendezvous state: held decode steps per guided group
+        # and registered unguided twins keyed by (caller request id, child
+        # index). Runner request ids are engine-internal, so twins cannot be
+        # matched by the NIM-visible child id they name in ``_nav_cfg_partner``.
+        self._policy_group_hold_steps: dict[str, int] = {}
+        self._pending_nav_twins: dict[tuple[str, int], dict[str, Any]] = {}
+        # Processed prompt length of each twin, measured in-engine on the step
+        # its first token is forced (after multimodal placeholder expansion).
+        self._nav_twin_prefill_lengths: dict[tuple[str, int], int] = {}
+        self._logits_request_count: int | None = None
         generation_config = vllm_config.model_config.try_get_generation_config()
         text_eos_ids = generation_config.get("eos_token_id")
         if text_eos_ids is None:
@@ -535,7 +552,17 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         positions: Sequence[torch.Tensor],
         observations: Sequence[Mapping[str, Any]],
         extra_args: Sequence[Mapping[str, Any]],
+        unguided_block_tables: Sequence[torch.Tensor] | None = None,
+        unguided_seq_lens: Sequence[int] | None = None,
+        unguided_positions: Sequence[torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Run flow matching for a batch of guided samples.
+
+        When ``unguided_*`` are given, every guided sample is paired with the
+        prefix of its unguided twin and the velocity is combined per step as in
+        ``FlowMatching._guided_v`` (``examples/two_gpu_nav_cfg_demo.py``):
+        ``v = (1 - w) * v_unguided + w * v_guided``.
+        """
         target_cache_layers = int(self.expert.config.llm_config.num_hidden_layers)
         if len(caches) < target_cache_layers:
             raise RuntimeError(
@@ -574,9 +601,29 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 or float(extra.get("action_temperature", 1.0)) != temperature
             ):
                 raise ValueError("Batched expert branches must use identical diffusion settings")
+        requested_weights = {extra.get("_nav_guidance_weight") for extra in extra_args}
+        if len(requested_weights) != 1:
+            raise ValueError("Batched expert branches must share one nav_guidance_weight")
+        requested_weight = requested_weights.pop()
+        nav_cfg = unguided_block_tables is not None
+        if nav_cfg:
+            if requested_weight is None:
+                raise ValueError("Navigation CFG requires _nav_guidance_weight on every guided branch")
+            if (
+                unguided_seq_lens is None
+                or unguided_positions is None
+                or not (len(unguided_block_tables) == len(unguided_seq_lens) == len(unguided_positions) == sample_count)
+            ):
+                raise ValueError("Navigation CFG needs exactly one unguided prefix per guided sample")
+        # The effective weight: 1.0 whenever the expert runs guided-only.
+        guidance_weight = float(requested_weight) if nav_cfg else 1.0
 
-        prefix_lengths = [int(seq_len) for seq_len in seq_lens]
-        prefix = self._gather_prefix_cache_batch(caches, block_tables, seq_lens)
+        all_block_tables = [*block_tables, *(unguided_block_tables or ())]
+        all_seq_lens = [int(seq_len) for seq_len in (*seq_lens, *(unguided_seq_lens or ()))]
+        all_positions = [*positions, *(unguided_positions or ())]
+        row_count = len(all_block_tables)
+        prefix_lengths = all_seq_lens
+        prefix = self._gather_prefix_cache_batch(caches, all_block_tables, all_seq_lens)
         if bool(first_extra.get("_batch_action_expert", True)) is False and sample_count > 1:
             raise ValueError("Sequential expert mode must submit one VLM branch per expert call")
         record_profile_event()
@@ -587,6 +634,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
+        if nav_cfg:
+            # The captured graph replays a fixed guided-only integration over a
+            # StaticCache holding one prefix per sample. CFG doubles the prefix
+            # rows and combines two velocities per step, so it always takes the
+            # eager DynamicCache loop below.
+            manual_action_cudagraph = False
+            static_expert_cache = False
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply
@@ -596,6 +650,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 prefix_len + suffix_length,
             )
 
+        # One noise row per trajectory sample; the unguided twin rows share
+        # their guided sample's action state.
         noise_rows: list[torch.Tensor] = []
         for extra in extra_args:
             generator = None
@@ -618,15 +674,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         action = action * temperature
 
         last_position = torch.cat(
-            [self._action_boundary_position(value, device=device) for value in positions],
+            [self._action_boundary_position(value, device=device) for value in all_positions],
             dim=1,
         )
         expert_positions = (
             last_position[:, :, None] + 1 + torch.arange(suffix_length, device=device)[None, None, :]
-        ).expand(3, sample_count, suffix_length)
+        ).expand(3, row_count, suffix_length)
         weight_dtype = self.expert.action_out_proj.weight.dtype
         attention_mask = self._make_action_attention_mask(
-            sample_count=sample_count,
+            sample_count=row_count,
             prefix_length=prefix_len,
             suffix_length=suffix_length,
             max_cache_len=(static_cache_max_len if static_expert_cache else None),
@@ -677,8 +733,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     (sample_count,) + (1,) * len(action_dims),
                     step / inference_steps,
                 )
+                step_action, step_timestep = action, timestep
+                if nav_cfg:
+                    # Guided and unguided rows denoise the same action x.
+                    step_action = torch.cat([action, action], dim=0)
+                    step_timestep = torch.cat([timestep, timestep], dim=0)
                 with torch.autocast(device_type=device.type, dtype=weight_dtype):
-                    embeddings = self.expert.action_in_proj(action, timestep)
+                    embeddings = self.expert.action_in_proj(step_action, step_timestep)
                 outputs = expert(
                     inputs_embeds=embeddings.to(weight_dtype),
                     position_ids=expert_positions,
@@ -693,7 +754,12 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 else:
                     expert_cache.crop(prefix_len)
                 velocity = self.expert.action_out_proj(outputs.last_hidden_state[:, -suffix_length:])
-                action = action + velocity.float().view(sample_count, *action_dims) / inference_steps
+                velocity = velocity.float().view(row_count, *action_dims)
+                if nav_cfg:
+                    guided_velocity = velocity[:sample_count]
+                    unguided_velocity = velocity[sample_count:]
+                    velocity = (1.0 - guidance_weight) * unguided_velocity + guidance_weight * guided_velocity
+                action = action + velocity / inference_steps
         record_profile_event()
 
         history_xyz_rows = [
@@ -743,12 +809,17 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 action_dims=action_dims,
                 device=device,
             )
+        # Counts trajectory samples per expert call; CFG doubles the prefix
+        # rows without changing the sample count.
         result["action_expert_invocation_batch_size"] = torch.full(
             (sample_count,),
             sample_count,
             device=device,
             dtype=torch.int32,
         )
+        # Request-level scalars (identical for every sample of one request).
+        result["nav_cfg_applied"] = torch.tensor(nav_cfg, device=device)
+        result["nav_guidance_weight"] = torch.tensor(guidance_weight, device=device, dtype=torch.float32)
         return result
 
     def _sample_actions(
@@ -836,6 +907,31 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             **kwargs,
         )
 
+    @staticmethod
+    def _microbatch_children(
+        ordered: Sequence[tuple[str, dict[str, Any]]],
+        max_batch_size: int,
+        *,
+        rows_per_sample: int,
+    ) -> list[Sequence[tuple[str, dict[str, Any]]]]:
+        """Chunk guided children so each expert call stays within the row budget.
+
+        ``_action_expert_max_batch_size`` counts expert prefix rows. A guided
+        sample and its unguided CFG twin always share one call, so with CFG
+        each pair costs two rows; a single pair is never split.
+        """
+        per_chunk = max(1, max_batch_size // rows_per_sample)
+        return [ordered[begin : begin + per_chunk] for begin in range(0, len(ordered), per_chunk)]
+
+    @staticmethod
+    def _nav_twin_key(extra: Mapping[str, Any]) -> tuple[str, int]:
+        """Return the (caller request id, child index) a twin pairs with."""
+        group = extra.get("_nav_cfg_group")
+        partner_index = extra.get("_nav_cfg_partner_index")
+        if not group or partner_index is None:
+            raise RuntimeError("Unguided CFG twins must carry _nav_cfg_group and _nav_cfg_partner_index")
+        return str(group), int(partner_index)
+
     def make_omni_output(
         self,
         hidden_states: torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]],
@@ -857,8 +953,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self._mask_text_eos_indices = tuple(
             index for index, observation in enumerate(observations) if observation is not None
         )
+        self._logits_request_count = len(observations) if observations else None
         multimodal_outputs: dict[str, list[torch.Tensor | None]] = {}
-        triggered_indices: list[int] = []
+        triggered_indices: set[int] = set()
         if observations and input_ids is not None:
             request_count = len(observations)
             if request_token_spans is None:
@@ -881,8 +978,29 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     raise RuntimeError("Super policy arguments and runner requests must align")
             per_request_outputs: list[dict[str, torch.Tensor] | None] = [None] * request_count
             touched_groups: set[str] = set()
+            touched_twins: set[str] = set()
+            forced_first_token_indices: set[int] = set()
             for index, (observation, span) in enumerate(zip(observations, request_token_spans, strict=True)):
                 start, end = span
+                extra = extras[index] if index < len(extras) else None
+                if (
+                    observation is not None
+                    and isinstance(extra, Mapping)
+                    and extra.get("_force_first_token") is not None
+                    and not trigger_mask[index]
+                ):
+                    # An unguided CFG twin that has not produced its first
+                    # token yet (its prompt is still being prefilled). Force
+                    # future_start so its next span triggers the rendezvous.
+                    if int(extra["_force_first_token"]) != self.future_start_id:
+                        raise ValueError("_force_first_token must be the future_start token")
+                    forced_first_token_indices.add(index)
+                    if extra.get("_nav_cfg_role") == "unguided" and runner_kv_cache_context is not None:
+                        # Full processed prompt length; the last chunk of a
+                        # chunked prefill overwrites earlier partial values.
+                        self._nav_twin_prefill_lengths[self._nav_twin_key(extra)] = int(
+                            runner_kv_cache_context.sequence_lengths[index]
+                        )
                 # A speculative verification block can contain an unaccepted
                 # future_start after its first token. The accepted boundary is
                 # fed back as the first token of a draft-free request span.
@@ -890,15 +1008,50 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 assert observation is not None
                 assert runner_kv_cache_context is not None
-                extra = extras[index]
                 if not isinstance(extra, Mapping):
                     raise RuntimeError("Super policy sampling arguments must be mappings")
                 request_id = runner_kv_cache_context.request_ids[index]
+                if extra.get("_nav_cfg_role") == "unguided":
+                    # Twins never run the expert themselves; they only lend
+                    # their unguided prefix to the guided partner's group.
+                    partner = self._nav_twin_key(extra)
+                    seq_len = int(runner_kv_cache_context.sequence_lengths[index])
+                    twin = self._pending_nav_twins.get(partner)
+                    if twin is None:
+                        prefill_len = self._nav_twin_prefill_lengths.pop(partner, None)
+                        if prefill_len is None or seq_len != prefill_len + 1:
+                            # future_start was not the first token produced
+                            # after the prompt (the forcing step was skipped,
+                            # see compute_logits), so the prefix no longer
+                            # ends at the guided reasoning boundary.
+                            logger.warning(
+                                "Unguided CFG twin %s reached future_start at length %d, expected %s; "
+                                "its guided partner %s will run without navigation guidance",
+                                request_id,
+                                seq_len,
+                                "unknown" if prefill_len is None else prefill_len + 1,
+                                extra.get("_nav_cfg_partner", partner),
+                            )
+                            self._pending_nav_twins[partner] = {"request_id": request_id, "invalid": True}
+                            triggered_indices.add(index)
+                            touched_twins.add(partner)
+                            continue
+                        self._pending_nav_twins[partner] = {
+                            "request_id": request_id,
+                            "block_table": runner_kv_cache_context.block_table[index].clone(),
+                            "seq_len": seq_len,
+                            "positions": self._request_positions(positions, start, end).clone(),
+                        }
+                    elif twin["request_id"] != request_id:
+                        raise RuntimeError(f"Guided child {partner} has more than one unguided CFG twin")
+                    touched_twins.add(partner)
+                    continue
                 group_id, child_index, expected = self._parallel_group_info(
                     request_id,
                     extra,
                 )
-                if expected == 1 or not bool(extra.get("_batch_action_expert", True)):
+                needs_twin = extra.get("_nav_guidance_weight") is not None
+                if not needs_twin and (expected == 1 or not bool(extra.get("_batch_action_expert", True))):
                     per_request_outputs[index] = self._sample_actions(
                         caches=runner_kv_cache_context.caches,
                         block_table=runner_kv_cache_context.block_table[index],
@@ -907,7 +1060,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         observation=observation,
                         extra_args=extra,
                     )
-                    triggered_indices.append(index)
+                    triggered_indices.add(index)
                     continue
 
                 group = self._pending_policy_groups.setdefault(group_id, {})
@@ -921,6 +1074,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "positions": self._request_positions(positions, start, end).clone(),
                         "observation": observation,
                         "extra_args": extra,
+                        "needs_twin": needs_twin,
+                        # (caller request id, child index): the key its twin uses.
+                        "nav_key": (str(extra.get("_nav_cfg_group") or group_id), child_index),
                     },
                 )
                 touched_groups.add(group_id)
@@ -944,6 +1100,39 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     continue
 
+                # Navigation CFG: every guided child that requested guidance
+                # must also have its unguided twin scheduled in this batch.
+                twin_partners = [entry["nav_key"] for entry in group.values() if entry["needs_twin"]]
+                twins = {nav_key: self._pending_nav_twins.get(nav_key) for nav_key in twin_partners}
+                apply_nav_cfg = bool(twin_partners)
+                if twin_partners:
+                    if any(twin is not None and twin.get("invalid") for twin in twins.values()):
+                        apply_nav_cfg = False
+                    elif not all(
+                        twin is not None and twin["request_id"] in request_index_by_id for twin in twins.values()
+                    ):
+                        hold_steps = self._policy_group_hold_steps.get(group_id, 0) + 1
+                        self._policy_group_hold_steps[group_id] = hold_steps
+                        max_hold_steps = max(
+                            int(entry["extra_args"].get("_nav_cfg_max_hold_steps", _NAV_CFG_DEFAULT_MAX_HOLD_STEPS))
+                            for entry in group.values()
+                        )
+                        if hold_steps < max_hold_steps:
+                            waiting_indices.update(request_index_by_id[request_id] for request_id in group)
+                            waiting_indices.update(
+                                request_index_by_id[twin["request_id"]]
+                                for twin in twins.values()
+                                if twin is not None and twin["request_id"] in request_index_by_id
+                            )
+                            continue
+                        logger.warning(
+                            "Navigation CFG twin missing for %s after %d held decode steps; "
+                            "running the action expert guided-only",
+                            group_id,
+                            hold_steps,
+                        )
+                        apply_nav_cfg = False
+
                 ordered = sorted(group.items(), key=lambda item: int(item[1]["child_index"]))
                 configured_batch_sizes = {
                     int(entry["extra_args"].get("_action_expert_max_batch_size", expected)) for _, entry in ordered
@@ -953,19 +1142,30 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 max_batch_size = configured_batch_sizes.pop()
                 if max_batch_size < 1:
                     raise ValueError("action_expert_max_batch_size must be positive")
+                if not all(bool(entry["extra_args"].get("_batch_action_expert", True)) for _, entry in ordered):
+                    max_batch_size = 1
                 microbatch_outputs = []
-                for begin in range(0, len(ordered), max_batch_size):
-                    chunk = ordered[begin : begin + max_batch_size]
-                    microbatch_outputs.append(
-                        self._sample_actions_batch(
-                            caches=runner_kv_cache_context.caches,
-                            block_tables=[entry["block_table"] for _, entry in chunk],
-                            seq_lens=[int(entry["seq_len"]) for _, entry in chunk],
-                            positions=[entry["positions"] for _, entry in chunk],
-                            observations=[entry["observation"] for _, entry in chunk],
-                            extra_args=[entry["extra_args"] for _, entry in chunk],
+                for chunk in self._microbatch_children(
+                    ordered,
+                    max_batch_size,
+                    rows_per_sample=2 if apply_nav_cfg else 1,
+                ):
+                    batch_kwargs: dict[str, Any] = {
+                        "caches": runner_kv_cache_context.caches,
+                        "block_tables": [entry["block_table"] for _, entry in chunk],
+                        "seq_lens": [int(entry["seq_len"]) for _, entry in chunk],
+                        "positions": [entry["positions"] for _, entry in chunk],
+                        "observations": [entry["observation"] for _, entry in chunk],
+                        "extra_args": [entry["extra_args"] for _, entry in chunk],
+                    }
+                    if apply_nav_cfg:
+                        chunk_twins = [twins[entry["nav_key"]] for _, entry in chunk]
+                        batch_kwargs.update(
+                            unguided_block_tables=[twin["block_table"] for twin in chunk_twins],
+                            unguided_seq_lens=[int(twin["seq_len"]) for twin in chunk_twins],
+                            unguided_positions=[twin["positions"] for twin in chunk_twins],
                         )
-                    )
+                    microbatch_outputs.append(self._sample_actions_batch(**batch_kwargs))
                 batched_output = self._concat_batched_policy_outputs(microbatch_outputs)
                 for batch_index, (request_id, _) in enumerate(ordered):
                     request_index = request_index_by_id[request_id]
@@ -973,16 +1173,63 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         batched_output,
                         batch_index,
                     )
-                    triggered_indices.append(request_index)
+                    triggered_indices.add(request_index)
+                for nav_key in twin_partners:
+                    # Twins end with the group (forced future_end, empty payload).
+                    self._nav_twin_prefill_lengths.pop(nav_key, None)
+                    twin = self._pending_nav_twins.pop(nav_key, None)
+                    if twin is not None and twin["request_id"] in request_index_by_id:
+                        triggered_indices.add(request_index_by_id[twin["request_id"]])
+                if apply_nav_cfg:
+                    logger.info(
+                        "Navigation CFG applied for group %s after %d held decode steps (K=%d, weight=%.2f)",
+                        group_id,
+                        self._policy_group_hold_steps.get(group_id, 0),
+                        expected,
+                        float(ordered[0][1]["extra_args"]["_nav_guidance_weight"]),
+                    )
                 del self._pending_policy_groups[group_id]
+                self._policy_group_hold_steps.pop(group_id, None)
+
+            for partner in touched_twins:
+                twin = self._pending_nav_twins.get(partner)
+                if twin is None:
+                    continue
+                partner_pending = any(
+                    entry.get("nav_key") == partner
+                    for group in self._pending_policy_groups.values()
+                    for entry in group.values()
+                )
+                if twin.get("invalid"):
+                    # Already ended; keep the marker only while its group can
+                    # still consume it.
+                    if not partner_pending:
+                        del self._pending_nav_twins[partner]
+                    continue
+                twin_index = request_index_by_id.get(twin["request_id"])
+                if twin_index is None or twin_index in triggered_indices:
+                    continue
+                if partner_pending:
+                    # The guided group is still assembling; hold the twin too.
+                    waiting_indices.add(twin_index)
+                    continue
+                # The partner already finished (timeout fallback or abort); a
+                # twin must never run the expert or wait on its own.
+                logger.warning(
+                    "Unguided CFG twin %s has no pending guided partner %s; ending it without an expert run",
+                    twin["request_id"],
+                    partner,
+                )
+                del self._pending_nav_twins[partner]
+                triggered_indices.add(twin_index)
 
             output_keys = {key for output in per_request_outputs if output is not None for key in output}
             multimodal_outputs = {
                 key: [output.get(key) if output is not None else None for output in per_request_outputs]
                 for key in output_keys
             }
-            self._force_future_end_indices = tuple(triggered_indices)
-            self._force_future_start_indices = tuple(sorted(waiting_indices))
+            self._force_future_end_indices = tuple(sorted(triggered_indices))
+            self._force_future_start_indices = tuple(sorted(waiting_indices | forced_first_token_indices))
         if isinstance(hidden_states, list | tuple):
             text_hidden_states = hidden_states[0]
             aux_hidden_states = hidden_states[1]
@@ -1002,9 +1249,11 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         force_end_indices = self._force_future_end_indices
         force_start_indices = self._force_future_start_indices
         mask_text_eos_indices = self._mask_text_eos_indices
+        request_count = self._logits_request_count
         self._force_future_end_indices = ()
         self._force_future_start_indices = ()
         self._mask_text_eos_indices = ()
+        self._logits_request_count = None
         traj_ids = self.alpamayo_config.traj_ids
         start = min(int(traj_ids["history_id0"]), int(traj_ids["future_id0"]))
         logits[..., start : start + int(self.alpamayo_config.traj_vocab_size)] = -torch.inf
@@ -1014,6 +1263,23 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 indices[:, None],
                 torch.as_tensor(self._text_eos_token_ids, device=logits.device, dtype=torch.long),
             ] = -torch.inf
+        if (
+            (force_start_indices or force_end_indices)
+            and request_count is not None
+            and int(logits.shape[0]) != request_count
+        ):
+            # Speculative verification steps carry one logits row per draft
+            # position, so request indices do not address rows. Model-owned
+            # boundaries are only forced on draft-free steps (a request that
+            # sampled future_start disables drafting for the next step); never
+            # force a token onto another request's row.
+            logger.warning(
+                "Skipping forced trajectory boundaries: %d logits rows for %d requests",
+                int(logits.shape[0]),
+                request_count,
+            )
+            force_start_indices = ()
+            force_end_indices = ()
         for force_indices, token_id in (
             (force_start_indices, self.future_start_id),
             (force_end_indices, self.future_end_id),

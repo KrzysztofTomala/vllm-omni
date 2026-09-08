@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,15 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_omni.entrypoints.openpi.request_adapters import OpenPIEngineRequest
 
 _ACTION_EXPERT_MAX_BATCH_SIZE_ENV = "NIM_ALPAMAYO_ACTION_EXPERT_MAX_BATCH_SIZE"
+# Navigation CFG defaults. The released checkpoint carries
+# inference_guidance_weight=3.0; ``use_classifier_free_guidance`` must stay off
+# in the expert config (the OSS expert refuses to initialise otherwise), so the
+# combination is applied per call in the model.
+_DEFAULT_NAV_GUIDANCE_WEIGHT = 3.0
+# The twin round trip is one NIM stream callback plus a cached-encoder prefill:
+# a few dozen decode steps. Held steps reserve KV per child, so keep this tight.
+_DEFAULT_NAV_CFG_MAX_HOLD_STEPS = 128
+_NAV_COMPONENTS_ORDER = ("image", "traj_history", "nav_instruction", "prompt")
 
 
 def _wire_value(value: Any) -> Any:
@@ -81,19 +91,54 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             frame_tensor = frame_tensor.unflatten(0, (camera_indices.numel(), frames_per_camera))
         return frame_tensor, camera_indices, frames_per_camera
 
-    def _policy_prompt(self, observation: Mapping[str, Any]) -> tuple[list[int], list[torch.Tensor]]:
+    @staticmethod
+    def _nav_text(observation: Mapping[str, Any]) -> str | None:
+        navigation = observation.get("nav_text", observation.get("navigation"))
+        if navigation is None or not str(navigation):
+            return None
+        return str(navigation)
+
+    def _policy_messages(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        include_nav: bool,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor]:
         from alpamayo2_super.helper import create_messages
-        from alpamayo2_super.models.utils import fuse_traj_tokens
 
         frames, camera_indices, _ = self._frames(observation)
-        data = {
+        data: dict[str, Any] = {
             "image_frames": frames,
             "camera_indices": camera_indices,
         }
-        navigation = observation.get("nav_text", observation.get("navigation"))
-        if navigation:
-            data["nav_text"] = [navigation]
-        messages = create_messages(data, self.model_config)
+        navigation = self._nav_text(observation) if include_nav else None
+        if navigation is None:
+            # The released default prompt. This path must stay bit-identical
+            # for observations without navigation text.
+            return create_messages(data, self.model_config), frames
+        # Mirror examples/two_gpu_nav_cfg_demo.py::prepare_nav_model_inputs:
+        # the navigation instruction sits between traj_history and prompt.
+        from alpamayo2_super.chat_template.conversation import build_conversation
+
+        data["nav_text"] = [navigation]
+        messages = build_conversation(
+            data=data,
+            num_tokens_per_history_traj=self.model_config.tokens_per_history_traj,
+            num_tokens_per_future_traj=self.model_config.tokens_per_future_traj,
+            components_order=list(_NAV_COMPONENTS_ORDER),
+            components_prompt=["cot", "traj_future"],
+            generation_mode=True,
+            include_camera_ids=self.model_config.include_camera_ids,
+            camera_ids=camera_indices,
+            include_frame_nums=self.model_config.frame_label == "frame_num",
+        )
+        if messages[-1]["role"] == "assistant" and not messages[-1]["content"]:
+            messages = messages[:-1]
+        return messages, frames
+
+    def _prompt_ids(self, messages: list[dict[str, Any]], observation: Mapping[str, Any]) -> list[int]:
+        from alpamayo2_super.models.utils import fuse_traj_tokens
+
         has_assistant = messages[-1]["role"] == "assistant" and bool(messages[-1]["content"])
         prompt = self.tokenizer.apply_chat_template(
             messages,
@@ -102,7 +147,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             continue_final_message=has_assistant,
         )
         prompt_ids = torch.tensor([self.tokenizer.encode(prompt)])
-        prompt_ids = fuse_traj_tokens(
+        return fuse_traj_tokens(
             self.history_tokenizer,
             self.future_tokenizer,
             prompt_ids,
@@ -112,27 +157,80 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             },
             self.model_config.traj_ids,
         )[0].tolist()
-        return prompt_ids, list(frames.flatten(0, 1))
 
-    def build_request(
-        self,
-        observation: dict[str, Any],
-        *,
+    def _policy_prompt(self, observation: Mapping[str, Any]) -> tuple[list[int], list[torch.Tensor]]:
+        messages, frames = self._policy_messages(observation, include_nav=True)
+        return self._prompt_ids(messages, observation), list(frames.flatten(0, 1))
+
+    def build_prompt_pair(self, observation: Mapping[str, Any]) -> tuple[list[int], list[int]]:
+        """Return (guided, unguided) prompt IDs for navigation CFG.
+
+        The unguided prompt is exactly the released no-navigation prompt, as in
+        ``examples/two_gpu_nav_cfg_demo.py``. Without ``nav_text`` both match.
+        """
+        guided_messages, _ = self._policy_messages(observation, include_nav=True)
+        unguided_messages, _ = self._policy_messages(observation, include_nav=False)
+        return (
+            self._prompt_ids(guided_messages, observation),
+            self._prompt_ids(unguided_messages, observation),
+        )
+
+    def _nav_guidance_weight(self, observation: Mapping[str, Any]) -> float:
+        """Resolve the CFG weight: observation, policy config, then checkpoint."""
+        value = observation.get("nav_guidance_weight")
+        if value is None:
+            value = self.policy_config.get("nav_guidance_weight")
+        if value is None:
+            value = getattr(self.model_config, "nav_guidance_weight", None)
+        if value is None:
+            # The released checkpoint stores inference_guidance_weight=3.0 in
+            # expert_config.diffusion_cfg while keeping CFG disabled at init.
+            try:
+                value = self.model_config.expert_config["diffusion_cfg"]["inference_guidance_weight"]
+            except (AttributeError, KeyError, TypeError):
+                value = None
+        weight = float(_DEFAULT_NAV_GUIDANCE_WEIGHT if value is None else value)
+        if not math.isfinite(weight):
+            raise ValueError("nav_guidance_weight must be a finite number")
+        return weight
+
+    def _nav_cfg_max_hold_steps(self) -> int:
+        steps = int(self.policy_config.get("nav_cfg_max_hold_steps", _DEFAULT_NAV_CFG_MAX_HOLD_STEPS))
+        if steps < 1:
+            raise ValueError("nav_cfg_max_hold_steps must be positive")
+        return steps
+
+    @staticmethod
+    def _multi_modal_uuids(
+        observation: Mapping[str, Any],
+        images: Sequence[Any],
         request_id: str,
-        session_id: str,
-        reset: bool,
-    ) -> OpenPIEngineRequest:
-        prompt_ids, images = self._policy_prompt(observation)
+    ) -> list[str]:
+        # Content-addressed IDs let a CFG twin reuse the guided request's
+        # encoder-cache entries; fall back to request-scoped IDs otherwise.
+        image_uuids = observation.get("image_uuids")
+        if image_uuids:
+            uuids = [str(uuid) for uuid in image_uuids]
+            if len(uuids) != len(images):
+                raise ValueError(f"image_uuids must contain one entry per image; got {len(uuids)} for {len(images)}")
+            return uuids
+        return [f"{request_id}:image:{index}" for index in range(len(images))]
+
+    def _expert_extra_args(self) -> dict[str, Any]:
+        """Diffusion and expert-cache flags shared by guided and twin requests."""
         sample_count = int(self.policy_config.get("num_trajectory_samples", 1))
         if sample_count < 1:
             raise ValueError("num_trajectory_samples must be positive")
-        sampling_seed = int(self.policy_config.get("seed", 42))
-        precision = str(
-            self.policy_config.get("precision")
-            or os.getenv("NIM_PRECISION")
-            or os.getenv("NIM_ALPAMAYO_PRECISION")
-            or "bf16"
-        ).strip().lower()
+        precision = (
+            str(
+                self.policy_config.get("precision")
+                or os.getenv("NIM_PRECISION")
+                or os.getenv("NIM_ALPAMAYO_PRECISION")
+                or "bf16"
+            )
+            .strip()
+            .lower()
+        )
         user_batch_size = os.getenv(_ACTION_EXPERT_MAX_BATCH_SIZE_ENV)
         configured_batch_size = self.policy_config.get("action_expert_max_batch_size")
         # Three samples is the largest BF16 action-expert batch qualified on an
@@ -149,28 +247,17 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 action_expert_max_batch_size = sample_count
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and "
-                "action_expert_max_batch_size must be positive integers"
+                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and action_expert_max_batch_size must be positive integers"
             ) from exc
         if action_expert_max_batch_size < 1:
             raise ValueError(
-                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and "
-                "action_expert_max_batch_size must be positive integers"
+                f"{_ACTION_EXPERT_MAX_BATCH_SIZE_ENV} and action_expert_max_batch_size must be positive integers"
             )
-        extra_args = {
-            "reset": reset,
-            "session_id": session_id,
-            "robot_obs": _wire_value(
-                {
-                    "ego_history_xyz": observation["ego_history_xyz"],
-                    "ego_history_rot": observation["ego_history_rot"],
-                }
-            ),
+        return {
             # vLLM's native parallel-sampling path creates one independently
             # decoded VLM completion per trajectory.  Each child invokes the
             # action expert once, conditioned on its own reasoning prefix.
             "num_traj_samples": 1,
-            "_parallel_sample_count": sample_count,
             "_batch_action_expert": bool(self.policy_config.get("batch_action_expert", True)),
             "_action_expert_max_batch_size": action_expert_max_batch_size,
             "diffusion_steps": int(self.policy_config.get("diffusion_steps", 10)),
@@ -179,11 +266,56 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "_manual_action_cudagraph": bool(self.policy_config.get("manual_action_cudagraph", False)),
             "_static_expert_cache_max_len": int(self.policy_config.get("static_expert_cache_max_len", 4800)),
         }
+
+    @staticmethod
+    def _robot_obs(observation: Mapping[str, Any]) -> Any:
+        return _wire_value(
+            {
+                "ego_history_xyz": observation["ego_history_xyz"],
+                "ego_history_rot": observation["ego_history_rot"],
+            }
+        )
+
+    def build_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        request_id: str,
+        session_id: str,
+        reset: bool,
+    ) -> OpenPIEngineRequest:
+        prompt_ids, images = self._policy_prompt(observation)
+        sample_count = int(self.policy_config.get("num_trajectory_samples", 1))
+        sampling_seed = int(self.policy_config.get("seed", 42))
+        max_tokens = int(self.policy_config.get("max_tokens", 128))
+        extra_args = {
+            "reset": reset,
+            "session_id": session_id,
+            "robot_obs": self._robot_obs(observation),
+            **self._expert_extra_args(),
+            "_parallel_sample_count": sample_count,
+        }
+        nav_weight = self._nav_guidance_weight(observation)
+        if self._nav_text(observation) is not None and nav_weight != 1.0:
+            # Navigation CFG (examples/two_gpu_nav_cfg_demo.py): with w == 1 the
+            # guided/unguided combination reduces to the guided velocity, so a
+            # twin is requested only for other weights. The model holds each
+            # guided child (forcing future_start every step) until the NIM
+            # submits its unguided twin; give that wait its own token budget.
+            max_hold_steps = self._nav_cfg_max_hold_steps()
+            extra_args["_nav_guidance_weight"] = nav_weight
+            extra_args["_nav_cfg_max_hold_steps"] = max_hold_steps
+            # The engine renames requests internally (AsyncOmni suffixes the
+            # id, the input processor assigns a UUID, StagePool derives child
+            # ids), so twins pair by (caller request id, child index) rather
+            # than by runner request id. extra_args are copied to every child.
+            extra_args["_nav_cfg_group"] = str(request_id)
+            max_tokens += max_hold_steps
         return OpenPIEngineRequest(
             prompt={
                 "prompt_token_ids": prompt_ids,
                 "multi_modal_data": {"image": images},
-                "multi_modal_uuids": {"image": [f"{request_id}:image:{index}" for index in range(len(images))]},
+                "multi_modal_uuids": {"image": self._multi_modal_uuids(observation, images, request_id)},
                 "mm_processor_kwargs": {"device": "cuda"},
             },
             sampling_params=SamplingParams(
@@ -191,11 +323,84 @@ class Alpamayo2SuperOpenPIRequestAdapter:
                 seed=sampling_seed,
                 temperature=float(self.policy_config.get("temperature", 0.6)),
                 top_p=float(self.policy_config.get("top_p", 0.98)),
-                max_tokens=int(self.policy_config.get("max_tokens", 128)),
+                max_tokens=max_tokens,
                 output_kind=RequestOutputKind.FINAL_ONLY,
                 # ``future_start`` triggers the in-model action expert on the
                 # following decode step. Stop only after that hook forces the
                 # terminal ``future_end`` token and publishes its payload.
+                stop_token_ids=[int(self.model_config.traj_ids["future_end"])],
+                extra_args=extra_args,
+            ),
+            request_id=request_id,
+        )
+
+    @staticmethod
+    def _split_child_request_id(child_request_id: str) -> tuple[str, int]:
+        """Split vLLM's ``"<index>_<caller request id>"`` child id form.
+
+        A plain request id (no index prefix) denotes the single child of an
+        ``n=1`` request.
+        """
+        index, separator, parent = str(child_request_id).partition("_")
+        if separator and index.isdigit() and parent:
+            return parent, int(index)
+        return str(child_request_id), 0
+
+    def build_unguided_twin_request(
+        self,
+        observation: dict[str, Any],
+        *,
+        guided_child_request_id: str,
+        generated_token_ids: Sequence[int],
+        request_id: str,
+        session_id: str | None = None,
+    ) -> OpenPIEngineRequest:
+        """Build the unguided twin that supplies the CFG prefix for one child.
+
+        Mirrors ``build_unguided_continuation_inputs`` in the OSS demo: the
+        unguided prompt is followed by the guided child's generated reasoning
+        (without the trailing ``future_start``). The model forces
+        ``future_start`` as the twin's first token so it joins the guided
+        child's expert rendezvous, then forces ``future_end`` to end it.
+        """
+        future_start = int(self.model_config.traj_ids["future_start"])
+        partner_group, partner_index = self._split_child_request_id(guided_child_request_id)
+        generated = [int(token) for token in generated_token_ids]
+        while generated and generated[-1] == future_start:
+            generated.pop()
+        if future_start in generated:
+            raise ValueError("generated_token_ids must not contain future_start before the trailing boundary")
+        unguided_messages, frames = self._policy_messages(observation, include_nav=False)
+        prompt_ids = self._prompt_ids(unguided_messages, observation) + generated
+        images = list(frames.flatten(0, 1))
+        max_hold_steps = self._nav_cfg_max_hold_steps()
+        extra_args = {
+            "reset": True,
+            "session_id": session_id if session_id is not None else request_id,
+            "robot_obs": self._robot_obs(observation),
+            **self._expert_extra_args(),
+            "_nav_cfg_role": "unguided",
+            # Informational; the model pairs by (_nav_cfg_group, _nav_cfg_partner_index).
+            "_nav_cfg_partner": str(guided_child_request_id),
+            "_nav_cfg_group": partner_group,
+            "_nav_cfg_partner_index": partner_index,
+            "_force_first_token": future_start,
+            "_nav_cfg_max_hold_steps": max_hold_steps,
+        }
+        return OpenPIEngineRequest(
+            prompt={
+                "prompt_token_ids": prompt_ids,
+                "multi_modal_data": {"image": images},
+                "multi_modal_uuids": {"image": self._multi_modal_uuids(observation, images, request_id)},
+                "mm_processor_kwargs": {"device": "cuda"},
+            },
+            sampling_params=SamplingParams(
+                n=1,
+                # Forced future_start, up to max_hold_steps held steps while the
+                # rendezvous completes, then the forced future_end.
+                max_tokens=max_hold_steps + 2,
+                temperature=0,
+                output_kind=RequestOutputKind.FINAL_ONLY,
                 stop_token_ids=[int(self.model_config.traj_ids["future_end"])],
                 extra_args=extra_args,
             ),

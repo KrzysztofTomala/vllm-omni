@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as alpamayo2_super_module
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
 )
@@ -295,6 +296,11 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._mask_text_eos_indices = ()
     model._text_eos_token_ids = (2, 3)
     model._pending_policy_groups = {}
+    model._policy_group_hold_steps = {}
+    model._pending_nav_twins = {}
+    model._nav_twin_prefill_lengths = {}
+    model._logits_request_count = None
+    model._compiled_expert = None
     return model
 
 
@@ -616,3 +622,656 @@ def test_super_batched_action_expert_honors_microbatch_limit(monkeypatch) -> Non
         3,
         1,
     ]
+
+
+# The NIM-visible request id; vLLM renames the request internally and names
+# children "<index>_<internal uuid>", so runner ids never contain this string.
+_NIM_REQUEST_ID = "nim-trajectory-7"
+_INTERNAL_PARENT = "9f2c1a3e"
+
+
+def _child_id(index):
+    return f"{index}_{_INTERNAL_PARENT}"
+
+
+def _nav_child_extra(index, *, expected, weight=3.0, group=_NIM_REQUEST_ID, **overrides):
+    extra = {
+        "robot_obs": {"branch": index},
+        "_sampling_seed": 40 + index,
+        "_parallel_sample_count": expected,
+        "_batch_action_expert": True,
+        "_nav_guidance_weight": weight,
+        "_nav_cfg_group": group,
+    }
+    extra.update(overrides)
+    return extra
+
+
+def _twin_extra(partner_index, *, group=_NIM_REQUEST_ID, **overrides):
+    extra = {
+        "robot_obs": {"twin_of": partner_index},
+        "_nav_cfg_role": "unguided",
+        # What the NIM passes: the child id built from its own request id.
+        "_nav_cfg_partner": f"{partner_index}_{group}",
+        "_nav_cfg_group": group,
+        "_nav_cfg_partner_index": partner_index,
+        "_force_first_token": 7,
+    }
+    extra.update(overrides)
+    return extra
+
+
+def _prime_twin_prefill(model, context, extras, *, offset=1):
+    """Record each twin's in-engine prefill length as its forcing step would.
+
+    The engine-side length includes multimodal placeholder expansion, so it is
+    unrelated to the adapter's prompt token count; ``offset`` != 1 simulates a
+    twin whose forced first token was not its first produced token.
+    """
+    for index, extra in enumerate(extras):
+        if extra.get("_nav_cfg_role") == "unguided":
+            key = (extra["_nav_cfg_group"], extra["_nav_cfg_partner_index"])
+            model._nav_twin_prefill_lengths[key] = int(context.sequence_lengths[index]) - offset
+
+
+def _capture_logs(monkeypatch, level):
+    """Collect formatted messages emitted through the module logger at ``level``."""
+    records = []
+    monkeypatch.setattr(alpamayo2_super_module.logger, level, lambda msg, *args: records.append(msg % args))
+    return records
+
+
+def _marker_sample_actions_batch(calls):
+    def sample_actions_batch(**kwargs):
+        calls.append(kwargs)
+        markers = torch.tensor(kwargs["seq_lens"], dtype=torch.float32)
+        applied = "unguided_block_tables" in kwargs
+        return {
+            "actions": markers[:, None, None].expand(-1, 64, 3).clone(),
+            "nav_cfg_applied": torch.tensor(applied),
+            "nav_guidance_weight": torch.tensor(3.0 if applied else 1.0),
+        }
+
+    return sample_actions_batch
+
+
+def test_super_forces_first_token_for_unguided_twin_during_prefill(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    monkeypatch.setattr(model, "_sample_actions", lambda **kwargs: calls.append(kwargs) or {})
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10], [20]], dtype=torch.int32),
+        sequence_lengths=(50, 120),
+        request_ids=(_child_id(0), "twin-0"),
+    )
+
+    # The twin's prompt (a chunk of it) is prefilled next to an ordinary
+    # decode step of an unrelated request; nothing triggers.
+    output = model.make_omni_output(
+        torch.zeros(4, 8),
+        input_ids=torch.tensor([5, 1, 2, 3]),
+        positions=torch.arange(12).reshape(3, 4),
+        sampling_extra_args=[{"robot_obs": {}}, _twin_extra(0)],
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 4)],
+    )
+
+    assert calls == []
+    assert output.multimodal_outputs == {}
+    assert model._force_future_start_indices == (1,)
+    assert model._force_future_end_indices == ()
+    assert model._pending_nav_twins == {}
+    assert model._nav_twin_prefill_lengths == {(_NIM_REQUEST_ID, 0): 120}
+
+    logits = model.compute_logits(torch.zeros(2, 24))
+    assert torch.isneginf(logits[1]).sum() == logits.shape[-1] - 1
+    assert logits[1, model.future_start_id] == 0
+    assert logits[0, 5] == 0
+
+    with pytest.raises(ValueError, match="_force_first_token"):
+        model.make_omni_output(
+            torch.zeros(1, 8),
+            input_ids=torch.tensor([5]),
+            positions=torch.arange(3).reshape(3, 1),
+            sampling_extra_args=[_twin_extra(0, _force_first_token=9)],
+            runner_kv_cache_context=None,
+            request_token_spans=[(0, 1)],
+        )
+
+
+def test_super_compute_logits_skips_forcing_when_rows_are_not_requests(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.compute_logits",
+        lambda _self, hidden_states: hidden_states.clone(),
+    )
+    model._logits_request_count = 2
+    model._force_future_start_indices = (1,)
+    model._force_future_end_indices = (0,)
+
+    # Speculative verification: five logits rows for two requests.
+    logits = model.compute_logits(torch.zeros(5, 24))
+    assert not torch.isneginf(logits[..., 5]).any()
+    assert model._logits_request_count is None
+
+    model._logits_request_count = 2
+    model._force_future_start_indices = (1,)
+    logits = model.compute_logits(torch.zeros(2, 24))
+    assert logits[1, model.future_start_id] == 0
+    assert torch.isneginf(logits[1, 5])
+
+
+def test_super_nav_cfg_rendezvous_waits_for_twins_then_runs_expert_with_pairs(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    info_logs = _capture_logs(monkeypatch, "info")
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    monkeypatch.setattr(model, "_sample_actions", lambda **kwargs: calls.append(kwargs) or {})
+    request_ids = (_child_id(0), _child_id(1), "twin-0", "twin-1")
+    block_table = torch.tensor([[10], [20], [30], [40]], dtype=torch.int32)
+
+    def context(*sequence_lengths):
+        return RunnerKVCacheContext(
+            caches=[], block_table=block_table, sequence_lengths=sequence_lengths, request_ids=request_ids
+        )
+
+    # Four expert rows (two guided samples plus their twins) fit one call.
+    # The adapter built ~300-token twin prompts; after image placeholder
+    # expansion the engine prefill is ~4600 tokens (24 images). Only the
+    # in-engine length may be used for the boundary check.
+    extras = [
+        _nav_child_extra(0, expected=2, _action_expert_max_batch_size=4),
+        _nav_child_extra(1, expected=2, _action_expert_max_batch_size=4),
+        _twin_extra(0),
+        _twin_extra(1),
+    ]
+    positions = torch.arange(12).reshape(3, 4)
+    spans = [(index, index + 1) for index in range(4)]
+
+    # Step 1: both guided children reach future_start; the twins finish
+    # prefilling (their spans do not start with future_start) and get their
+    # first token forced.
+    waiting = model.make_omni_output(
+        torch.zeros(4, 8),
+        input_ids=torch.tensor([7, 7, 3, 4]),
+        positions=positions,
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context(4601, 4602, 4593, 4610),
+        request_token_spans=spans,
+    )
+    assert calls == []
+    assert waiting.multimodal_outputs == {}
+    assert model._force_future_start_indices == (0, 1, 2, 3)
+    assert model._force_future_end_indices == ()
+    assert model._policy_group_hold_steps == {_INTERNAL_PARENT: 1}
+    assert model._nav_twin_prefill_lengths == {(_NIM_REQUEST_ID, 0): 4593, (_NIM_REQUEST_ID, 1): 4610}
+
+    # Step 2: only twin-0 has triggered; the group keeps holding everyone.
+    waiting = model.make_omni_output(
+        torch.zeros(4, 8),
+        input_ids=torch.tensor([7, 7, 7, 4]),
+        positions=positions,
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context(4602, 4603, 4594, 4610),
+        request_token_spans=spans,
+    )
+    assert calls == []
+    assert model._force_future_start_indices == (0, 1, 2, 3)
+    assert model._force_future_end_indices == ()
+    assert set(model._pending_nav_twins) == {(_NIM_REQUEST_ID, 0)}
+    assert model._pending_nav_twins[(_NIM_REQUEST_ID, 0)]["seq_len"] == 4594
+    assert model._nav_twin_prefill_lengths == {(_NIM_REQUEST_ID, 1): 4610}
+    assert model._policy_group_hold_steps == {_INTERNAL_PARENT: 2}
+
+    # Step 3: twin-1 triggers; one expert call with 2K prefix rows.
+    completed = model.make_omni_output(
+        torch.zeros(4, 8),
+        input_ids=torch.tensor([7, 7, 7, 7]),
+        positions=positions,
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context(4603, 4604, 4595, 4611),
+        request_token_spans=spans,
+    )
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["seq_lens"] == [4601, 4602]
+    assert call["unguided_seq_lens"] == [4594, 4611]
+    assert [table.item() for table in call["block_tables"]] == [10, 20]
+    assert [table.item() for table in call["unguided_block_tables"]] == [30, 40]
+    assert torch.equal(call["unguided_positions"][0], positions[:, 2:3])
+    assert torch.equal(call["unguided_positions"][1], positions[:, 3:4])
+    assert [item["branch"] for item in call["observations"]] == [0, 1]
+    actions = completed.multimodal_outputs["actions"]
+    assert [item[0, 0, 0].item() for item in actions[:2]] == [4601, 4602]
+    assert actions[2] is None and actions[3] is None
+    assert completed.multimodal_outputs["nav_cfg_applied"][0].item() is True
+    assert completed.multimodal_outputs["nav_guidance_weight"][1].item() == 3.0
+    assert model._force_future_end_indices == (0, 1, 2, 3)
+    assert model._force_future_start_indices == ()
+    assert model._pending_policy_groups == {}
+    assert model._pending_nav_twins == {}
+    assert model._nav_twin_prefill_lengths == {}
+    assert model._policy_group_hold_steps == {}
+    assert info_logs == [
+        f"Navigation CFG applied for group {_INTERNAL_PARENT} after 2 held decode steps (K=2, weight=3.00)"
+    ]
+
+
+def test_super_nav_cfg_single_sample_still_waits_for_twin(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    monkeypatch.setattr(model, "_sample_actions", lambda **kwargs: calls.append(kwargs) or {})
+
+    def context(*sequence_lengths):
+        return RunnerKVCacheContext(
+            caches=[],
+            block_table=torch.tensor([[10], [30]], dtype=torch.int32),
+            sequence_lengths=sequence_lengths,
+            # With n=1 the runner still sees an internal id, never the NIM's.
+            request_ids=("c0ffee42", "twin"),
+        )
+
+    extras = [_nav_child_extra(0, expected=1), _twin_extra(0)]
+    assert extras[1]["_nav_cfg_partner"] not in context(0, 0).request_ids
+
+    # The child triggers while the twin's last prefill chunk completes; the
+    # twin's in-engine length (200) is recorded on this forcing step.
+    model.make_omni_output(
+        torch.zeros(2, 8),
+        input_ids=torch.tensor([7, 3]),
+        positions=torch.arange(6).reshape(3, 2),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context(101, 200),
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    assert calls == []
+    assert model._force_future_start_indices == (0, 1)
+    assert model._nav_twin_prefill_lengths == {(_NIM_REQUEST_ID, 0): 200}
+
+    completed = model.make_omni_output(
+        torch.zeros(2, 8),
+        input_ids=torch.tensor([7, 7]),
+        positions=torch.arange(6).reshape(3, 2),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context(102, 201),
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    assert len(calls) == 1
+    assert calls[0]["seq_lens"] == [101]
+    assert calls[0]["unguided_seq_lens"] == [201]
+    assert completed.multimodal_outputs["actions"][1] is None
+    assert model._force_future_end_indices == (0, 1)
+
+
+def test_super_nav_cfg_hold_timeout_runs_guided_only_and_ends_late_twin(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    info_logs = _capture_logs(monkeypatch, "info")
+    warning_logs = _capture_logs(monkeypatch, "warning")
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10]], dtype=torch.int32),
+        sequence_lengths=(101,),
+        request_ids=(_child_id(0),),
+    )
+    extras = [_nav_child_extra(0, expected=1, _nav_cfg_max_hold_steps=3)]
+
+    for _ in range(2):
+        output = model.make_omni_output(
+            torch.zeros(1, 8),
+            input_ids=torch.tensor([7]),
+            positions=torch.arange(3).reshape(3, 1),
+            sampling_extra_args=extras,
+            runner_kv_cache_context=context,
+        )
+        assert calls == []
+        assert output.multimodal_outputs == {}
+        assert model._force_future_start_indices == (0,)
+
+    output = model.make_omni_output(
+        torch.zeros(1, 8),
+        input_ids=torch.tensor([7]),
+        positions=torch.arange(3).reshape(3, 1),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+    )
+    assert len(calls) == 1
+    assert "unguided_block_tables" not in calls[0]
+    assert output.multimodal_outputs["nav_cfg_applied"][0].item() is False
+    assert output.multimodal_outputs["nav_guidance_weight"][0].item() == 1.0
+    assert model._force_future_end_indices == (0,)
+    assert model._pending_policy_groups == {}
+    assert model._policy_group_hold_steps == {}
+    assert info_logs == []
+    # With n=1 the group is the child's own runner id.
+    assert warning_logs == [
+        f"Navigation CFG twin missing for {_child_id(0)} after 3 held decode steps; "
+        "running the action expert guided-only"
+    ]
+
+    # A twin arriving after its partner finished never runs the expert,
+    # whether its prefill length was recorded (orphan) or not (invalid).
+    late_context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[30]], dtype=torch.int32),
+        sequence_lengths=(201,),
+        request_ids=("twin-0",),
+    )
+    for prime in (True, False):
+        if prime:
+            _prime_twin_prefill(model, late_context, [_twin_extra(0)])
+        output = model.make_omni_output(
+            torch.zeros(1, 8),
+            input_ids=torch.tensor([7]),
+            positions=torch.arange(3).reshape(3, 1),
+            sampling_extra_args=[_twin_extra(0)],
+            runner_kv_cache_context=late_context,
+        )
+        assert len(calls) == 1
+        assert output.multimodal_outputs == {}
+        assert model._force_future_end_indices == (0,)
+        assert model._force_future_start_indices == ()
+        assert model._pending_nav_twins == {}
+        assert model._nav_twin_prefill_lengths == {}
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_super_nav_cfg_twin_with_unexpected_prefix_length_disables_guidance(monkeypatch, recorded) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10], [30]], dtype=torch.int32),
+        sequence_lengths=(101, 205),
+        request_ids=(_child_id(0), "twin-0"),
+    )
+    extras = [_nav_child_extra(0, expected=1), _twin_extra(0)]
+    if recorded:
+        # The forcing step was skipped once, so a stray token precedes future_start.
+        _prime_twin_prefill(model, context, extras, offset=2)
+
+    output = model.make_omni_output(
+        torch.zeros(2, 8),
+        input_ids=torch.tensor([7, 7]),
+        positions=torch.arange(6).reshape(3, 2),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    assert len(calls) == 1
+    assert "unguided_block_tables" not in calls[0]
+    assert output.multimodal_outputs["nav_cfg_applied"][0].item() is False
+    assert output.multimodal_outputs["actions"][1] is None
+    assert model._force_future_end_indices == (0, 1)
+    assert model._pending_nav_twins == {}
+    assert model._nav_twin_prefill_lengths == {}
+    assert model._pending_policy_groups == {}
+
+
+def test_super_nav_cfg_microbatches_pairs_within_row_budget(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    children = [_child_id(index) for index in range(3)]
+    twins = [f"twin-{index}" for index in range(3)]
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.arange(6, dtype=torch.int32)[:, None],
+        sequence_lengths=(101, 102, 103, 201, 202, 203),
+        request_ids=(*children, *twins),
+    )
+    extras = [_nav_child_extra(index, expected=3, _action_expert_max_batch_size=4) for index in range(3)] + [
+        _twin_extra(index) for index in range(3)
+    ]
+    _prime_twin_prefill(model, context, extras)
+
+    output = model.make_omni_output(
+        torch.zeros(6, 8),
+        input_ids=torch.full((6,), 7),
+        positions=torch.arange(18).reshape(3, 6),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(index, index + 1) for index in range(6)],
+    )
+
+    # Four rows per call: two guided samples plus their two twins, then one pair.
+    assert [call["seq_lens"] for call in calls] == [[101, 102], [103]]
+    assert [call["unguided_seq_lens"] for call in calls] == [[201, 202], [203]]
+    assert [item[0, 0, 0].item() for item in output.multimodal_outputs["actions"][:3]] == [101, 102, 103]
+    assert output.multimodal_outputs["actions"][3:] == [None, None, None]
+    assert model._force_future_end_indices == (0, 1, 2, 3, 4, 5)
+
+    ordered = [(name, {}) for name in children]
+    chunk = Alpamayo2SuperForConditionalGeneration._microbatch_children
+    assert [len(part) for part in chunk(ordered, 3, rows_per_sample=2)] == [1, 1, 1]
+    assert [len(part) for part in chunk(ordered, 1, rows_per_sample=2)] == [1, 1, 1]
+    assert [len(part) for part in chunk(ordered, 3, rows_per_sample=1)] == [3]
+
+
+def test_super_nav_cfg_pairs_twin_by_group_and_index_not_by_partner_id(monkeypatch) -> None:
+    model = _minimal_policy_model()
+    calls = []
+    info_logs = _capture_logs(monkeypatch, "info")
+    monkeypatch.setattr(model, "_sample_actions_batch", _marker_sample_actions_batch(calls))
+    # Two concurrent NIM requests (K=2 and K=1); child index 0 exists in both
+    # groups, so pairing must use the caller request id as well.
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.tensor([[10], [20], [30], [40], [50], [60]], dtype=torch.int32),
+        sequence_lengths=(101, 102, 111, 201, 202, 211),
+        request_ids=("0_aaaa", "1_aaaa", "bbbb", "tw-a0", "tw-a1", "tw-b0"),
+    )
+    extras = [
+        _nav_child_extra(0, expected=2, group="nim-A", _action_expert_max_batch_size=4),
+        _nav_child_extra(1, expected=2, group="nim-A", _action_expert_max_batch_size=4),
+        _nav_child_extra(0, expected=1, group="nim-B"),
+        _twin_extra(0, group="nim-A"),
+        _twin_extra(1, group="nim-A"),
+        _twin_extra(0, group="nim-B"),
+    ]
+    assert not {extra["_nav_cfg_partner"] for extra in extras[3:]} & set(context.request_ids)
+    _prime_twin_prefill(model, context, extras)
+
+    output = model.make_omni_output(
+        torch.zeros(6, 8),
+        input_ids=torch.full((6,), 7),
+        positions=torch.arange(18).reshape(3, 6),
+        sampling_extra_args=extras,
+        runner_kv_cache_context=context,
+        request_token_spans=[(index, index + 1) for index in range(6)],
+    )
+
+    by_group = {tuple(call["seq_lens"]): call for call in calls}
+    assert set(by_group) == {(101, 102), (111,)}
+    assert by_group[(101, 102)]["unguided_seq_lens"] == [201, 202]
+    assert by_group[(111,)]["unguided_seq_lens"] == [211]
+    assert [item[0, 0, 0].item() for item in output.multimodal_outputs["actions"][:3]] == [101, 102, 111]
+    assert output.multimodal_outputs["actions"][3:] == [None, None, None]
+    assert model._force_future_end_indices == (0, 1, 2, 3, 4, 5)
+    assert model._pending_nav_twins == {}
+    assert model._pending_policy_groups == {}
+    # Twins were already present when the children completed: no held steps.
+    assert sorted(info_logs) == [
+        "Navigation CFG applied for group aaaa after 0 held decode steps (K=2, weight=3.00)",
+        "Navigation CFG applied for group bbbb after 0 held decode steps (K=1, weight=3.00)",
+    ]
+
+    with pytest.raises(RuntimeError, match="_nav_cfg_group"):
+        model.make_omni_output(
+            torch.zeros(1, 8),
+            input_ids=torch.tensor([7]),
+            positions=torch.arange(3).reshape(3, 1),
+            sampling_extra_args=[{"robot_obs": {}, "_nav_cfg_role": "unguided", "_nav_cfg_partner": "0_x"}],
+            runner_kv_cache_context=RunnerKVCacheContext(
+                caches=[],
+                block_table=torch.tensor([[1]], dtype=torch.int32),
+                sequence_lengths=(5,),
+                request_ids=("tw",),
+            ),
+        )
+
+
+class _FakeProjection:
+    def __init__(self, dtype=torch.bfloat16):
+        self.weight = torch.zeros(1, dtype=dtype)
+
+    def __call__(self, hidden_states, *_args):
+        return hidden_states
+
+
+class _PrefixSumExpert:
+    """Return a per-row constant derived from that row's prefix keys."""
+
+    def __call__(self, *, inputs_embeds, past_key_values, **_kwargs):
+        rows = inputs_embeds.shape[0]
+        keys = past_key_values.layers[0].keys
+        assert keys.shape[0] == rows
+        row_sums = keys.float().flatten(1).sum(dim=1)
+        hidden = row_sums[:, None, None].expand(rows, inputs_embeds.shape[1], 1).clone()
+        return SimpleNamespace(last_hidden_state=hidden.to(inputs_embeds.dtype))
+
+
+def _cfg_test_model():
+    model = _minimal_policy_model()
+    model.expert = SimpleNamespace(
+        config=SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1), expert_non_causal_attention=True),
+        action_space=SimpleNamespace(
+            get_action_space_dims=lambda: (2, 1),
+            action_to_traj=lambda action, xyz, rot: (action, action),
+        ),
+        action_in_proj=lambda action, timestep: torch.zeros(action.shape[0], 2, 1, dtype=torch.float32),
+        action_out_proj=_FakeProjection(),
+        expert=_PrefixSumExpert(),
+    )
+    return model
+
+
+def _cfg_test_cache():
+    # Rank-5 paged layout [2, blocks, block_size=1, kv_heads=1, head_dim=1]:
+    # block b holds key value b for both K and V.
+    values = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1, 1, 1)
+    return torch.cat([values, values], dim=0)
+
+
+def _run_cfg(model, *, weight, with_twins, steps=4):
+    observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)} for _ in range(2)]
+    extras = [
+        {
+            "_sampling_seed": 40 + index,
+            "diffusion_steps": steps,
+            "_nav_guidance_weight": weight,
+            "_return_action_noise": True,
+        }
+        for index in range(2)
+    ]
+    kwargs = dict(
+        caches=[_cfg_test_cache()],
+        # Guided prefixes sum to 1 and 5; unguided prefixes sum to 3 and 4.
+        block_tables=[torch.tensor([1]), torch.tensor([2, 3])],
+        seq_lens=[1, 2],
+        positions=[torch.full((3, 1), 10), torch.full((3, 1), 20)],
+        observations=observations,
+        extra_args=extras,
+    )
+    if with_twins:
+        kwargs.update(
+            unguided_block_tables=[torch.tensor([3]), torch.tensor([4])],
+            unguided_seq_lens=[1, 1],
+            unguided_positions=[torch.full((3, 1), 8), torch.full((3, 1), 9)],
+        )
+    return model._sample_actions_batch(**kwargs)
+
+
+def test_super_nav_cfg_combines_guided_and_unguided_velocities() -> None:
+    model = _cfg_test_model()
+
+    result = _run_cfg(model, weight=3.0, with_twins=True)
+
+    noise = result["action_noise"]
+    guided = torch.tensor([1.0, 5.0])
+    unguided = torch.tensor([3.0, 4.0])
+    # Integrating a constant velocity over the unit interval adds it once:
+    # x1 = x0 + (1 - w) * v_unguided + w * v_guided, as in FlowMatching._guided_v.
+    expected = noise + ((1 - 3.0) * unguided + 3.0 * guided)[:, None, None]
+    torch.testing.assert_close(result["normalized_controls"], expected)
+    assert result["nav_cfg_applied"].item() is True
+    assert result["nav_guidance_weight"].item() == 3.0
+    assert result["action_expert_invocation_batch_size"].tolist() == [2, 2]
+    assert result["actions"].shape == (2, 2, 1)
+
+
+def test_super_nav_cfg_with_unit_weight_matches_guided_only_run() -> None:
+    model = _cfg_test_model()
+
+    guided_only = _run_cfg(model, weight=None, with_twins=False)
+    unit_weight = _run_cfg(model, weight=1.0, with_twins=True)
+
+    torch.testing.assert_close(unit_weight["normalized_controls"], guided_only["normalized_controls"])
+    torch.testing.assert_close(
+        guided_only["normalized_controls"],
+        guided_only["action_noise"] + torch.tensor([1.0, 5.0])[:, None, None],
+    )
+    assert guided_only["nav_cfg_applied"].item() is False
+    assert guided_only["nav_guidance_weight"].item() == 1.0
+    assert unit_weight["nav_cfg_applied"].item() is True
+
+
+def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> None:
+    model = _cfg_test_model()
+    monkeypatch.setattr(
+        model,
+        "_run_manual_action_graph",
+        lambda **_kwargs: pytest.fail("CFG must not take the captured graph path"),
+    )
+    monkeypatch.setattr(
+        model,
+        "_make_static_action_cache",
+        lambda *_args, **_kwargs: pytest.fail("CFG must not build a StaticCache"),
+    )
+    observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
+    extras = [
+        {
+            "_sampling_seed": 1,
+            "diffusion_steps": 2,
+            "_nav_guidance_weight": 2.0,
+            "_manual_action_cudagraph": True,
+            "_static_expert_cache": True,
+            "_static_expert_cache_max_len": 16,
+        }
+    ]
+
+    result = model._sample_actions_batch(
+        caches=[_cfg_test_cache()],
+        block_tables=[torch.tensor([1])],
+        seq_lens=[1],
+        positions=[torch.full((3, 1), 10)],
+        observations=observations,
+        extra_args=extras,
+        unguided_block_tables=[torch.tensor([3])],
+        unguided_seq_lens=[1],
+        unguided_positions=[torch.full((3, 1), 8)],
+    )
+
+    assert result["nav_cfg_applied"].item() is True
+    with pytest.raises(ValueError, match="one unguided prefix per guided sample"):
+        model._sample_actions_batch(
+            caches=[_cfg_test_cache()],
+            block_tables=[torch.tensor([1])],
+            seq_lens=[1],
+            positions=[torch.full((3, 1), 10)],
+            observations=observations,
+            extra_args=extras,
+            unguided_block_tables=[torch.tensor([3]), torch.tensor([4])],
+            unguided_seq_lens=[1, 1],
+            unguided_positions=[torch.full((3, 1), 8)],
+        )
