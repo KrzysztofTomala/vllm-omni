@@ -3254,3 +3254,40 @@ def test_paged_context_clone_and_copy_keep_the_graph_inputs_at_fixed_addresses()
     assert cloned.block_table.eq(9).all() and cloned.tail_source.tolist() == [2]
     assert cloned.suffix_value_rows.tolist() == fresh.suffix_value_rows.tolist()
     assert cloned.layout is source.layout
+
+
+def test_image_only_processor_skips_dummy_text(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    proc = object.__new__(module.Alpamayo2SuperMultiModalProcessor)
+    calls = []
+
+    class _Ctx:
+        def call_hf_processor(self, hf_processor, data, kwargs):
+            calls.append((hf_processor, dict(data), dict(kwargs)))
+            return {"pixel_values": "pv", "image_grid_thw": "grid"}
+
+    proc.info = SimpleNamespace(ctx=_Ctx(), get_hf_processor=lambda **kw: ("hf", tuple(sorted(kw))))
+    proc._get_hf_mm_data = lambda items: ({"images": ["img"] * 24}, {"passthrough": 1})
+
+    class _Items:
+        def __init__(self, counts):
+            self.counts = counts
+
+        def get_all_counts(self):
+            return self.counts
+
+        def select(self, modalities):
+            return ("selected", tuple(sorted(modalities)))
+
+    out = proc._apply_hf_processor_mm_only(_Items({"image": 24}), {"device": "cuda"}, {"truncation": False})
+    assert out == {"pixel_values": "pv", "image_grid_thw": "grid", "passthrough": 1}
+    assert calls == [(("hf", ("device",)), {"images": ["img"] * 24}, {"device": "cuda", "truncation": False})]
+    # anything but images keeps the inherited (dummy-text) path
+    monkeypatch.setattr(
+        module.Qwen3VLMultiModalProcessor,
+        "_apply_hf_processor_mm_only",
+        lambda self, items, hf_kw, tok_kw: "inherited",
+    )
+    assert proc._apply_hf_processor_mm_only(_Items({"image": 2, "video": 1}), {}, {}) == "inherited"
+    assert proc._apply_hf_processor_mm_only(_Items({"video": 1}), {}, {}) == "inherited"

@@ -954,8 +954,40 @@ class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
         )
 
 
+class Alpamayo2SuperMultiModalProcessor(Qwen3VLMultiModalProcessor):
+    """Process image-only requests without the dummy-text detour.
+
+    The NIM sends prompts as token ids, so vLLM calls the HF processor for the
+    multimodal data only. For processors with a custom text path (Qwen3-VL
+    has one for videos) vLLM synthesizes a dummy prompt with one placeholder per
+    image, tokenizes it, expands the placeholders and validates the counts,
+    and then discards the text: about 28 ms per request for the 24 camera
+    frames, more than ten times the image processing itself. Alpamayo requests
+    carry images only, so hand the images straight to the processor; the
+    pixel values and grid are identical to the text path's.
+    """
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: Any,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        counts = mm_items.get_all_counts()
+        if {modality for modality, count in counts.items() if count} != {"image"}:
+            return super()._apply_hf_processor_mm_only(mm_items, hf_processor_mm_kwargs, tokenization_kwargs)
+        processor_data, passthrough_data = self._get_hf_mm_data(mm_items.select({"image"}))
+        processed = self.info.ctx.call_hf_processor(
+            self.info.get_hf_processor(**hf_processor_mm_kwargs),
+            processor_data,
+            dict(**hf_processor_mm_kwargs, **tokenization_kwargs),
+        )
+        processed.update(passthrough_data)
+        return processed
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    Qwen3VLMultiModalProcessor,
+    Alpamayo2SuperMultiModalProcessor,
     info=Alpamayo2SuperProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
