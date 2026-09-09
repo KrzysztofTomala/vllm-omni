@@ -265,6 +265,7 @@ class Alpamayo2SuperOpenPIRequestAdapter:
             "_compile_expert": bool(self.policy_config.get("compile_actions", False)),
             "_manual_action_cudagraph": bool(self.policy_config.get("manual_action_cudagraph", False)),
             "_static_expert_cache_max_len": int(self.policy_config.get("static_expert_cache_max_len", 4800)),
+            "_paged_expert_kv": bool(self.policy_config.get("paged_expert_kv", False)),
         }
 
     @staticmethod

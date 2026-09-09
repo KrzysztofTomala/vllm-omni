@@ -85,6 +85,54 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        # (first block id, count) of model-owned KV pages allocated beyond the
+        # scheduler's pool; see runner_kv_cache_reserved_blocks.
+        self.runner_reserved_kv_blocks: tuple[int, int] = (0, 0)
+
+    def _runner_reserved_kv_blocks(self) -> int:
+        """Pages per layer a model asks to own outside the scheduler's block pool."""
+        hook = getattr(self.model, "runner_kv_cache_reserved_blocks", None)
+        if hook is None:
+            return 0
+        return max(int(hook(block_size=int(self.cache_config.block_size))), 0)
+
+    def runner_reserved_kv_cache_bytes(self) -> int:
+        """Memory the reserved pages take across layers (subtracted from the KV budget)."""
+        reserve = self._runner_reserved_kv_blocks()
+        if reserve <= 0:
+            return 0
+        return reserve * sum(spec.page_size_bytes for spec in self.get_kv_cache_spec().values())
+
+    def _allocate_kv_cache_tensors(self, kv_cache_config) -> dict[str, torch.Tensor]:
+        reserve = self._runner_reserved_kv_blocks()
+        self.runner_reserved_kv_blocks = (int(kv_cache_config.num_blocks), 0)
+        if reserve <= 0:
+            return super()._allocate_kv_cache_tensors(kv_cache_config)
+        # Grow every tensor by `reserve` pages. The reshape derives the block
+        # count from the tensor size, so the attention caches carry blocks
+        # [num_blocks, num_blocks + reserve) that the scheduler never hands
+        # out; the worker already took their bytes out of the KV budget.
+        page_bytes = {
+            layer_name: group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        grown = [
+            replace(
+                tensor,
+                size=tensor.size
+                + reserve * (tensor.block_stride if tensor.block_stride > 0 else page_bytes[tensor.shared_by[0]]),
+            )
+            for tensor in kv_cache_config.kv_cache_tensors
+        ]
+        self.runner_reserved_kv_blocks = (int(kv_cache_config.num_blocks), reserve)
+        logger.info(
+            "Reserving %d KV pages per layer (blocks %d..%d) for the model outside the scheduler's pool",
+            reserve,
+            kv_cache_config.num_blocks,
+            kv_cache_config.num_blocks + reserve - 1,
+        )
+        return super()._allocate_kv_cache_tensors(replace(kv_cache_config, kv_cache_tensors=grown))
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -1433,15 +1481,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             scheduled = self._omni_num_scheduled_tokens_np
             computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
             if scheduled is not None:
-                sequence_lengths = tuple(
-                    int(base + added)
-                    for base, added in zip(computed, scheduled, strict=True)
-                )
+                sequence_lengths = tuple(int(base + added) for base, added in zip(computed, scheduled, strict=True))
                 model_kwargs_extra["runner_kv_cache_context"] = RunnerKVCacheContext(
                     caches=self.kv_caches,
                     block_table=runner_block_table,
                     sequence_lengths=sequence_lengths,
                     request_ids=tuple(self.input_batch.req_ids),
+                    reserved_blocks=self.runner_reserved_kv_blocks,
                 )
 
         return model_kwargs_extra

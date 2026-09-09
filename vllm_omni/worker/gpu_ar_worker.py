@@ -123,6 +123,21 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+    @torch.inference_mode()
+    def determine_available_memory(self) -> int:
+        available = super().determine_available_memory()
+        reserve_bytes_fn = getattr(self.model_runner, "runner_reserved_kv_cache_bytes", None)
+        reserve_bytes = int(reserve_bytes_fn()) if reserve_bytes_fn is not None else 0
+        if reserve_bytes > 0:
+            # Pages the model owns outside the scheduler's pool come out of the
+            # same budget, so the total KV allocation still fits.
+            logger.info(
+                "Setting aside %s GiB of the KV cache budget for model-owned pages",
+                format_gib(reserve_bytes),
+            )
+            available = max(int(available) - reserve_bytes, 0)
+        return available
+
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
         """
         Explicitly handle sleep commands.
