@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import DynamicCache, StaticCache
+from transformers import BatchFeature, DynamicCache, StaticCache
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
 from vllm.config import VllmConfig
@@ -415,6 +415,64 @@ def compile_action_expert(expert: nn.Module) -> nn.Module:
     )
 
 
+class PinnedHostPixelValuesProcessor(Qwen3VLProcessor):
+    """Qwen3-VL processor with a cheaper host hand-off and placeholder check.
+
+    vLLM runs the fast HF image processor on the GPU (``device="cuda"``) and
+    then moves its outputs to the host before serializing them for the engine
+    process. For the 24 camera frames of one request that output is a 106 MB
+    float32 tensor, and the implicit pageable copy took about 57 ms per
+    request on an H100 host, most of the frontend-to-engine gap. The vision
+    tower casts ``pixel_values`` to its bf16 weight dtype before the first
+    kernel, so casting here is the same single rounding step; it halves the
+    bytes crossing the process boundary, and a pinned destination turns the
+    pageable copy into a few-millisecond DMA. vLLM's own host move then finds
+    the tensor already on the host.
+    """
+
+    def _check_special_mm_tokens(self, text: list[str], text_inputs: Any, modalities: list[str]) -> None:
+        # Same check as ProcessorMixin (the placeholder count in the text must
+        # match the token count in input_ids), but counted on plain Python
+        # ints. The base implementation iterates the input_ids tensor row into
+        # 0-d tensors and calls list.count on them, which took about 20 ms per
+        # request for a 4,600-token prompt, two thirds of the processor call.
+        input_ids = text_inputs["input_ids"]
+        rows = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else [list(ids) for ids in input_ids]
+        for modality in modalities:
+            token_str = getattr(self, f"{modality}_token", None)
+            token_id = getattr(self, f"{modality}_token_id", None)
+            if token_str is None or token_id is None:
+                continue
+            ids_count = [row.count(token_id) for row in rows]
+            text_count = [sample.count(token_str) for sample in text]
+            if ids_count != text_count:
+                raise ValueError(
+                    f"Mismatch in `{modality}` token count between text and `input_ids`. "
+                    f"Got ids={ids_count} and text={text_count}. Likely due to `truncation='max_length'`. "
+                    "Please disable truncation or increase `max_length`."
+                )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> BatchFeature:
+        outputs = super().__call__(*args, **kwargs)
+        for key in ("pixel_values", "pixel_values_videos"):
+            values = outputs.get(key) if hasattr(outputs, "get") else None
+            if isinstance(values, torch.Tensor) and values.device.type == "cuda":
+                outputs[key] = self._to_pinned_host_bf16(values)
+        return outputs
+
+    @staticmethod
+    def _to_pinned_host_bf16(values: torch.Tensor) -> torch.Tensor:
+        staged = values.to(torch.bfloat16) if values.is_floating_point() else values
+        # PyTorch's caching host allocator hands back a recycled pinned block
+        # after the first request and only reuses it once this tensor is
+        # released, so a fresh tensor per call is both cheap and safe for the
+        # processor cache that may keep the result alive across requests.
+        host = torch.empty(staged.shape, dtype=staged.dtype, pin_memory=True)
+        host.copy_(staged, non_blocking=True)
+        torch.cuda.current_stream(staged.device).synchronize()
+        return host
+
+
 class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
     """Use the processor and extended tokenizer shipped with Super."""
 
@@ -423,7 +481,7 @@ class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
         kwargs.pop("device", None)
         return cached_get_processor(
             config._name_or_path,
-            processor_cls=Qwen3VLProcessor,
+            processor_cls=PinnedHostPixelValuesProcessor,
             tokenizer=self.get_tokenizer(),
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
@@ -1177,12 +1235,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
         if nav_cfg:
-            # The captured graph replays a fixed guided-only integration over a
-            # StaticCache holding one prefix per sample. CFG doubles the prefix
-            # rows and combines two velocities per step, so it always takes the
-            # eager DynamicCache loop below.
+            # The captured graph replays a fixed guided-only integration, and
+            # CFG doubles the prefix rows and combines two velocities per step,
+            # so navigation takes the eager loop below. It keeps the StaticCache
+            # when one is configured: the compiled expert is traced with static
+            # shapes, and a DynamicCache sized to each prompt made every new
+            # prompt length a recompile (about two minutes per length on H100)
+            # before the recompile limit turned the rest into eager layers. A
+            # StaticCache of the configured length gives one shape per K.
             manual_action_cudagraph = False
-            static_expert_cache = False
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply
