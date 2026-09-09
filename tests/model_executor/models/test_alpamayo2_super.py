@@ -414,8 +414,9 @@ def test_super_registers_fa3_expert_attention_with_transformers() -> None:
     [
         ({}, True),
         ({"dtype": torch.float16}, True),
-        ({"batch_rows": 3}, False),
-        ({"batch_rows": 2}, False),
+        ({"batch_rows": 3}, True),
+        ({"batch_rows": 2}, True),
+        ({"batch_rows": 0}, False),
         ({"is_causal": True}, False),
         ({"device_type": "cpu"}, False),
         ({"dtype": torch.float32}, False),
@@ -2039,39 +2040,20 @@ def test_super_nav_cfg_with_unit_weight_matches_guided_only_run() -> None:
     assert unit_weight["nav_cfg_applied"].item() is True
 
 
-def test_super_nav_cfg_disables_manual_graph_but_keeps_static_cache(monkeypatch) -> None:
+def test_super_nav_cfg_replays_a_blended_graph_over_two_rows_per_sample(monkeypatch) -> None:
     model = _cfg_test_model()
+    graph_calls: list[dict] = []
+
+    def fake_graph(**kwargs):
+        graph_calls.append(kwargs)
+        return torch.zeros_like(kwargs["action"])
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_graph)
     monkeypatch.setattr(
         model,
-        "_run_manual_action_graph",
-        lambda **_kwargs: pytest.fail("CFG must not take the captured graph path"),
+        "_make_static_action_cache",
+        lambda *_args, **_kwargs: pytest.fail("the graph runner owns the StaticCache for CFG"),
     )
-    # CFG keeps the configured StaticCache (one static shape per K for the
-    # compiled expert) and only leaves the captured-graph path.
-    static_calls: list[dict] = []
-
-    def fake_make_static(prefix, *, suffix_length, max_cache_len):
-        # The test model has no HF config, so stand in for the StaticCache with
-        # the same layout: right-padded prefix rows plus room for the suffix.
-        from transformers import StaticCache
-
-        static_calls.append({"suffix_length": suffix_length, "max_cache_len": max_cache_len})
-        fake = object.__new__(StaticCache)
-        layers = []
-        for layer in prefix.layers:
-            total = max_cache_len if max_cache_len is not None else layer.keys.shape[2] + suffix_length
-            pad = total - layer.keys.shape[2]
-            layers.append(
-                SimpleNamespace(
-                    keys=torch.nn.functional.pad(layer.keys, (0, 0, 0, pad)),
-                    values=torch.nn.functional.pad(layer.values, (0, 0, 0, pad)),
-                    cumulative_length=torch.tensor(layer.keys.shape[2]),
-                )
-            )
-        fake.layers = layers
-        return fake
-
-    monkeypatch.setattr(model, "_make_static_action_cache", fake_make_static)
     observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
     extras = [
         {
@@ -2097,7 +2079,16 @@ def test_super_nav_cfg_disables_manual_graph_but_keeps_static_cache(monkeypatch)
     )
 
     assert result["nav_cfg_applied"].item() is True
-    assert static_calls == [{"suffix_length": 2, "max_cache_len": 16}]
+    assert len(graph_calls) == 1
+    call = graph_calls[0]
+    # One action row per sample; cache rows, positions and mask carry the
+    # guided row and its unguided twin; the blend weight rides along as a
+    # device scalar so the captured body can combine the two velocities.
+    assert call["action"].shape[0] == 1
+    assert call["expert_positions"].shape[1] == 2
+    assert call["attention_mask"].shape[0] == 2
+    assert call["guidance_weight"] is not None and float(call["guidance_weight"]) == 2.0
+    assert call["static_cache_max_len"] == 16
     with pytest.raises(ValueError, match="one unguided prefix per guided sample"):
         model._sample_actions_batch(
             caches=[_cfg_test_cache()],
@@ -2572,3 +2563,113 @@ def test_pinned_host_processor_leaves_host_pixel_values_alone(monkeypatch) -> No
     # Host tensors are untouched (the GPU cast/copy only applies to CUDA outputs).
     assert outputs["pixel_values"] is host_values
     assert calls and calls[0]["text"] == ["x"]
+
+
+def test_expert_row_prefix_lengths_from_additive_mask() -> None:
+    from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import expert_row_prefix_lengths
+
+    rows, query_length, allocated = 2, 4, 32
+    prefix = [10, 7]
+    suffix_start = 12
+    mask = torch.full((rows, 1, query_length, allocated), torch.finfo(torch.bfloat16).min, dtype=torch.bfloat16)
+    for r in range(rows):
+        mask[r, :, :, : prefix[r]] = 0
+        mask[r, :, :, suffix_start : suffix_start + query_length] = 0
+    lengths = expert_row_prefix_lengths(mask, query_length)
+    assert lengths.dtype == torch.int32
+    assert lengths.tolist() == prefix
+
+
+def test_expert_fa3_rows_fake_shape_and_wrapper_dispatch(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    rows, heads_q, heads_kv, query_length, allocated, dim = 2, 4, 2, 4, 512, 8
+    query = torch.zeros(rows, heads_q, query_length, dim, dtype=torch.bfloat16)
+    key = torch.zeros(rows, heads_kv, allocated, dim, dtype=torch.bfloat16)
+    fake = module._expert_fa3_attention_rows_fake(
+        query, key, key, torch.zeros(rows, dtype=torch.int32), torch.arange(query_length), 1.0
+    )
+    assert fake.shape == (rows, query_length, heads_q, dim)
+
+    calls = []
+
+    def fake_rows_op(q, k, v, prefix_lengths, suffix_positions, scale):
+        calls.append((tuple(q.shape), prefix_lengths.tolist(), suffix_positions.tolist(), scale))
+        return q.new_zeros((q.shape[0], q.shape[2], q.shape[1], q.shape[-1]))
+
+    monkeypatch.setattr(module, "expert_fa3_attention_rows", fake_rows_op)
+    monkeypatch.setattr(
+        module,
+        "sdpa_attention_forward",
+        lambda *a, **k: pytest.fail("a page-aligned multi-row batch with a mask must take the FA3 rows path"),
+    )
+    mask = torch.full((rows, 1, query_length, allocated), torch.finfo(torch.bfloat16).min, dtype=torch.bfloat16)
+    mask[0, :, :, :100] = 0
+    mask[1, :, :, :90] = 0
+    mask[:, :, :, 128 : 128 + query_length] = 0
+    cache_position = torch.arange(128, 128 + query_length)
+    module_stub = SimpleNamespace(is_causal=False)
+    with torch.device("meta"):
+        pass
+    query = query.to("cpu")
+
+    # The wrapper checks device_type == "cuda" first; emulate a CUDA query via a
+    # lightweight proxy so the dispatch logic (not the kernel) is exercised.
+    class _CudaLike:
+        def __init__(self, t):
+            self._t = t
+            self.device = SimpleNamespace(type="cuda")
+
+        def __getattr__(self, name):
+            return getattr(self._t, name)
+
+    out, weights = module.alpamayo_flash_attention_3_forward(
+        module_stub,
+        _CudaLike(query),
+        _CudaLike(key),
+        _CudaLike(key),
+        mask,
+        scaling=0.5,
+        is_causal=False,
+        cache_position=cache_position,
+    )
+    assert weights is None
+    assert calls and calls[0][0] == (rows, heads_q, query_length, dim)
+    assert calls[0][1] == [100, 90]
+    assert calls[0][2] == list(range(128, 128 + query_length))
+    assert calls[0][3] == 0.5
+
+
+def test_expert_fa3_rows_fall_back_to_sdpa_without_page_alignment(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.alpamayo2_super import alpamayo2_super as module
+
+    used = []
+    monkeypatch.setattr(
+        module, "sdpa_attention_forward", lambda *a, **k: (used.append("sdpa"), None)[0] or ("sdpa", None)
+    )
+    monkeypatch.setattr(
+        module, "expert_fa3_attention_rows", lambda *a, **k: pytest.fail("unaligned allocation must not take FA3 rows")
+    )
+    rows, heads_q, heads_kv, query_length, allocated, dim = 2, 4, 2, 4, 500, 8
+
+    class _CudaLike:
+        def __init__(self, t):
+            self._t = t
+            self.device = SimpleNamespace(type="cuda")
+
+        def __getattr__(self, name):
+            return getattr(self._t, name)
+
+    query = torch.zeros(rows, heads_q, query_length, dim, dtype=torch.bfloat16)
+    key = torch.zeros(rows, heads_kv, allocated, dim, dtype=torch.bfloat16)
+    mask = torch.zeros(rows, 1, query_length, allocated, dtype=torch.bfloat16)
+    out = module.alpamayo_flash_attention_3_forward(
+        SimpleNamespace(is_causal=False),
+        _CudaLike(query),
+        _CudaLike(key),
+        _CudaLike(key),
+        mask,
+        is_causal=False,
+        cache_position=torch.arange(100, 100 + query_length),
+    )
+    assert out == ("sdpa", None) and used == ["sdpa"]

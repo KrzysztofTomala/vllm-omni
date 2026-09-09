@@ -72,19 +72,25 @@ def expert_fa3_supports(
 ) -> bool:
     """Return whether one expert invocation may take the FA3 kernel path.
 
-    The validated FA3 shape is a single prefix row (the varlen call carries one
-    device-side sequence length), non-causal, dropout-free half precision on
-    CUDA, with query heads that repeat the KV heads evenly. Anything else keeps
-    the previously validated SDPA behavior.
+    Non-causal, dropout-free half precision on CUDA, with query heads that
+    repeat the KV heads evenly. One prefix row takes the validated single varlen
+    call; several rows (navigation guidance pairs a guided row with its unguided
+    twin) take the two-segment paged call, provided the caller can hand over
+    per-row prefix lengths. Anything else keeps the SDPA behavior.
     """
     return (
-        int(batch_rows) == 1
+        int(batch_rows) >= 1
         and device_type == "cuda"
         and dtype in (torch.float16, torch.bfloat16)
         and not is_causal
         and float(dropout) == 0.0
         and bool(gqa_divisible)
     )
+
+
+# Page size of the paged FA3 call used for multi-row batches; FA3 requires the
+# page size to be a multiple of 256, so the allocated key length must be too.
+EXPERT_FA3_PAGE_SIZE = 256
 
 
 def _expert_fa3_attention_impl(
@@ -141,7 +147,122 @@ def _expert_fa3_attention_fake(
     return query.new_empty((1, query.shape[2], query.shape[1], query.shape[-1]))
 
 
-# CUDA-only: eligibility (device, dtype, one row, non-causal) is decided by
+def _expert_fa3_attention_rows_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Multi-row expert attention over right-padded prefixes plus a shared suffix.
+
+    ``key``/``value`` are ``(rows, kv_heads, allocated, head_dim)`` cache
+    tensors in which row ``r`` holds its valid prefix in ``[0, prefix_lengths[r])``
+    and the current action tokens at ``suffix_positions`` (the same positions
+    for every row), with padding in between and after. FA3's varlen kernel
+    wants each sequence contiguous, so the attention is computed as two
+    segments and merged exactly through the returned log-sum-exps: the prefix
+    segment runs the paged kernel over the rows' page-aligned layout with
+    ``seqused_k`` cutting each row at its own prefix length, and the suffix
+    segment gathers the shared action positions. No prefix copy: the only data
+    movement is the head/sequence transpose FA3 needs (also present in the
+    single-row path) and the gather of the suffix tokens. Returns
+    ``(rows, query_length, query_heads, head_dim)``.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    rows, query_heads, query_length, head_dim = query.shape
+    kv_heads, allocated = key.shape[1], key.shape[2]
+    pages = allocated // EXPERT_FA3_PAGE_SIZE
+    device = query.device
+    q = query.transpose(1, 2).reshape(rows * query_length, query_heads, head_dim)
+    cu_seqlens_q = torch.arange(0, rows * query_length + 1, query_length, device=device, dtype=torch.int32)
+    # Prefix segment: the cache rows are already page-aligned once heads and
+    # sequence are swapped; page p of row r is block r * pages + p.
+    paged_key = key.transpose(1, 2).reshape(rows * pages, EXPERT_FA3_PAGE_SIZE, kv_heads, head_dim)
+    paged_value = value.transpose(1, 2).reshape(rows * pages, EXPERT_FA3_PAGE_SIZE, kv_heads, head_dim)
+    block_table = (
+        torch.arange(rows, device=device, dtype=torch.int32)[:, None] * pages
+        + torch.arange(pages, device=device, dtype=torch.int32)[None, :]
+    )
+    prefix_out, prefix_lse = flash_attn_varlen_func(
+        q,
+        paged_key,
+        paged_value,
+        query_length,
+        cu_seqlens_q,
+        allocated,
+        cu_seqlens_k=None,
+        seqused_k=prefix_lengths.to(dtype=torch.int32),
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+        return_softmax_lse=True,
+    )
+    # Suffix segment: the action tokens of every row, gathered to a contiguous
+    # varlen layout.
+    suffix_key = key.index_select(2, suffix_positions).transpose(1, 2).reshape(rows * query_length, kv_heads, head_dim)
+    suffix_value = (
+        value.index_select(2, suffix_positions).transpose(1, 2).reshape(rows * query_length, kv_heads, head_dim)
+    )
+    suffix_out, suffix_lse = flash_attn_varlen_func(
+        q,
+        suffix_key,
+        suffix_value,
+        query_length,
+        cu_seqlens_q,
+        query_length,
+        cu_seqlens_k=cu_seqlens_q,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+        return_softmax_lse=True,
+    )
+    # Exact merge of the two softmax partitions: lse is (query_heads, total_q).
+    prefix_lse = prefix_lse.transpose(0, 1).unsqueeze(-1)
+    suffix_lse = suffix_lse.transpose(0, 1).unsqueeze(-1)
+    peak = torch.maximum(prefix_lse, suffix_lse)
+    prefix_weight = torch.exp(prefix_lse - peak)
+    suffix_weight = torch.exp(suffix_lse - peak)
+    merged = (prefix_out.float() * prefix_weight + suffix_out.float() * suffix_weight) / (prefix_weight + suffix_weight)
+    return merged.to(query.dtype).view(rows, query_length, query_heads, head_dim)
+
+
+def _expert_fa3_attention_rows_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return query.new_empty((query.shape[0], query.shape[2], query.shape[1], query.shape[-1]))
+
+
+expert_fa3_attention_rows = torch.library.custom_op(
+    "alpamayo2_super::expert_fa3_attention_rows",
+    mutates_args=(),
+    device_types="cuda",
+)(_expert_fa3_attention_rows_impl)
+expert_fa3_attention_rows.register_fake(_expert_fa3_attention_rows_fake)
+
+
+def expert_row_prefix_lengths(attention_mask: torch.Tensor, query_length: int) -> torch.Tensor:
+    """Per-row valid prefix lengths from the expert's additive attention mask.
+
+    The mask is ``(rows, 1, query_length, allocated)`` with zeros at attendable
+    positions: each row's right-padded prefix plus the ``query_length`` action
+    positions shared by all rows. Counting the zeros of one query row and
+    removing the action positions yields the prefix length on the device, so
+    the compiled expert traces this without a host synchronization.
+    """
+    attendable = (attention_mask[:, 0, 0, :] == 0).sum(dim=-1)
+    return (attendable - query_length).to(dtype=torch.int32)
+
+
+# CUDA-only: eligibility (device, dtype, non-causal) is decided by
 # ``expert_fa3_supports`` in eager Python before the op is reached.
 expert_fa3_attention = torch.library.custom_op(
     "alpamayo2_super::expert_fa3_attention",
@@ -213,6 +334,37 @@ def alpamayo_flash_attention_3_forward(
     query_length = query.shape[2]
     allocated_key_length = key.shape[2]
     cache_position = kwargs.get("cache_position")
+    softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
+    if query.shape[0] > 1:
+        multi_row_ready = (
+            attention_mask is not None
+            and cache_position is not None
+            and allocated_key_length % EXPERT_FA3_PAGE_SIZE == 0
+            and attention_mask.shape[0] == query.shape[0]
+            and attention_mask.shape[-1] == allocated_key_length
+        )
+        if not multi_row_ready:
+            return sdpa_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                is_causal=is_causal,
+                **kwargs,
+            )
+        output = expert_fa3_attention_rows(
+            query,
+            key,
+            value,
+            expert_row_prefix_lengths(attention_mask, query_length),
+            cache_position.reshape(-1),
+            softmax_scale,
+        )
+        return output, None
+
     if cache_position is None:
         valid_key_length = torch.scalar_tensor(
             allocated_key_length,
@@ -223,7 +375,6 @@ def alpamayo_flash_attention_3_forward(
         valid_key_length = cache_position.reshape(-1)[-1].to(dtype=torch.int32) + 1
     cu_seqlens_q = torch.stack((valid_key_length.new_zeros(()), valid_key_length.new_full((), query_length)))
     cu_seqlens_k = torch.stack((valid_key_length.new_zeros(()), valid_key_length))
-    softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
     output = expert_fa3_attention(
         query,
         key,
@@ -1019,6 +1170,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         inference_steps: int,
         suffix_length: int,
         static_cache_max_len: int | None,
+        guidance_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replay the fixed-shape ten-step expert integration in one graph.
 
@@ -1026,8 +1178,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         It is ``None`` when ``_sample_actions_batch`` already gathered the paged
         prefix straight into that cache, which requires the graph state for
         this shape to exist.
+
+        With ``guidance_weight`` (navigation CFG) the cache, positions and mask
+        hold two rows per sample, guided first then the unguided twins; every
+        step denoises the same action through both rows and blends the two
+        velocities as ``(1 - w) * v_unguided + w * v_guided`` inside the
+        captured body, with ``w`` a device scalar copied in per replay.
         """
 
+        nav_cfg = guidance_weight is not None
         key = self._action_graph_key(
             action_shape=tuple(action.shape),
             action_dtype=action.dtype,
@@ -1035,6 +1194,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             positions_shape=tuple(expert_positions.shape),
             attention_mask_shape=tuple(attention_mask.shape),
             inference_steps=inference_steps,
+            nav_cfg=nav_cfg,
         )
         state = self._action_graphs.get(key)
         if state is None:
@@ -1056,7 +1216,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     device=action.device,
                     dtype=torch.long,
                 ),
+                "guidance_weight": guidance_weight.clone() if nav_cfg else None,
             }
+            sample_count = action.shape[0]
 
             def graph_body() -> torch.Tensor:
                 graph_action = state["action"]
@@ -1065,11 +1227,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         (graph_action.shape[0],) + (1,) * (graph_action.ndim - 1),
                         step / inference_steps,
                     )
+                    step_action, step_timestep = graph_action, timestep
+                    if nav_cfg:
+                        # Guided and unguided rows denoise the same action x.
+                        step_action = torch.cat([graph_action, graph_action], dim=0)
+                        step_timestep = torch.cat([timestep, timestep], dim=0)
                     with torch.autocast(
                         device_type="cuda",
                         dtype=self.expert.action_out_proj.weight.dtype,
                     ):
-                        embeddings = self.expert.action_in_proj(graph_action, timestep)
+                        embeddings = self.expert.action_in_proj(step_action, step_timestep)
                     output = expert(
                         inputs_embeds=embeddings.to(self.expert.action_out_proj.weight.dtype),
                         position_ids=state["positions"],
@@ -1084,7 +1251,11 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         state["cache_position"][0],
                     )
                     velocity = self.expert.action_out_proj(output.last_hidden_state[:, -suffix_length:])
-                    graph_action = graph_action + velocity.float().view_as(graph_action) / inference_steps
+                    velocity = velocity.float().view(step_action.shape[0], *graph_action.shape[1:])
+                    if nav_cfg:
+                        weight = state["guidance_weight"]
+                        velocity = (1.0 - weight) * velocity[sample_count:] + weight * velocity[:sample_count]
+                    graph_action = graph_action + velocity / inference_steps
                 return graph_action
 
             warmup_stream = torch.cuda.Stream()
@@ -1115,6 +1286,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 dtype=torch.long,
             )
         )
+        if nav_cfg:
+            state["guidance_weight"].copy_(guidance_weight)
         if prefix is not None:
             self._copy_action_prefix(state["cache"], prefix, prefix_length)
         state["graph"].replay()
@@ -1129,12 +1302,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         positions_shape: tuple[int, ...],
         attention_mask_shape: tuple[int, ...],
         inference_steps: int,
+        nav_cfg: bool = False,
     ) -> tuple[Any, ...]:
         """Identify one captured action graph by the shapes it was traced with.
 
         ``_sample_actions_batch`` derives the same key from the planned shapes
         before any expert tensor exists, so a known shape can gather its paged
-        prefix directly into the graph's StaticCache.
+        prefix directly into the graph's StaticCache. ``nav_cfg`` separates the
+        CFG body (two cache rows per action row, blended velocities) from a
+        guided-only body with the same tensor shapes.
         """
         return (
             tuple(action_shape),
@@ -1143,6 +1319,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tuple(positions_shape),
             tuple(attention_mask_shape),
             int(inference_steps),
+            bool(nav_cfg),
         )
 
     def _sample_actions_batch(
@@ -1234,16 +1411,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
-        if nav_cfg:
-            # The captured graph replays a fixed guided-only integration, and
-            # CFG doubles the prefix rows and combines two velocities per step,
-            # so navigation takes the eager loop below. It keeps the StaticCache
-            # when one is configured: the compiled expert is traced with static
-            # shapes, and a DynamicCache sized to each prompt made every new
-            # prompt length a recompile (about two minutes per length on H100)
-            # before the recompile limit turned the rest into eager layers. A
-            # StaticCache of the configured length gives one shape per K.
-            manual_action_cudagraph = False
+        # Navigation CFG doubles the cache rows (guided plus unguided twins) and
+        # blends two velocities per step; the captured graph carries that body
+        # too (keyed separately), so navigation replays a graph like guided-only
+        # requests do. It also keeps the StaticCache: the compiled expert is
+        # traced with static shapes, and a DynamicCache sized to each prompt
+        # made every new prompt length a recompile (about two minutes per
+        # length on H100).
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply
@@ -1262,7 +1436,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if manual_action_cudagraph and static_expert_cache:
             graph_state = self._action_graphs.get(
                 self._action_graph_key(
-                    action_shape=(row_count, *action_dims),
+                    action_shape=(sample_count, *action_dims),
                     action_dtype=torch.float32,
                     device=device,
                     positions_shape=(3, row_count, suffix_length),
@@ -1273,6 +1447,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         static_cache_max_len if static_cache_max_len is not None else prefix_len + suffix_length,
                     ),
                     inference_steps=inference_steps,
+                    nav_cfg=nav_cfg,
                 )
             )
         if graph_state is not None:
@@ -1356,6 +1531,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 inference_steps=inference_steps,
                 suffix_length=suffix_length,
                 static_cache_max_len=static_cache_max_len,
+                guidance_weight=(
+                    torch.tensor(guidance_weight, device=device, dtype=torch.float32) if nav_cfg else None
+                ),
             )
         else:
             assert expert_cache is not None, "eager expert modes require a dense DynamicCache prefix"
@@ -1449,13 +1627,22 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             dtype=torch.int32,
         )
         # Whether this invocation ran the expert's attention through FA3. The
-        # same predicate gates the kernel, so CFG (two prefix rows) and any
-        # other unsupported shape report 0 even when FA3 is configured.
-        fa3_used = self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3 and expert_fa3_supports(
+        # same predicate gates the kernel; several rows (CFG) additionally need
+        # the page-aligned StaticCache that the two-segment paged call requires,
+        # otherwise the attention wrapper falls back to SDPA and this reports 0.
+        multi_row_fa3_layout = row_count == 1 or (
+            static_expert_cache
+            and static_cache_max_len is not None
+            and static_cache_max_len % EXPERT_FA3_PAGE_SIZE == 0
+        )
+        fa3_supported = expert_fa3_supports(
             batch_rows=row_count,
             dtype=weight_dtype,
             device_type=device.type,
             is_causal=not bool(self.expert.config.expert_non_causal_attention),
+        )
+        fa3_used = (
+            self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3 and multi_row_fa3_layout and fa3_supported
         )
         result["action_expert_attention_fa3"] = torch.full(
             (sample_count,),
