@@ -17,3 +17,21 @@ def test_runner_kv_cache_context_validates_request_alignment():
             sequence_lengths=(10,),
             request_ids=("first", "second"),
         )
+
+
+def test_runner_kv_cache_context_reserved_blocks_default_to_none():
+    context = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        sequence_lengths=(10,),
+        request_ids=("first",),
+    )
+    assert context.reserved_blocks == (0, 0)
+    reserved = RunnerKVCacheContext(
+        caches=[],
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        sequence_lengths=(10,),
+        request_ids=("first",),
+        reserved_blocks=(472, 40),
+    )
+    assert reserved.reserved_blocks == (472, 40)

@@ -7,6 +7,8 @@ from __future__ import annotations
 import copy
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -220,14 +222,298 @@ def _expert_fa3_attention_rows_impl(
         fa_version=3,
         return_softmax_lse=True,
     )
-    # Exact merge of the two softmax partitions: lse is (query_heads, total_q).
-    prefix_lse = prefix_lse.transpose(0, 1).unsqueeze(-1)
-    suffix_lse = suffix_lse.transpose(0, 1).unsqueeze(-1)
-    peak = torch.maximum(prefix_lse, suffix_lse)
-    prefix_weight = torch.exp(prefix_lse - peak)
-    suffix_weight = torch.exp(suffix_lse - peak)
-    merged = (prefix_out.float() * prefix_weight + suffix_out.float() * suffix_weight) / (prefix_weight + suffix_weight)
+    merged = _merge_lse_segments(prefix_out, prefix_lse, suffix_out, suffix_lse)
     return merged.to(query.dtype).view(rows, query_length, query_heads, head_dim)
+
+
+def _merge_lse_segments(
+    first_out: torch.Tensor,
+    first_lse: torch.Tensor,
+    second_out: torch.Tensor,
+    second_lse: torch.Tensor,
+) -> torch.Tensor:
+    """Exactly combine two softmax partitions of one attention from their log-sum-exps.
+
+    ``*_out`` are ``(total_q, heads, dim)``, ``*_lse`` are ``(heads, total_q)``.
+    """
+    first_lse = first_lse.transpose(0, 1).unsqueeze(-1)
+    second_lse = second_lse.transpose(0, 1).unsqueeze(-1)
+    peak = torch.maximum(first_lse, second_lse)
+    first_weight = torch.exp(first_lse - peak)
+    second_weight = torch.exp(second_lse - peak)
+    return (first_out.float() * first_weight + second_out.float() * second_weight) / (first_weight + second_weight)
+
+
+def _expert_fa3_attention_paged_impl(
+    query: torch.Tensor,
+    flat_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    key_size: list[int],
+    key_stride: list[int],
+    value_offset: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Expert attention over prefix plus action suffix, both already in vLLM's paged cache.
+
+    ``flat_cache`` is one layer of the engine's cache as a ``(rows, head_dim)``
+    view of its storage; the ``(num_blocks, block_size, kv_heads, head_dim)``
+    K and V views are rebuilt from ``key_size``/``key_stride`` (elements) and
+    ``value_offset`` (elements from K to V), so the op reads exactly what the
+    caller wrote through ``flat_cache`` just before (the action tokens' K/V go
+    into the rows' reserved pages by a plain ``index_copy_`` in the traced
+    attention wrapper, which Inductor fuses like the StaticCache write).
+    ``block_table`` (rows, max_blocks) int32 and ``seqused_k`` (rows,) int32
+    cover prefix and suffix; one paged FA3 call serves both. Returns
+    ``(rows, query_length, query_heads, head_dim)``.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    rows, query_heads, query_length, head_dim = query.shape
+    base = flat_cache.storage_offset()
+    key_cache = flat_cache.as_strided(key_size, key_stride, base)
+    value_cache = flat_cache.as_strided(key_size, key_stride, base + value_offset)
+    page_size = int(key_size[1])
+    q = query.transpose(1, 2).reshape(rows * query_length, query_heads, head_dim)
+    output = flash_attn_varlen_func(
+        q,
+        key_cache,
+        value_cache,
+        query_length,
+        cu_seqlens_q,
+        int(block_table.shape[1]) * page_size,
+        cu_seqlens_k=None,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+    )
+    return output.view(rows, query_length, query_heads, head_dim)
+
+
+def _expert_fa3_attention_paged_fake(
+    query: torch.Tensor,
+    flat_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    key_size: list[int],
+    key_stride: list[int],
+    value_offset: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return query.new_empty((query.shape[0], query.shape[2], query.shape[1], query.shape[-1]))
+
+
+expert_fa3_attention_paged = torch.library.custom_op(
+    "alpamayo2_super::expert_fa3_attention_paged",
+    mutates_args=(),
+    device_types="cuda",
+)(_expert_fa3_attention_paged_impl)
+expert_fa3_attention_paged.register_fake(_expert_fa3_attention_paged_fake)
+
+
+@dataclass(frozen=True)
+class PagedRowLayout:
+    """Where token (block, slot, head) of a layer sits in its ``(rows, head_dim)`` flat view.
+
+    ``row = block * block_stride + slot * slot_stride + head * head_stride``
+    for K, plus ``value_offset`` for V (all in rows of ``head_dim`` elements).
+    ``key_size``/``key_stride`` (elements) rebuild the ``(blocks, block_size,
+    kv_heads, head_dim)`` K view over the flat storage; V starts
+    ``value_offset * head_dim`` elements later. One layout serves every layer.
+    """
+
+    block_stride: int
+    slot_stride: int
+    head_stride: int
+    value_offset: int
+    key_size: tuple[int, ...]
+    key_stride: tuple[int, ...]
+
+    def rows(self, block: torch.Tensor, slot: torch.Tensor, kv_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flat K and V rows for ``block``/``slot`` of shape (rows, tokens), ordered (row, head, token)."""
+        heads = torch.arange(kv_heads, dtype=torch.long)[None, :, None]
+        key_rows = (
+            block.to(torch.long)[:, None, :] * self.block_stride
+            + slot.to(torch.long)[:, None, :] * self.slot_stride
+            + heads * self.head_stride
+        ).reshape(-1)
+        return key_rows, key_rows + self.value_offset
+
+
+def paged_kv_flat_rows(cache: torch.Tensor, layer_index: int) -> tuple[torch.Tensor, PagedRowLayout]:
+    """A layer's cache as a contiguous ``(rows, head_dim)`` view of its storage plus the row layout.
+
+    vLLM hands out the logical ``[blocks, kv_heads, block_size, 2 * head_dim]``
+    shape as a permuted view of the physical layout (NHD by default), so the
+    row of token (block, slot, head) is read off the K view's strides rather
+    than assumed from the shape. Works for every layout ``split_paged_kv_cache``
+    accepts as long as the tensor is one permuted contiguous block (a packed
+    multi-layer backing is not).
+    """
+    key_view, value_view = split_paged_kv_cache(cache, layer_index)
+    head_dim = int(key_view.shape[-1])
+    block_stride, slot_stride, head_stride, last_stride = key_view.stride()
+    if last_stride != 1 or any(stride % head_dim for stride in (block_stride, slot_stride, head_stride)):
+        raise RuntimeError(
+            f"The paged expert KV path needs head_dim-aligned strides; layer {layer_index} has {key_view.stride()}"
+        )
+    by_stride = sorted(range(cache.ndim), key=lambda dim: -cache.stride(dim))
+    physical = cache.permute(by_stride)
+    if not physical.is_contiguous():
+        raise RuntimeError(
+            f"The paged expert KV path writes through a flat view; layer {layer_index} is not contiguous"
+        )
+    value_offset = value_view.storage_offset() - key_view.storage_offset()
+    if value_offset % head_dim or key_view.storage_offset() != physical.storage_offset():
+        raise RuntimeError(f"The paged expert KV path needs K/V offsets aligned to head_dim; layer {layer_index}")
+    return physical.view(-1, head_dim), PagedRowLayout(
+        block_stride=block_stride // head_dim,
+        slot_stride=slot_stride // head_dim,
+        head_stride=head_stride // head_dim,
+        value_offset=value_offset // head_dim,
+        key_size=tuple(int(dim) for dim in key_view.shape),
+        key_stride=tuple(int(stride) for stride in key_view.stride()),
+    )
+
+
+@dataclass
+class PagedPrefixContext:
+    """Where the expert's rows live in the engine's paged KV cache.
+
+    ``key_caches``/``value_caches`` are per-layer ``(blocks, block_size,
+    kv_heads, head_dim)`` views of the engine's cache tensors (persistent for
+    the engine's lifetime, so a captured graph may read them), ``flat_caches``
+    the same layers as ``(rows, head_dim)`` and ``raw_caches`` the layer
+    tensors themselves, for whole-block copies. Each row's page table lists
+    its full prefix blocks followed by the row's reserved pages (blocks the
+    runner allocated beyond the scheduler's pool). The prefix's last,
+    partially filled block is copied into the first reserved page
+    (``tail_source`` -> ``tail_target``; a self-copy when the prefix ends on
+    a block boundary) so the action tokens continue it: the suffix K/V of
+    (row, head, token) go to flat rows ``suffix_key_rows``/``suffix_value_rows``.
+    ``seqused`` is prefix plus suffix length per row. All small tensors are
+    refreshed per request with ``copy_`` so their addresses stay fixed.
+    """
+
+    key_caches: list[torch.Tensor]
+    value_caches: list[torch.Tensor]
+    flat_caches: list[torch.Tensor]
+    raw_caches: list[torch.Tensor]
+    layout: PagedRowLayout
+    block_table: torch.Tensor
+    seqused: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    suffix_key_rows: torch.Tensor
+    suffix_value_rows: torch.Tensor
+    tail_source: torch.Tensor
+    tail_target: torch.Tensor
+
+    def clone_indices(self) -> PagedPrefixContext:
+        """A context with private copies of the per-request index tensors (graph inputs)."""
+        return PagedPrefixContext(
+            self.key_caches,
+            self.value_caches,
+            self.flat_caches,
+            self.raw_caches,
+            self.layout,
+            self.block_table.clone(),
+            self.seqused.clone(),
+            self.cu_seqlens_q.clone(),
+            self.suffix_key_rows.clone(),
+            self.suffix_value_rows.clone(),
+            self.tail_source.clone(),
+            self.tail_target.clone(),
+        )
+
+    def copy_indices_from(self, other: PagedPrefixContext) -> None:
+        self.block_table.copy_(other.block_table)
+        self.seqused.copy_(other.seqused)
+        self.suffix_key_rows.copy_(other.suffix_key_rows)
+        self.suffix_value_rows.copy_(other.suffix_value_rows)
+        self.tail_source.copy_(other.tail_source)
+        self.tail_target.copy_(other.tail_target)
+
+    def relocate_tails(self) -> None:
+        """Copy each row's partial last prefix block into its first reserved page (every layer)."""
+        for cache in self.raw_caches:
+            block_dim = paged_kv_block_dim(cache)
+            cache.index_copy_(block_dim, self.tail_target, cache.index_select(block_dim, self.tail_source))
+
+
+class SuffixPassthroughCache(StaticCache):
+    """A StaticCache-shaped cache that stores nothing.
+
+    In paged mode the attention wrapper writes the action tokens' K/V into the
+    engine's reserved pages itself, so HF's cache only has to hand the fresh
+    states through; keeping the StaticCache interface leaves the expert's
+    mask/position handling unchanged.
+    """
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[layer_idx]
+        if not layer.is_initialized:
+            layer.lazy_initialization(key_states, value_states)
+        return key_states, value_states
+
+
+# Set while the expert runs (eagerly, or during graph capture) in paged mode;
+# the attention wrapper picks it up because HF does not pass the cache object
+# down to the attention interface.
+_ACTIVE_PAGED_PREFIX: PagedPrefixContext | None = None
+
+
+@contextmanager
+def paged_prefix_scope(context: PagedPrefixContext | None):
+    global _ACTIVE_PAGED_PREFIX
+    previous = _ACTIVE_PAGED_PREFIX
+    _ACTIVE_PAGED_PREFIX = context
+    try:
+        yield
+    finally:
+        _ACTIVE_PAGED_PREFIX = previous
+
+
+def split_paged_kv_cache(cache: torch.Tensor, layer_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (key_cache, value_cache) as ``(num_blocks, block_size, kv_heads, head_dim)`` views.
+
+    No copy is made: FA3 reads the pages through their strides (only the
+    head_dim axis has to be contiguous), so the same layouts
+    ``_gather_prefix_cache`` understands are exposed as strided views.
+    """
+    if cache.ndim == 4 and cache.shape[-1] % 2 == 0:
+        # FlashAttention: [blocks, kv_heads, block_size, 2 * head_dim].
+        head_dim = cache.shape[-1] // 2
+        return (
+            cache[..., :head_dim].permute(0, 2, 1, 3),
+            cache[..., head_dim:].permute(0, 2, 1, 3),
+        )
+    if cache.ndim == 5 and cache.shape[0] == 2:
+        # [2, blocks, block_size, kv_heads, head_dim].
+        return cache[0], cache[1]
+    if cache.ndim == 5 and cache.shape[1] == 2:
+        # [blocks, 2, block_size, kv_heads, head_dim].
+        return cache[:, 0], cache[:, 1]
+    raise RuntimeError(
+        "The paged expert KV path needs a supported vLLM paged KV layout; "
+        f"layer {layer_index} has shape {tuple(cache.shape)}"
+    )
+
+
+def paged_kv_block_dim(cache: torch.Tensor) -> int:
+    """The block axis of a supported paged layout (see ``split_paged_kv_cache``)."""
+    if cache.ndim == 5 and cache.shape[0] == 2:
+        return 1
+    return 0
 
 
 def _expert_fa3_attention_rows_fake(
@@ -313,6 +599,10 @@ def alpamayo_flash_attention_3_forward(
         )
     )
     if not use_fa3:
+        if _ACTIVE_PAGED_PREFIX is not None:
+            raise RuntimeError(
+                "The paged expert KV path requires the FA3 expert attention kernel (non-causal, half precision, CUDA)"
+            )
         return sdpa_attention_forward(
             module,
             query,
@@ -335,6 +625,29 @@ def alpamayo_flash_attention_3_forward(
     allocated_key_length = key.shape[2]
     cache_position = kwargs.get("cache_position")
     softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
+    paged = _ACTIVE_PAGED_PREFIX
+    if paged is not None:
+        # key/value are this step's action tokens. They go into the rows'
+        # reserved pages with a plain index_copy_ (traced, so Inductor fuses it
+        # with the RoPE output like the StaticCache write); the op then reads
+        # prefix and suffix where the engine keeps them.
+        layer_index = int(module.layer_idx)
+        flat_cache = paged.flat_caches[layer_index]
+        head_dim = query.shape[-1]
+        flat_cache.index_copy_(0, paged.suffix_key_rows, key.reshape(-1, head_dim))
+        flat_cache.index_copy_(0, paged.suffix_value_rows, value.reshape(-1, head_dim))
+        output = expert_fa3_attention_paged(
+            query,
+            flat_cache,
+            paged.block_table,
+            paged.seqused,
+            paged.cu_seqlens_q,
+            list(paged.layout.key_size),
+            list(paged.layout.key_stride),
+            paged.layout.value_offset * head_dim,
+            softmax_scale,
+        )
+        return output, None
     if query.shape[0] > 1:
         multi_row_ready = (
             attention_mask is not None
@@ -698,6 +1011,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             fa3_reason,
         )
         expert_config.llm_config._attn_implementation = self.expert_attention_backend
+        # Paged expert KV (see PagedPrefixContext): the runner reserves pages
+        # for up to this many concurrent expert rows; make_omni_output records
+        # where they are.
+        self._paged_expert_kv_enabled = bool(policy_config.get("paged_expert_kv", False))
+        self._paged_expert_kv_rows = int(policy_config.get("paged_expert_kv_rows", 8))
+        self._runner_reserved_blocks: tuple[int, int] = (0, 0)
+        self._paged_expert_kv_fallbacks: set[str] = set()
         self.expert = ExpertModel(
             expert_config,
             dtype=vllm_config.model_config.dtype,
@@ -1108,6 +1428,131 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 cls._copy_block_prefix(dst_values[row], value_blocks, seq_len, prefix_length)
             static_layer.cumulative_length.fill_(prefix_length)
 
+    def _paged_expert_kv_applies(self, caches: list[torch.Tensor], *, row_count: int, suffix_length: int) -> bool:
+        """Whether this batch can run in paged mode; otherwise the dense path serves it."""
+        key_cache, _ = split_paged_kv_cache(caches[0], 0)
+        expert_dtype = self.expert.action_out_proj.weight.dtype
+        reason = None
+        if key_cache.dtype != expert_dtype:
+            reason = f"the engine KV cache is {key_cache.dtype}, the expert {expert_dtype}"
+        else:
+            try:
+                for layer_index, cache in enumerate(caches):
+                    paged_kv_flat_rows(cache, layer_index)
+            except RuntimeError as exc:
+                reason = str(exc)
+        if reason is None:
+            needed = row_count * self.paged_blocks_per_row(int(key_cache.shape[1]), suffix_length)
+            if needed > self._runner_reserved_blocks[1]:
+                reason = (
+                    f"{row_count} expert rows need {needed} reserved KV pages, the runner reserved "
+                    f"{self._runner_reserved_blocks[1]} (paged_expert_kv_rows)"
+                )
+        if reason is None:
+            return True
+        if reason not in self._paged_expert_kv_fallbacks:
+            self._paged_expert_kv_fallbacks.add(reason)
+            logger.warning("paged_expert_kv not applicable, using the dense prefix path: %s", reason)
+        return False
+
+    @staticmethod
+    def paged_blocks_per_row(block_size: int, suffix_length: int) -> int:
+        """Reserved pages one expert row needs: the relocated partial block plus the suffix."""
+        return (block_size - 1 + suffix_length + block_size - 1) // block_size
+
+    def runner_kv_cache_reserved_blocks(self, block_size: int) -> int:
+        """Pages per layer the runner should allocate beyond the scheduler's pool.
+
+        Called by the model runner before the KV cache is sized. In paged
+        expert mode every concurrently served expert row (samples, plus
+        navigation twins) owns a few pages for its action tokens.
+        """
+        if not self._paged_expert_kv_enabled:
+            return 0
+        suffix_length = int(self.expert.action_space.get_action_space_dims()[0])
+        return self._paged_expert_kv_rows * self.paged_blocks_per_row(int(block_size), suffix_length)
+
+    def _paged_prefix_context(
+        self,
+        caches: list[torch.Tensor],
+        block_tables: Sequence[torch.Tensor],
+        seq_lens: Sequence[int],
+        *,
+        nominal_length: int,
+        suffix_length: int,
+    ) -> PagedPrefixContext:
+        """Lay the batch's rows out over the engine's paged cache.
+
+        The prefix part of the page table is padded to the number of blocks
+        the configured nominal length needs (a longer prompt widens it and
+        creates another graph shape), so captured graphs see one shape per K.
+        """
+        device = caches[0].device
+        key_caches: list[torch.Tensor] = []
+        value_caches: list[torch.Tensor] = []
+        flat_caches: list[torch.Tensor] = []
+        layout: PagedRowLayout | None = None
+        for layer_index, cache in enumerate(caches):
+            key_cache, value_cache = split_paged_kv_cache(cache, layer_index)
+            flat_cache, layer_layout = paged_kv_flat_rows(cache, layer_index)
+            if layout is None:
+                layout = layer_layout
+            elif layer_layout != layout:
+                raise RuntimeError("paged_expert_kv needs the same KV layout in every layer")
+            key_caches.append(key_cache)
+            value_caches.append(value_cache)
+            flat_caches.append(flat_cache)
+        assert layout is not None
+        block_size = int(key_caches[0].shape[1])
+        kv_heads = int(key_caches[0].shape[2])
+        rows = len(block_tables)
+        blocks_per_row = self.paged_blocks_per_row(block_size, suffix_length)
+        reserved_start, reserved_count = self._runner_reserved_blocks
+        if rows * blocks_per_row > reserved_count:
+            raise RuntimeError(
+                f"paged_expert_kv: {rows} expert rows need {rows * blocks_per_row} reserved KV pages "
+                f"but the runner reserved {reserved_count}; raise paged_expert_kv_rows"
+            )
+        needed_blocks = max((int(seq_len) + block_size - 1) // block_size for seq_len in seq_lens)
+        prefix_width = max((int(nominal_length) + block_size - 1) // block_size, needed_blocks)
+        block_table = torch.zeros((rows, prefix_width + blocks_per_row), dtype=torch.int32, device=device)
+        seqused = torch.tensor([int(seq_len) + suffix_length for seq_len in seq_lens], dtype=torch.int32, device=device)
+        tail_source = torch.zeros(rows, dtype=torch.long, device=device)
+        tail_target_host: list[int] = []
+        suffix_block_host = torch.empty((rows, suffix_length), dtype=torch.long)
+        suffix_slot_host = torch.empty((rows, suffix_length), dtype=torch.long)
+        for row, (table, seq_len) in enumerate(zip(block_tables, seq_lens, strict=True)):
+            full_blocks, tail = divmod(int(seq_len), block_size)
+            reserved = [reserved_start + row * blocks_per_row + offset for offset in range(blocks_per_row)]
+            block_table[row, :full_blocks] = table[:full_blocks].to(dtype=torch.int32)
+            block_table[row, full_blocks : full_blocks + blocks_per_row] = torch.tensor(
+                reserved, dtype=torch.int32, device=device
+            )
+            tail_target_host.append(reserved[0])
+            if tail > 0:
+                # Device-to-device: the block id stays on the GPU (no host sync).
+                tail_source[row : row + 1].copy_(table[full_blocks : full_blocks + 1].to(dtype=torch.long))
+            else:
+                tail_source[row] = reserved[0]
+            local = torch.arange(tail, tail + suffix_length, dtype=torch.long)
+            suffix_block_host[row] = torch.tensor(reserved, dtype=torch.long)[local // block_size]
+            suffix_slot_host[row] = local % block_size
+        key_rows, value_rows = layout.rows(suffix_block_host, suffix_slot_host, kv_heads)
+        return PagedPrefixContext(
+            key_caches,
+            value_caches,
+            flat_caches,
+            list(caches),
+            layout,
+            block_table,
+            seqused,
+            torch.arange(0, rows * suffix_length + 1, suffix_length, dtype=torch.int32, device=device),
+            key_rows.to(device),
+            value_rows.to(device),
+            tail_source,
+            torch.tensor(tail_target_host, dtype=torch.long, device=device),
+        )
+
     @staticmethod
     def _rewind_static_action_cache(
         cache: StaticCache,
@@ -1171,6 +1616,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         suffix_length: int,
         static_cache_max_len: int | None,
         guidance_weight: torch.Tensor | None = None,
+        paged: PagedPrefixContext | None = None,
     ) -> torch.Tensor:
         """Replay the fixed-shape ten-step expert integration in one graph.
 
@@ -1192,36 +1638,47 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             action_dtype=action.dtype,
             device=action.device,
             positions_shape=tuple(expert_positions.shape),
-            attention_mask_shape=tuple(attention_mask.shape),
+            attention_mask_shape=tuple(attention_mask.shape) if attention_mask is not None else (),
             inference_steps=inference_steps,
             nav_cfg=nav_cfg,
+            paged_blocks=int(paged.block_table.shape[1]) if paged is not None else 0,
         )
         state = self._action_graphs.get(key)
         if state is None:
-            if prefix is None:
-                raise RuntimeError("A dense prefix cache is required to create a new action graph state")
-            static_cache = self._make_static_action_cache(
-                prefix,
-                suffix_length=suffix_length,
-                max_cache_len=static_cache_max_len,
-            )
+            if paged is not None:
+                # The attention wrapper writes the action tokens into the engine's
+                # reserved pages; the HF cache object stores nothing.
+                static_cache = SuffixPassthroughCache(config=self.expert.config.llm_config, max_cache_len=suffix_length)
+                first_position = 0
+            else:
+                if prefix is None:
+                    raise RuntimeError("A dense prefix cache is required to create a new action graph state")
+                static_cache = self._make_static_action_cache(
+                    prefix,
+                    suffix_length=suffix_length,
+                    max_cache_len=static_cache_max_len,
+                )
+                first_position = prefix_length
             state = {
                 "cache": static_cache,
                 "action": action.clone(),
                 "positions": expert_positions.clone(),
-                "attention_mask": attention_mask.clone(),
+                "attention_mask": attention_mask.clone() if attention_mask is not None else None,
                 "cache_position": torch.arange(
-                    prefix_length,
-                    prefix_length + suffix_length,
+                    first_position,
+                    first_position + suffix_length,
                     device=action.device,
                     dtype=torch.long,
                 ),
                 "guidance_weight": guidance_weight.clone() if nav_cfg else None,
+                "paged": paged.clone_indices() if paged is not None else None,
             }
             sample_count = action.shape[0]
 
             def graph_body() -> torch.Tensor:
                 graph_action = state["action"]
+                if state["paged"] is not None:
+                    state["paged"].relocate_tails()
                 for step in range(inference_steps):
                     timestep = graph_action.new_full(
                         (graph_action.shape[0],) + (1,) * (graph_action.ndim - 1),
@@ -1237,15 +1694,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         dtype=self.expert.action_out_proj.weight.dtype,
                     ):
                         embeddings = self.expert.action_in_proj(step_action, step_timestep)
-                    output = expert(
-                        inputs_embeds=embeddings.to(self.expert.action_out_proj.weight.dtype),
-                        position_ids=state["positions"],
-                        past_key_values=static_cache,
-                        attention_mask=state["attention_mask"],
-                        cache_position=state["cache_position"],
-                        use_cache=True,
-                        is_causal=not bool(self.expert.config.expert_non_causal_attention),
-                    )
+                    with paged_prefix_scope(state["paged"]):
+                        output = expert(
+                            inputs_embeds=embeddings.to(self.expert.action_out_proj.weight.dtype),
+                            position_ids=state["positions"],
+                            past_key_values=static_cache,
+                            attention_mask=state["attention_mask"],
+                            cache_position=state["cache_position"],
+                            use_cache=True,
+                            is_causal=not bool(self.expert.config.expert_non_causal_attention),
+                        )
                     self._rewind_static_action_cache(
                         static_cache,
                         state["cache_position"][0],
@@ -1277,15 +1735,19 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         state["action"].copy_(action)
         state["positions"].copy_(expert_positions)
-        state["attention_mask"].copy_(attention_mask)
-        state["cache_position"].copy_(
-            torch.arange(
-                prefix_length,
-                prefix_length + suffix_length,
-                device=action.device,
-                dtype=torch.long,
+        if attention_mask is not None:
+            state["attention_mask"].copy_(attention_mask)
+        if paged is not None:
+            state["paged"].copy_indices_from(paged)
+        else:
+            state["cache_position"].copy_(
+                torch.arange(
+                    prefix_length,
+                    prefix_length + suffix_length,
+                    device=action.device,
+                    dtype=torch.long,
+                )
             )
-        )
         if nav_cfg:
             state["guidance_weight"].copy_(guidance_weight)
         if prefix is not None:
@@ -1303,6 +1765,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         attention_mask_shape: tuple[int, ...],
         inference_steps: int,
         nav_cfg: bool = False,
+        paged_blocks: int = 0,
     ) -> tuple[Any, ...]:
         """Identify one captured action graph by the shapes it was traced with.
 
@@ -1320,6 +1783,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tuple(attention_mask_shape),
             int(inference_steps),
             bool(nav_cfg),
+            int(paged_blocks),
         )
 
     def _sample_actions_batch(
@@ -1411,6 +1875,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
+        # Paged expert KV: the expert attends to the VLM prefix in the engine's
+        # paged cache through FA3's paged call and keeps only its own action
+        # tokens in a small suffix cache. No prefix gather, no dense copy, no
+        # per-row StaticCache; requires the FA3 expert attention backend.
+        paged_expert_kv = bool(first_extra.get("_paged_expert_kv", False))
+        if paged_expert_kv:
+            if self.expert_attention_backend != EXPERT_ATTENTION_BACKEND_FA3:
+                raise RuntimeError("paged_expert_kv requires expert_attention_backend=alpamayo_fa3")
+            paged_expert_kv = self._paged_expert_kv_applies(caches, row_count=row_count, suffix_length=suffix_length)
         # Navigation CFG doubles the cache rows (guided plus unguided twins) and
         # blends two velocities per step; the captured graph carries that body
         # too (keyed separately), so navigation replays a graph like guided-only
@@ -1433,7 +1906,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # for the first request of a new graph shape (which creates the state).
         prefix: DynamicCache | None = None
         graph_state: dict[str, Any] | None = None
-        if manual_action_cudagraph and static_expert_cache:
+        paged_context: PagedPrefixContext | None = None
+        if paged_expert_kv:
+            paged_context = self._paged_prefix_context(
+                caches,
+                all_block_tables,
+                all_seq_lens,
+                nominal_length=(static_cache_max_len or (prefix_len + suffix_length)),
+                suffix_length=suffix_length,
+            )
+        elif manual_action_cudagraph and static_expert_cache:
             graph_state = self._action_graphs.get(
                 self._action_graph_key(
                     action_shape=(sample_count, *action_dims),
@@ -1450,7 +1932,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     nav_cfg=nav_cfg,
                 )
             )
-        if graph_state is not None:
+        if paged_expert_kv:
+            pass  # nothing to materialize: the prefix stays in the engine's paged cache
+        elif graph_state is not None:
             self._gather_prefix_cache_into_static(caches, all_block_tables, all_seq_lens, graph_state["cache"])
         else:
             prefix = self._gather_prefix_cache_batch(caches, all_block_tables, all_seq_lens)
@@ -1487,21 +1971,26 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             last_position[:, :, None] + 1 + torch.arange(suffix_length, device=device)[None, None, :]
         ).expand(3, row_count, suffix_length)
         weight_dtype = self.expert.action_out_proj.weight.dtype
-        attention_mask = self._make_action_attention_mask(
-            sample_count=row_count,
-            prefix_length=prefix_len,
-            suffix_length=suffix_length,
-            max_cache_len=(static_cache_max_len if static_expert_cache else None),
-            device=device,
-            dtype=weight_dtype,
-            prefix_lengths=prefix_lengths,
-        )
+        attention_mask: torch.Tensor | None = None
+        if not paged_expert_kv:
+            attention_mask = self._make_action_attention_mask(
+                sample_count=row_count,
+                prefix_length=prefix_len,
+                suffix_length=suffix_length,
+                max_cache_len=(static_cache_max_len if static_expert_cache else None),
+                device=device,
+                dtype=weight_dtype,
+                prefix_lengths=prefix_lengths,
+            )
         # Every non-graph mode below runs on a dense prefix; the manual-graph
         # path may arrive here with prefix None because it gathered directly
         # into the graph state's StaticCache.
         expert_cache: DynamicCache | StaticCache | None = prefix
         expert_cache_position = None
-        if static_expert_cache and not manual_action_cudagraph:
+        if paged_expert_kv and not manual_action_cudagraph:
+            expert_cache = SuffixPassthroughCache(config=self.expert.config.llm_config, max_cache_len=suffix_length)
+            expert_cache_position = torch.arange(suffix_length, device=device, dtype=torch.long)
+        elif static_expert_cache and not manual_action_cudagraph:
             expert_cache = self._make_static_action_cache(
                 prefix,
                 suffix_length=suffix_length,
@@ -1534,9 +2023,12 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 guidance_weight=(
                     torch.tensor(guidance_weight, device=device, dtype=torch.float32) if nav_cfg else None
                 ),
+                paged=paged_context,
             )
         else:
             assert expert_cache is not None, "eager expert modes require a dense DynamicCache prefix"
+            if paged_context is not None:
+                paged_context.relocate_tails()
             for step in range(inference_steps):
                 timestep = action.new_full(
                     (sample_count,) + (1,) * len(action_dims),
@@ -1549,17 +2041,18 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     step_timestep = torch.cat([timestep, timestep], dim=0)
                 with torch.autocast(device_type=device.type, dtype=weight_dtype):
                     embeddings = self.expert.action_in_proj(step_action, step_timestep)
-                outputs = expert(
-                    inputs_embeds=embeddings.to(weight_dtype),
-                    position_ids=expert_positions,
-                    past_key_values=expert_cache,
-                    attention_mask=attention_mask,
-                    cache_position=expert_cache_position,
-                    use_cache=True,
-                    is_causal=not bool(self.expert.config.expert_non_causal_attention),
-                )
+                with paged_prefix_scope(paged_context):
+                    outputs = expert(
+                        inputs_embeds=embeddings.to(weight_dtype),
+                        position_ids=expert_positions,
+                        past_key_values=expert_cache,
+                        attention_mask=attention_mask,
+                        cache_position=expert_cache_position,
+                        use_cache=True,
+                        is_causal=not bool(self.expert.config.expert_non_causal_attention),
+                    )
                 if isinstance(expert_cache, StaticCache):
-                    self._rewind_static_action_cache(expert_cache, prefix_len)
+                    self._rewind_static_action_cache(expert_cache, 0 if paged_expert_kv else prefix_len)
                 else:
                     expert_cache.crop(prefix_len)
                 velocity = self.expert.action_out_proj(outputs.last_hidden_state[:, -suffix_length:])
@@ -1630,10 +2123,14 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # same predicate gates the kernel; several rows (CFG) additionally need
         # the page-aligned StaticCache that the two-segment paged call requires,
         # otherwise the attention wrapper falls back to SDPA and this reports 0.
-        multi_row_fa3_layout = row_count == 1 or (
-            static_expert_cache
-            and static_cache_max_len is not None
-            and static_cache_max_len % EXPERT_FA3_PAGE_SIZE == 0
+        multi_row_fa3_layout = (
+            paged_expert_kv
+            or row_count == 1
+            or (
+                static_expert_cache
+                and static_cache_max_len is not None
+                and static_cache_max_len % EXPERT_FA3_PAGE_SIZE == 0
+            )
         )
         fa3_supported = expert_fa3_supports(
             batch_rows=row_count,
@@ -1894,6 +2391,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     raise RuntimeError("Super action generation requires runner KV-cache access")
                 if len(runner_kv_cache_context.request_ids) != request_count:
                     raise RuntimeError("Super policy arguments and runner requests must align")
+                start, count = getattr(runner_kv_cache_context, "reserved_blocks", (0, 0))
+                self._runner_reserved_blocks = (int(start), int(count))
             per_request_outputs: list[dict[str, torch.Tensor] | None] = [None] * request_count
             touched_groups: set[str] = set()
             touched_twins: set[str] = set()
