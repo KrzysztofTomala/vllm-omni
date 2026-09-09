@@ -1235,12 +1235,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
         if nav_cfg:
-            # The captured graph replays a fixed guided-only integration over a
-            # StaticCache holding one prefix per sample. CFG doubles the prefix
-            # rows and combines two velocities per step, so it always takes the
-            # eager DynamicCache loop below.
+            # The captured graph replays a fixed guided-only integration, and
+            # CFG doubles the prefix rows and combines two velocities per step,
+            # so navigation takes the eager loop below. It keeps the StaticCache
+            # when one is configured: the compiled expert is traced with static
+            # shapes, and a DynamicCache sized to each prompt made every new
+            # prompt length a recompile (about two minutes per length on H100)
+            # before the recompile limit turned the rest into eager layers. A
+            # StaticCache of the configured length gives one shape per K.
             manual_action_cudagraph = False
-            static_expert_cache = False
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply

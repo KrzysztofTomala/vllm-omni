@@ -2039,18 +2039,39 @@ def test_super_nav_cfg_with_unit_weight_matches_guided_only_run() -> None:
     assert unit_weight["nav_cfg_applied"].item() is True
 
 
-def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> None:
+def test_super_nav_cfg_disables_manual_graph_but_keeps_static_cache(monkeypatch) -> None:
     model = _cfg_test_model()
     monkeypatch.setattr(
         model,
         "_run_manual_action_graph",
         lambda **_kwargs: pytest.fail("CFG must not take the captured graph path"),
     )
-    monkeypatch.setattr(
-        model,
-        "_make_static_action_cache",
-        lambda *_args, **_kwargs: pytest.fail("CFG must not build a StaticCache"),
-    )
+    # CFG keeps the configured StaticCache (one static shape per K for the
+    # compiled expert) and only leaves the captured-graph path.
+    static_calls: list[dict] = []
+
+    def fake_make_static(prefix, *, suffix_length, max_cache_len):
+        # The test model has no HF config, so stand in for the StaticCache with
+        # the same layout: right-padded prefix rows plus room for the suffix.
+        from transformers import StaticCache
+
+        static_calls.append({"suffix_length": suffix_length, "max_cache_len": max_cache_len})
+        fake = object.__new__(StaticCache)
+        layers = []
+        for layer in prefix.layers:
+            total = max_cache_len if max_cache_len is not None else layer.keys.shape[2] + suffix_length
+            pad = total - layer.keys.shape[2]
+            layers.append(
+                SimpleNamespace(
+                    keys=torch.nn.functional.pad(layer.keys, (0, 0, 0, pad)),
+                    values=torch.nn.functional.pad(layer.values, (0, 0, 0, pad)),
+                    cumulative_length=torch.tensor(layer.keys.shape[2]),
+                )
+            )
+        fake.layers = layers
+        return fake
+
+    monkeypatch.setattr(model, "_make_static_action_cache", fake_make_static)
     observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
     extras = [
         {
@@ -2076,6 +2097,7 @@ def test_super_nav_cfg_disables_manual_graph_and_static_cache(monkeypatch) -> No
     )
 
     assert result["nav_cfg_applied"].item() is True
+    assert static_calls == [{"suffix_length": 2, "max_cache_len": 16}]
     with pytest.raises(ValueError, match="one unguided prefix per guided sample"):
         model._sample_actions_batch(
             caches=[_cfg_test_cache()],
