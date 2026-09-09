@@ -126,6 +126,19 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         available = super().determine_available_memory()
+        # The profile run (and, on a cold compile cache, the Inductor compile
+        # and autotuning it triggers) leaves several GiB reserved in the caching
+        # allocator. With an explicit kv_cache_memory_bytes nothing releases
+        # them before the KV cache is allocated, so on a full card the sibling
+        # API process could not get its own buffers. Hand them back now; the
+        # engine re-acquires what it needs on the first request.
+        reserved_before = torch.cuda.memory_reserved()
+        torch.accelerator.synchronize()
+        gc.collect()
+        torch.accelerator.empty_cache()
+        released = reserved_before - torch.cuda.memory_reserved()
+        if released > 0:
+            logger.info("Released %s GiB of cached allocator memory after profiling", format_gib(released))
         reserve_bytes_fn = getattr(self.model_runner, "runner_reserved_kv_cache_bytes", None)
         reserve_bytes = int(reserve_bytes_fn()) if reserve_bytes_fn is not None else 0
         if reserve_bytes > 0:
