@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -311,6 +312,81 @@ def resolve_expert_attention_backend(
     return EXPERT_ATTENTION_BACKEND_SDPA
 
 
+# Inductor picks the launch configuration of its generated Triton reduction
+# kernels by benchmarking a few candidates at first use. For the expert's
+# RMSNorm-style reductions one of the candidates yields trajectories about a
+# metre away from the eager layers (and from the other candidates), so which
+# variant a process serves depended on timing at compile time. Inductor's
+# deterministic mode replaces the benchmark with a fixed choice; measured cost
+# on H100 is within noise. Set to "0" only to reproduce the old behaviour.
+EXPERT_COMPILE_DETERMINISTIC = os.getenv("ALPAMAYO_EXPERT_COMPILE_DETERMINISTIC", "1") != "0"
+# Triton 3.7.1 miscompiles the Inductor pointwise kernel that builds the
+# expert's interleaved-mRoPE angle table for exactly XBLOCK=256 with four
+# warps (a lane permutation in one third of the first mRoPE section; every
+# other block size and warp count agrees bit for bit). Inductor's pointwise
+# autotuner offers 128 and 256 for that kernel and picks by timing, so about
+# one process in three rotated q/k with a wrong table and returned trajectories
+# about a metre off; with autotuning disabled the single default configuration
+# is the bad one. The guard below removes that launch configuration from every
+# pointwise candidate list handed to Inductor's autotuner in this process (the
+# backbone compiles in the same process and could hit the same bug) and falls
+# back to XBLOCK=128 when it was the only candidate. Set
+# ALPAMAYO_INDUCTOR_POINTWISE_GUARD=0 to disable. Standalone reproduction:
+# perf_study_20260908/triton_repro.
+INDUCTOR_POINTWISE_GUARD = os.getenv("ALPAMAYO_INDUCTOR_POINTWISE_GUARD", "1") != "0"
+_BAD_POINTWISE_XBLOCK = 256
+_BAD_POINTWISE_NUM_WARPS = 4
+_FALLBACK_POINTWISE_XBLOCK = 128
+
+
+def filter_pointwise_configs(configs: Sequence[Any]) -> list[Any]:
+    """Drop the miscompiling (XBLOCK=256, num_warps=4) pointwise configuration."""
+    kept = [
+        cfg
+        for cfg in configs
+        if not (cfg.kwargs.get("XBLOCK") == _BAD_POINTWISE_XBLOCK and int(cfg.num_warps) == _BAD_POINTWISE_NUM_WARPS)
+    ]
+    if kept or not configs:
+        return kept
+    from triton import Config
+
+    first = configs[0]
+    return [
+        Config(
+            {**first.kwargs, "XBLOCK": _FALLBACK_POINTWISE_XBLOCK},
+            num_warps=int(first.num_warps),
+            num_stages=int(first.num_stages),
+        )
+    ]
+
+
+def install_inductor_pointwise_config_guard() -> bool:
+    """Wrap Inductor's autotuner entry point so pointwise kernels never use the bad configuration."""
+    from torch._inductor.runtime import triton_heuristics
+    from torch._inductor.runtime.hints import HeuristicType
+
+    original = triton_heuristics.cached_autotune
+    if getattr(original, "_alpamayo_pointwise_guard", False):
+        return False
+
+    def guarded_cached_autotune(
+        size_hints: Any, configs: Any, triton_meta: Any, heuristic_type: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if heuristic_type == HeuristicType.POINTWISE:
+            configs = filter_pointwise_configs(list(configs))
+        return original(size_hints, configs, triton_meta, heuristic_type, *args, **kwargs)
+
+    guarded_cached_autotune._alpamayo_pointwise_guard = True  # type: ignore[attr-defined]
+    guarded_cached_autotune._alpamayo_original = original  # type: ignore[attr-defined]
+    triton_heuristics.cached_autotune = guarded_cached_autotune
+    logger.info("Inductor pointwise autotune guard installed (drops XBLOCK=256/num_warps=4 candidates)")
+    return True
+
+
+if INDUCTOR_POINTWISE_GUARD:
+    install_inductor_pointwise_config_guard()
+
+
 def compile_action_expert(expert: nn.Module) -> nn.Module:
     """Compile the expert decoder stack as one Dynamo frame.
 
@@ -327,12 +403,15 @@ def compile_action_expert(expert: nn.Module) -> nn.Module:
     Inference only: the FA3 op has no backward, and the model runner already
     executes under ``torch.inference_mode``.
     """
-    logger.info("Compiling the Alpamayo action expert as a single graph (fullgraph=True, static shapes)")
+    logger.info(
+        "Compiling the Alpamayo action expert as a single graph (fullgraph=True, static shapes, deterministic=%s)",
+        EXPERT_COMPILE_DETERMINISTIC,
+    )
     return torch.compile(
         expert,
         fullgraph=True,
         dynamic=False,
-        options={"triton.cudagraphs": False},
+        options={"triton.cudagraphs": False, "deterministic": EXPERT_COMPILE_DETERMINISTIC},
     )
 
 
