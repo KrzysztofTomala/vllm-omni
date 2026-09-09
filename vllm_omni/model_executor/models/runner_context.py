@@ -23,6 +23,10 @@ class RunnerKVCacheContext:
     block_table: torch.Tensor
     sequence_lengths: tuple[int, ...]
     request_ids: tuple[str, ...]
+    # Blocks (first id, count) the runner allocated in every cache tensor
+    # beyond the scheduler's pool, for a model that asked for them through
+    # ``runner_kv_cache_reserved_blocks``; (0, 0) when none.
+    reserved_blocks: tuple[int, int] = (0, 0)
 
     def __post_init__(self) -> None:
         if self.block_table.ndim != 2:

@@ -662,3 +662,74 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def _reserving_runner(reserve_per_layer: int, *, block_size: int = 16) -> OmniGPUModelRunner:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.cache_config = SimpleNamespace(block_size=block_size)
+    runner.model = SimpleNamespace(runner_kv_cache_reserved_blocks=lambda block_size: reserve_per_layer)
+    runner.runner_reserved_kv_blocks = (0, 0)
+    return runner
+
+
+def _kv_cache_config(num_blocks: int, page_size_bytes: int, layers: int, *, packed: bool = False):
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+    layer_names = [f"layers.{index}.attn" for index in range(layers)]
+    if packed:
+        block_stride = page_size_bytes * layers
+        tensors = [
+            KVCacheTensor(
+                size=num_blocks * block_stride,
+                shared_by=[name],
+                offset=index * page_size_bytes,
+                block_stride=block_stride,
+            )
+            for index, name in enumerate(layer_names)
+        ]
+    else:
+        tensors = [KVCacheTensor(size=num_blocks * page_size_bytes, shared_by=[name]) for name in layer_names]
+    group = SimpleNamespace(kv_cache_spec=SimpleNamespace(page_size_bytes=page_size_bytes), layer_names=layer_names)
+    return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=tensors, kv_cache_groups=[group])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_runner_grows_kv_cache_tensors_by_the_model_reserved_pages(monkeypatch, packed) -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    seen = {}
+
+    def fake_allocate(self, kv_cache_config):
+        seen["config"] = kv_cache_config
+        return {}
+
+    monkeypatch.setattr(GPUModelRunner, "_allocate_kv_cache_tensors", fake_allocate)
+    config = _kv_cache_config(num_blocks=472, page_size_bytes=64, layers=2, packed=packed)
+
+    runner = _reserving_runner(40)
+    runner._allocate_kv_cache_tensors(config)
+
+    grown = seen["config"]
+    assert grown is not config and grown.num_blocks == 472  # the scheduler's view is untouched
+    stride = 64 * 2 if packed else 64
+    assert [tensor.size for tensor in grown.kv_cache_tensors] == [(472 + 40) * stride] * 2
+    assert [tensor.size for tensor in config.kv_cache_tensors] == [472 * stride] * 2
+    assert runner.runner_reserved_kv_blocks == (472, 40)
+
+    plain = _reserving_runner(0)
+    plain._allocate_kv_cache_tensors(config)
+    assert seen["config"] is config
+    assert plain.runner_reserved_kv_blocks == (472, 0)
+
+
+def test_runner_reserved_kv_cache_bytes_spans_all_layers() -> None:
+    runner = _reserving_runner(40)
+    runner.get_kv_cache_spec = lambda: {
+        "a": SimpleNamespace(page_size_bytes=64),
+        "b": SimpleNamespace(page_size_bytes=64),
+    }
+    assert runner.runner_reserved_kv_cache_bytes() == 40 * 128
+    without_hook = object.__new__(OmniGPUModelRunner)
+    without_hook.cache_config = SimpleNamespace(block_size=16)
+    without_hook.model = SimpleNamespace()
+    assert without_hook.runner_reserved_kv_cache_bytes() == 0

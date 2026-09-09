@@ -516,6 +516,7 @@ def test_unguided_twin_request_replays_guided_reasoning_after_unguided_prompt(po
         "_compile_expert",
         "_manual_action_cudagraph",
         "_static_expert_cache_max_len",
+        "_paged_expert_kv",
     ):
         assert extra[key] == guided.sampling_params.extra_args[key], key
 
@@ -542,3 +543,11 @@ def test_unguided_twin_request_parses_child_id_on_first_underscore(policy_prompt
     assert keys("0_nim-trajectory-3") == ("nim-trajectory-3", 0, "0_nim-trajectory-3")
     # A bare request id is the single child of an n=1 request.
     assert keys("nim-trajectory-3") == ("nim-trajectory-3", 0, "nim-trajectory-3")
+
+
+def test_paged_expert_kv_is_opt_in_through_the_policy_config():
+    adapter = _adapter()
+    adapter.policy_config = {}
+    assert adapter._expert_extra_args()["_paged_expert_kv"] is False
+    adapter.policy_config = {"paged_expert_kv": True}
+    assert adapter._expert_extra_args()["_paged_expert_kv"] is True

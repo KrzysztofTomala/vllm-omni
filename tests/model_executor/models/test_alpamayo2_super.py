@@ -850,6 +850,10 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._action_graphs = {}
     model.expert_attention_backend_requested = "sdpa"
     model.expert_attention_backend = "sdpa"
+    model._paged_expert_kv_enabled = False
+    model._paged_expert_kv_rows = 8
+    model._runner_reserved_blocks = (0, 0)
+    model._paged_expert_kv_fallbacks = set()
     model._decode_cudagraph_observation = -1
     model._uniform_decode_query_len = 1
     return model
@@ -2673,3 +2677,580 @@ def test_expert_fa3_rows_fall_back_to_sdpa_without_page_alignment(monkeypatch) -
         cache_position=torch.arange(100, 100 + query_length),
     )
     assert out == ("sdpa", None) and used == ["sdpa"]
+
+
+# --- Paged expert KV (zero-copy prefix) -------------------------------------
+
+
+class _CudaLikeTensor:
+    """Proxy that reports a CUDA device so the wrapper's dispatch runs on CPU tensors."""
+
+    def __init__(self, t):
+        self._t = t
+        self.device = SimpleNamespace(type="cuda")
+
+    def __getattr__(self, name):
+        return getattr(self._t, name)
+
+
+def _paged_test_context(rows: int = 1, max_blocks: int = 4, suffix_length: int = 4):
+    raw = torch.zeros(8, 1, 4, 2, dtype=torch.bfloat16)  # [blocks, kv_heads, block_size, 2*head_dim]
+    key_cache, value_cache = alpamayo2_super_module.split_paged_kv_cache(raw, 0)
+    flat, layout = alpamayo2_super_module.paged_kv_flat_rows(raw, 0)
+    return alpamayo2_super_module.PagedPrefixContext(
+        key_caches=[key_cache],
+        value_caches=[value_cache],
+        flat_caches=[flat],
+        raw_caches=[raw],
+        layout=layout,
+        block_table=torch.zeros(rows, max_blocks, dtype=torch.int32),
+        seqused=torch.full((rows,), 5, dtype=torch.int32),
+        cu_seqlens_q=torch.arange(0, rows * suffix_length + 1, suffix_length, dtype=torch.int32),
+        suffix_key_rows=torch.arange(rows * suffix_length, dtype=torch.long),
+        suffix_value_rows=torch.arange(rows * suffix_length, dtype=torch.long) + layout.value_offset,
+        tail_source=torch.zeros(rows, dtype=torch.long),
+        tail_target=torch.zeros(rows, dtype=torch.long),
+    )
+
+
+def test_expert_fa3_paged_custom_op_registered_with_fake_impl() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    module = alpamayo2_super_module
+    assert torch.ops.alpamayo2_super.expert_fa3_attention_paged.default is module.expert_fa3_attention_paged._opoverload
+    with FakeTensorMode():
+        query = torch.empty(2, 16, 64, 128, dtype=torch.bfloat16)
+        flat = torch.empty(300 * 16 * 8 * 2, 128, dtype=torch.bfloat16)
+        output = torch.ops.alpamayo2_super.expert_fa3_attention_paged(
+            query,
+            flat,
+            torch.empty(2, 300, dtype=torch.int32),
+            torch.empty(2, dtype=torch.int32),
+            torch.empty(3, dtype=torch.int32),
+            [300, 16, 8, 128],
+            [16 * 8 * 256, 8 * 256, 256, 1],
+            128,
+            0.1,
+        )
+    assert output.shape == (2, 64, 16, 128)
+    assert output.dtype == torch.bfloat16
+
+
+def test_paged_prefix_scope_sets_and_restores_the_active_context() -> None:
+    module = alpamayo2_super_module
+    context = _paged_test_context()
+    assert module._ACTIVE_PAGED_PREFIX is None
+    with module.paged_prefix_scope(context):
+        assert module._ACTIVE_PAGED_PREFIX is context
+        with module.paged_prefix_scope(None):
+            assert module._ACTIVE_PAGED_PREFIX is None
+        assert module._ACTIVE_PAGED_PREFIX is context
+    assert module._ACTIVE_PAGED_PREFIX is None
+
+
+def test_split_paged_kv_cache_exposes_every_supported_layout_as_strided_views() -> None:
+    split = alpamayo2_super_module.split_paged_kv_cache
+    block_dim = alpamayo2_super_module.paged_kv_block_dim
+    blocks, block_size, kv_heads, head_dim = 3, 4, 2, 5
+
+    # [2, blocks, block_size, kv_heads, head_dim]
+    cache = torch.arange(2 * blocks * block_size * kv_heads * head_dim).reshape(
+        2, blocks, block_size, kv_heads, head_dim
+    )
+    key_cache, value_cache = split(cache, 0)
+    assert key_cache.data_ptr() == cache[0].data_ptr() and value_cache.data_ptr() == cache[1].data_ptr()
+    assert block_dim(cache) == 1
+
+    # [blocks, 2, block_size, kv_heads, head_dim]
+    cache = torch.arange(2 * blocks * block_size * kv_heads * head_dim).reshape(
+        blocks, 2, block_size, kv_heads, head_dim
+    )
+    key_cache, value_cache = split(cache, 0)
+    torch.testing.assert_close(key_cache, cache[:, 0])
+    torch.testing.assert_close(value_cache, cache[:, 1])
+    assert key_cache.data_ptr() == cache.data_ptr()
+    assert block_dim(cache) == 0
+
+    # FlashAttention: [blocks, kv_heads, block_size, 2 * head_dim] (the layout vLLM 0.28 allocates)
+    cache = torch.arange(blocks * kv_heads * block_size * 2 * head_dim).reshape(
+        blocks, kv_heads, block_size, 2 * head_dim
+    )
+    key_cache, value_cache = split(cache, 0)
+    assert key_cache.shape == (blocks, block_size, kv_heads, head_dim)
+    assert key_cache.stride(-1) == 1 and key_cache.data_ptr() == cache.data_ptr()
+    assert block_dim(cache) == 0
+    key_blocks, value_blocks = cache.chunk(2, dim=-1)
+    torch.testing.assert_close(key_cache, key_blocks.permute(0, 2, 1, 3))
+    torch.testing.assert_close(value_cache, value_blocks.permute(0, 2, 1, 3))
+    # Same tokens the dense gather would produce for block b, position t.
+    gathered = alpamayo2_super_module.Alpamayo2SuperForConditionalGeneration._gather_prefix_cache(
+        [cache.float()], torch.tensor([2, 0]), seq_len=6
+    )
+    torch.testing.assert_close(gathered.layers[0].keys[0], key_cache[[2, 0]].flatten(0, 1)[:6].transpose(0, 1).float())
+
+    with pytest.raises(RuntimeError, match="paged"):
+        split(torch.zeros(3, 4, 2, 1, 1), 0)
+
+
+def _vllm_nhd_cache(blocks: int, kv_heads: int, block_size: int, head_dim: int) -> torch.Tensor:
+    """What vLLM's FlashAttention backend hands out: logical [blocks, kv_heads, block_size, 2*head_dim]
+    as a permuted view of the physical NHD layout [blocks, block_size, kv_heads, 2*head_dim]."""
+    return torch.zeros(blocks, block_size, kv_heads, 2 * head_dim).permute(0, 2, 1, 3)
+
+
+@pytest.mark.parametrize(
+    "cache",
+    [
+        torch.zeros(3, 2, 4, 10),
+        _vllm_nhd_cache(3, 2, 4, 5),
+        torch.zeros(2, 3, 4, 2, 5),
+        torch.zeros(3, 2, 4, 2, 5),
+    ],
+    ids=["fa-rank4-contiguous", "fa-rank4-vllm-nhd-permuted", "kv-first-rank5", "blocks-first-rank5"],
+)
+def test_paged_flat_rows_address_the_same_tokens_as_the_split_views(cache) -> None:
+    module = alpamayo2_super_module
+    cache = cache.clone() if cache.is_contiguous() else cache  # keep the permuted view permuted
+    cache.zero_()
+    key_view, value_view = module.split_paged_kv_cache(cache, 0)
+    flat, layout = module.paged_kv_flat_rows(cache, 0)
+    blocks, block_size, kv_heads, head_dim = key_view.shape
+    assert flat.shape == (cache.numel() // head_dim, head_dim)
+    # The op rebuilds the K/V views from the layout over the flat storage.
+    rebuilt_key = flat.as_strided(layout.key_size, layout.key_stride, flat.storage_offset())
+    rebuilt_value = flat.as_strided(
+        layout.key_size, layout.key_stride, flat.storage_offset() + layout.value_offset * head_dim
+    )
+    assert rebuilt_key.data_ptr() == key_view.data_ptr() and rebuilt_key.stride() == key_view.stride()
+    assert rebuilt_value.data_ptr() == value_view.data_ptr() and rebuilt_value.shape == value_view.shape
+    # Two rows of two tokens each, at (block, slot) = (2, 3), (0, 1) and (1, 0), (1, 3).
+    block = torch.tensor([[2, 0], [1, 1]])
+    slot = torch.tensor([[3, 1], [0, 3]])
+    key_rows, value_rows = layout.rows(block, slot, kv_heads)
+    assert key_rows.shape == (2 * kv_heads * 2,)
+    key_states = torch.arange(1, 1 + 2 * kv_heads * 2 * head_dim, dtype=torch.float32).reshape(2, kv_heads, 2, head_dim)
+    value_states = -key_states
+    # The op writes exactly like this: (row, head, token) order, flat rows.
+    flat.index_copy_(0, key_rows, key_states.reshape(-1, head_dim))
+    flat.index_copy_(0, value_rows, value_states.reshape(-1, head_dim))
+    for row in range(2):
+        for token in range(2):
+            torch.testing.assert_close(key_view[block[row, token], slot[row, token]], key_states[row, :, token])
+            torch.testing.assert_close(value_view[block[row, token], slot[row, token]], value_states[row, :, token])
+    # Nothing else was touched.
+    written = 2 * 2 * kv_heads * 2 * head_dim
+    assert cache.ne(0).sum().item() == written
+
+    # A packed multi-layer backing (layers interleaved per block) is not one contiguous block.
+    packed = torch.zeros(3, 2, 2, 4, 10)[:, 0]
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        module.paged_kv_flat_rows(packed, 0)
+
+
+def test_paged_context_relocates_partial_tail_blocks_in_every_layer() -> None:
+    module = alpamayo2_super_module
+    fa_layer = torch.arange(6 * 1 * 4 * 2, dtype=torch.float32).reshape(6, 1, 4, 2)  # rank-4, block dim 0
+    kv_layer = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4, 1, 1)  # rank-5, block dim 1
+    context = module.PagedPrefixContext(
+        key_caches=[],
+        value_caches=[],
+        flat_caches=[],
+        raw_caches=[fa_layer, kv_layer],
+        layout=module.paged_kv_flat_rows(fa_layer, 0)[1],
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        seqused=torch.zeros(2, dtype=torch.int32),
+        cu_seqlens_q=torch.zeros(3, dtype=torch.int32),
+        suffix_key_rows=torch.zeros(2, dtype=torch.long),
+        suffix_value_rows=torch.zeros(2, dtype=torch.long),
+        tail_source=torch.tensor([1, 4]),  # row 1 ends on a block boundary: self copy
+        tail_target=torch.tensor([5, 4]),
+    )
+    before_fa, before_kv = fa_layer.clone(), kv_layer.clone()
+    context.relocate_tails()
+    torch.testing.assert_close(fa_layer[5], before_fa[1])
+    torch.testing.assert_close(fa_layer[:5], before_fa[:5])
+    torch.testing.assert_close(kv_layer[:, 5], before_kv[:, 1])
+    torch.testing.assert_close(kv_layer[:, :5], before_kv[:, :5])
+
+
+def test_suffix_passthrough_cache_hands_states_through_without_storing() -> None:
+    from transformers import PretrainedConfig
+
+    cache = alpamayo2_super_module.SuffixPassthroughCache(config=PretrainedConfig(num_hidden_layers=1), max_cache_len=2)
+    key = torch.randn(1, 1, 2, 3)
+    value = torch.randn(1, 1, 2, 3)
+    out_key, out_value = cache.update(key, value, 0)
+    assert out_key is key and out_value is value
+    assert cache.layers[0].keys.eq(0).all()
+    assert int(cache.get_seq_length()) == 0
+    assert cache.get_mask_sizes(torch.arange(2), 0) == (2, 0)
+
+
+def test_expert_fa3_wrapper_writes_the_suffix_and_reads_the_prefix_from_the_paged_cache(monkeypatch) -> None:
+    module = alpamayo2_super_module
+    rows, heads_q, heads_kv, suffix_length, dim = 2, 4, 2, 4, 1
+    query = torch.zeros(rows, heads_q, suffix_length, dim, dtype=torch.bfloat16)
+    key = torch.arange(1, 1 + rows * heads_kv * suffix_length, dtype=torch.bfloat16).reshape(
+        rows, heads_kv, suffix_length, dim
+    )
+    value = -key
+    # Two layers; the wrapper picks the module's layer. block_size 4, one kv head, head_dim 1 -> 8 pages x 4 slots.
+    context = _paged_test_context(rows=rows, suffix_length=suffix_length)
+    context.key_caches = context.key_caches * 2
+    context.value_caches = context.value_caches * 2
+    context.flat_caches = context.flat_caches * 2
+    # 16 (row, head, token) entries; in the FA layout K rows are even, V rows odd.
+    context.suffix_key_rows = torch.arange(rows * heads_kv * suffix_length) * 2
+    context.suffix_value_rows = context.suffix_key_rows + 1
+    calls = []
+
+    def fake_paged_op(q, flat_cache, block_table, seqused, cu_seqlens_q, key_size, key_stride, value_offset, scale):
+        calls.append(
+            (tuple(q.shape), flat_cache, block_table, seqused, cu_seqlens_q, key_size, key_stride, value_offset, scale)
+        )
+        return q.new_zeros((q.shape[0], q.shape[2], q.shape[1], q.shape[-1]))
+
+    monkeypatch.setattr(module, "expert_fa3_attention_paged", fake_paged_op)
+    monkeypatch.setattr(module, "expert_fa3_attention_rows", lambda *a, **k: pytest.fail("paged mode never gathers"))
+    monkeypatch.setattr(module, "sdpa_attention_forward", lambda *a, **k: pytest.fail("paged mode requires FA3"))
+
+    with module.paged_prefix_scope(context):
+        out, weights = module.alpamayo_flash_attention_3_forward(
+            SimpleNamespace(is_causal=False, layer_idx=1),
+            _CudaLikeTensor(query),
+            _CudaLikeTensor(key),
+            _CudaLikeTensor(value),
+            None,
+            scaling=0.25,
+            is_causal=False,
+            cache_position=torch.arange(suffix_length),
+        )
+    assert weights is None
+    assert out.shape == (rows, suffix_length, heads_q, dim)
+    (shape, flat_cache, block_table, seqused, cu_seqlens_q, key_size, key_stride, value_offset, scale) = calls[0]
+    assert shape == (rows, heads_q, suffix_length, dim)
+    assert flat_cache is context.flat_caches[1]
+    assert block_table is context.block_table and seqused is context.seqused and cu_seqlens_q is context.cu_seqlens_q
+    assert key_size == list(context.layout.key_size) and key_stride == list(context.layout.key_stride)
+    assert value_offset == context.layout.value_offset * dim
+    assert scale == 0.25
+    # The suffix K/V were written at the context's rows before the read, in (row, head, token) order.
+    torch.testing.assert_close(context.flat_caches[1][context.suffix_key_rows], key.reshape(-1, dim))
+    torch.testing.assert_close(context.flat_caches[1][context.suffix_value_rows], value.reshape(-1, dim))
+
+    # A shape the FA3 kernel cannot serve must not silently fall back in paged mode.
+    with module.paged_prefix_scope(context), pytest.raises(RuntimeError, match="requires the FA3"):
+        module.alpamayo_flash_attention_3_forward(
+            SimpleNamespace(is_causal=True, layer_idx=0),
+            _CudaLikeTensor(query),
+            _CudaLikeTensor(key),
+            _CudaLikeTensor(value),
+            None,
+            is_causal=True,
+        )
+
+
+def test_super_paged_blocks_per_row_covers_the_relocated_tail_and_the_suffix() -> None:
+    blocks_per_row = Alpamayo2SuperForConditionalGeneration.paged_blocks_per_row
+    assert blocks_per_row(16, 64) == 5  # 15 tail slots + 64 action tokens = 79 -> 5 pages
+    assert blocks_per_row(4, 2) == 2
+    assert blocks_per_row(1, 2) == 2
+    assert blocks_per_row(256, 64) == 2
+
+
+def test_super_reserved_block_request_follows_the_policy_config() -> None:
+    model = _cfg_test_model()
+    model.expert.action_space.get_action_space_dims = lambda: (64, 3)
+    assert model.runner_kv_cache_reserved_blocks(block_size=16) == 0
+    model._paged_expert_kv_enabled = True
+    model._paged_expert_kv_rows = 6
+    assert model.runner_kv_cache_reserved_blocks(block_size=16) == 6 * 5
+
+
+def test_super_paged_prefix_context_lays_rows_out_over_prefix_blocks_and_reserved_pages() -> None:
+    model = _cfg_test_model()
+    model._runner_reserved_blocks = (100, 40)
+    # Rank-5 paged layout with block_size=4; suffix of 2 action tokens -> 2 reserved pages per row.
+    cache = torch.arange(2 * 8 * 4).reshape(2, 8, 4, 1, 1).float()
+    context = model._paged_prefix_context(
+        [cache],
+        [torch.tensor([1]), torch.tensor([2, 3])],
+        [3, 6],
+        nominal_length=16,
+        suffix_length=2,
+    )
+    assert context.block_table.dtype == torch.int32
+    # Prefix part padded to 4 blocks (nominal 16 / 4), then the row's 2 reserved pages right after its full blocks.
+    assert context.block_table.tolist() == [[100, 101, 0, 0, 0, 0], [2, 102, 103, 0, 0, 0]]
+    assert context.seqused.tolist() == [5, 8]
+    assert context.tail_source.tolist() == [1, 3]  # each row's partial last block
+    assert context.tail_target.tolist() == [100, 102]
+    # Row 0: tail of 3 tokens, so its 2 action tokens land at slot 3 of page 100 and slot 0 of page 101.
+    # Row 1: tail of 2 tokens, both action tokens fit in page 102 at slots 2 and 3.
+    # In the [2, blocks, 4, 1, 1] layout a token's K row is block * 4 + slot, its V row 8 * 4 further.
+    assert context.suffix_key_rows.tolist() == [403, 404, 410, 411]
+    assert context.suffix_value_rows.tolist() == [435, 436, 442, 443]
+    assert context.key_caches[0].data_ptr() == cache[0].data_ptr()
+    assert context.flat_caches[0].shape == (2 * 8 * 4, 1)
+    assert context.raw_caches[0] is cache
+    assert context.cu_seqlens_q.tolist() == [0, 2, 4]
+    assert context.layout.key_size == (8, 4, 1, 1) and context.layout.value_offset == 32
+
+    # A prefix ending on a block boundary relocates nothing (self copy) and starts the suffix at slot 0.
+    aligned = model._paged_prefix_context([cache], [torch.tensor([4, 5])], [8], nominal_length=16, suffix_length=2)
+    assert aligned.block_table.tolist() == [[4, 5, 100, 101, 0, 0]]
+    assert aligned.tail_source.tolist() == aligned.tail_target.tolist() == [100]
+    assert aligned.suffix_key_rows.tolist() == [400, 401]
+
+    # A prompt longer than the nominal length widens the table instead of truncating it.
+    wide = model._paged_prefix_context([cache], [torch.arange(1, 7)], [22], nominal_length=16, suffix_length=2)
+    assert wide.block_table.shape == (1, 8)
+    assert wide.block_table.tolist() == [[1, 2, 3, 4, 5, 100, 101, 0]]
+    assert wide.seqused.tolist() == [24]
+
+    # The FlashAttention rank-4 layout [blocks, kv_heads=1, block_size=4, 2*head_dim] reads the same.
+    fa_cache = torch.arange(8 * 1 * 4 * 2).reshape(8, 1, 4, 2).float()
+    fa_context = model._paged_prefix_context(
+        [fa_cache], [torch.tensor([1]), torch.tensor([2, 3])], [3, 6], nominal_length=16, suffix_length=2
+    )
+    assert fa_context.block_table.tolist() == context.block_table.tolist()
+    assert fa_context.key_caches[0].shape == (8, 4, 1, 1)
+    # Same tokens, addressed in that layout: row = 2 * (block * 4 + slot) for K, + 1 for V.
+    assert fa_context.suffix_key_rows.tolist() == [806, 808, 820, 822]
+    assert fa_context.suffix_value_rows.tolist() == [807, 809, 821, 823]
+
+    model._runner_reserved_blocks = (100, 3)
+    with pytest.raises(RuntimeError, match="reserved KV pages"):
+        model._paged_prefix_context(
+            [cache], [torch.tensor([1]), torch.tensor([2, 3])], [3, 6], nominal_length=16, suffix_length=2
+        )
+
+
+def _paged_graph_extras(steps: int = 2) -> list[dict]:
+    return [
+        {
+            "_sampling_seed": 5,
+            "diffusion_steps": steps,
+            "_manual_action_cudagraph": True,
+            "_static_expert_cache": True,
+            "_static_expert_cache_max_len": 16,
+            "_paged_expert_kv": True,
+        }
+    ]
+
+
+def _paged_test_model():
+    model = _cfg_test_model()
+    model.expert_attention_backend = alpamayo2_super_module.EXPERT_ATTENTION_BACKEND_FA3
+    model.expert.action_out_proj = _FakeProjection(dtype=torch.float32)  # matches the float32 test caches
+    model._runner_reserved_blocks = (100, 40)
+    return model
+
+
+def _forbid_prefix_copies(monkeypatch, model) -> None:
+    for name in ("_gather_prefix_cache_batch", "_gather_prefix_cache_into_static", "_make_static_action_cache"):
+        monkeypatch.setattr(model, name, lambda *_a, _name=name, **_k: pytest.fail(f"{_name} copies the prefix"))
+
+
+def test_super_paged_expert_kv_skips_every_prefix_copy_and_hands_the_graph_a_context(monkeypatch) -> None:
+    model = _paged_test_model()
+    captured: dict = {}
+
+    def fake_manual_graph(**kwargs):
+        captured.update(kwargs)
+        return kwargs["action"]
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_manual_graph)
+    _forbid_prefix_copies(monkeypatch, model)
+
+    result = model._sample_actions_batch(
+        caches=[_cfg_test_cache()],
+        block_tables=[torch.tensor([1, 2])],
+        seq_lens=[2],
+        positions=[torch.full((3, 1), 10)],
+        observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+        extra_args=_paged_graph_extras(),
+    )
+
+    assert captured["prefix"] is None
+    assert captured["attention_mask"] is None
+    paged = captured["paged"]
+    assert isinstance(paged, alpamayo2_super_module.PagedPrefixContext)
+    # block_size=1: a 16-wide prefix part (nominal length 16) plus 2 reserved pages for the 2 action tokens.
+    assert paged.block_table.shape == (1, 18)
+    assert paged.block_table[0, :4].tolist() == [1, 2, 100, 101]
+    assert paged.seqused.tolist() == [4]
+    # block_size 1, one head: the two action tokens are rows 100 and 101 of the K half.
+    assert paged.suffix_key_rows.tolist() == [100, 101] and paged.suffix_value_rows.tolist() == [108, 109]
+    assert captured["prefix_length"] == 2
+    assert result["actions"].shape == (1, 2, 1)
+    assert result["action_expert_attention_fa3"].tolist() == [0]  # float32 on CPU: kernel predicate is false here
+
+
+def test_super_paged_expert_kv_requires_the_fa3_backend() -> None:
+    model = _cfg_test_model()
+    model._runner_reserved_blocks = (100, 40)
+    with pytest.raises(RuntimeError, match="paged_expert_kv requires"):
+        model._sample_actions_batch(
+            caches=[_cfg_test_cache()],
+            block_tables=[torch.tensor([1, 2])],
+            seq_lens=[2],
+            positions=[torch.full((3, 1), 10)],
+            observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+            extra_args=_paged_graph_extras(),
+        )
+
+
+def test_super_paged_expert_kv_falls_back_to_the_dense_path_without_enough_reserved_pages(monkeypatch) -> None:
+    model = _paged_test_model()
+    model._runner_reserved_blocks = (100, 1)  # one page, the row needs two
+    captured: dict = {}
+
+    def fake_manual_graph(**kwargs):
+        captured.update(kwargs)
+        return kwargs["action"]
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_manual_graph)
+    records = _capture_logs(monkeypatch, "warning")
+    for _ in range(2):
+        model._sample_actions_batch(
+            caches=[_cfg_test_cache()],
+            block_tables=[torch.tensor([1, 2])],
+            seq_lens=[2],
+            positions=[torch.full((3, 1), 10)],
+            observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+            extra_args=_paged_graph_extras(),
+        )
+    assert captured["paged"] is None
+    assert isinstance(captured["prefix"], alpamayo2_super_module.DynamicCache)
+    assert captured["attention_mask"] is not None
+    warnings = [r for r in records if "paged_expert_kv not applicable" in r]
+    assert len(warnings) == 1  # reported once per reason, not per request
+    assert "reserved 1" in warnings[0]
+
+
+def test_super_paged_eager_loop_runs_the_expert_inside_the_paged_scope(monkeypatch) -> None:
+    module = alpamayo2_super_module
+    model = _paged_test_model()
+    seen: list[dict] = []
+    relocations: list[int] = []
+
+    class _SuffixCache(module.StaticCache):
+        def __init__(self, *, config, max_cache_len):  # noqa: D107 - stand-in, skips the HF constructor
+            self.suffix_capacity = max_cache_len
+            self.layers = [SimpleNamespace(cumulative_length=torch.tensor([max_cache_len]))]
+
+    class _ScopedExpert:
+        def __call__(self, *, inputs_embeds, past_key_values, attention_mask, cache_position, **_kwargs):
+            seen.append(
+                {
+                    "context": module._ACTIVE_PAGED_PREFIX,
+                    "cache": past_key_values,
+                    "mask": attention_mask,
+                    "cache_position": cache_position.tolist(),
+                }
+            )
+            return SimpleNamespace(last_hidden_state=torch.zeros(inputs_embeds.shape[0], inputs_embeds.shape[1], 1))
+
+    monkeypatch.setattr(module, "SuffixPassthroughCache", _SuffixCache)
+    monkeypatch.setattr(
+        module.PagedPrefixContext, "relocate_tails", lambda self: relocations.append(len(self.raw_caches))
+    )
+    model.expert.expert = _ScopedExpert()
+    _forbid_prefix_copies(monkeypatch, model)
+
+    extras = [dict(_paged_graph_extras()[0], _manual_action_cudagraph=False)]
+    model._sample_actions_batch(
+        caches=[_cfg_test_cache()],
+        block_tables=[torch.tensor([1, 2, 3])],
+        seq_lens=[3],
+        positions=[torch.full((3, 1), 10)],
+        observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+        extra_args=extras,
+    )
+
+    assert relocations == [1]  # once per request, before the flow-matching loop
+    assert len(seen) == 2
+    assert all(isinstance(call["context"], module.PagedPrefixContext) for call in seen)
+    assert seen[0]["context"].seqused.tolist() == [5]
+    assert all(call["mask"] is None for call in seen)
+    assert all(call["cache_position"] == [0, 1] for call in seen)
+    cache = seen[0]["cache"]
+    assert isinstance(cache, _SuffixCache) and cache.suffix_capacity == 2
+    # The write cursor is rewound to the start of the suffix cache after each step.
+    assert cache.layers[0].cumulative_length.tolist() == [0]
+    assert module._ACTIVE_PAGED_PREFIX is None
+
+
+def test_super_paged_graph_key_includes_the_page_table_width() -> None:
+    common = dict(
+        action_shape=(1, 2, 1),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 1, 2),
+        attention_mask_shape=(),
+        inference_steps=2,
+    )
+    key_fn = Alpamayo2SuperForConditionalGeneration._action_graph_key
+    assert key_fn(**common, paged_blocks=300) != key_fn(**common, paged_blocks=301)
+    assert key_fn(**common, paged_blocks=300) == key_fn(**common, paged_blocks=300)
+    assert key_fn(**common) == key_fn(**common, paged_blocks=0)
+
+
+def test_super_paged_graph_state_holds_a_suffix_only_cache(monkeypatch) -> None:
+    """Creating a paged graph state needs no dense prefix and clones the index tensors for replay."""
+    module = alpamayo2_super_module
+    model = _cfg_test_model()
+    model._action_graphs = {}
+    built: list[int] = []
+
+    class _SuffixCache:
+        def __init__(self, *, config, max_cache_len):
+            built.append(max_cache_len)
+            self.max_cache_len = max_cache_len
+            self.layers = [SimpleNamespace(cumulative_length=torch.tensor([0]))]
+
+    monkeypatch.setattr(module, "SuffixPassthroughCache", _SuffixCache)
+    monkeypatch.setattr(
+        model, "_make_static_action_cache", lambda *_a, **_k: pytest.fail("paged graphs never gather a prefix")
+    )
+    # torch.cuda graph capture is unavailable on CPU; stop right after the state is built.
+    stop = RuntimeError("stop-after-state")
+    monkeypatch.setattr(module.torch.cuda, "Stream", lambda *a, **k: (_ for _ in ()).throw(stop))
+    context = _paged_test_context(rows=1, max_blocks=3)
+
+    with pytest.raises(RuntimeError, match="stop-after-state"):
+        model._run_manual_action_graph(
+            expert=model.expert.expert,
+            prefix=None,
+            prefix_length=5,
+            action=torch.zeros(1, 2, 1),
+            expert_positions=torch.zeros(3, 1, 2, dtype=torch.long),
+            attention_mask=None,
+            inference_steps=2,
+            suffix_length=2,
+            static_cache_max_len=16,
+            paged=context,
+        )
+    # The state is only registered after capture; the cache built for it holds
+    # just the action tokens, never the prefix.
+    assert model._action_graphs == {}
+    assert built == [2]
+
+
+def test_paged_context_clone_and_copy_keep_the_graph_inputs_at_fixed_addresses() -> None:
+    source = _paged_test_context(rows=1, max_blocks=3)
+    source.block_table.fill_(7)
+    source.suffix_value_rows.fill_(3)
+    cloned = source.clone_indices()
+    assert cloned.key_caches is source.key_caches and cloned.raw_caches is source.raw_caches
+    assert cloned.block_table.data_ptr() != source.block_table.data_ptr()
+    fresh = _paged_test_context(rows=1, max_blocks=3)
+    fresh.block_table.fill_(9)
+    fresh.tail_source.fill_(2)
+    before = cloned.block_table.data_ptr()
+    cloned.copy_indices_from(fresh)
+    assert cloned.block_table.data_ptr() == before
+    assert cloned.block_table.eq(9).all() and cloned.tail_source.tolist() == [2]
+    assert cloned.suffix_value_rows.tolist() == fresh.suffix_value_rows.tolist()
+    assert cloned.layout is source.layout
