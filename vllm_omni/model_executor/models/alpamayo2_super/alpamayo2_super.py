@@ -1170,6 +1170,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         inference_steps: int,
         suffix_length: int,
         static_cache_max_len: int | None,
+        guidance_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replay the fixed-shape ten-step expert integration in one graph.
 
@@ -1177,8 +1178,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         It is ``None`` when ``_sample_actions_batch`` already gathered the paged
         prefix straight into that cache, which requires the graph state for
         this shape to exist.
+
+        With ``guidance_weight`` (navigation CFG) the cache, positions and mask
+        hold two rows per sample, guided first then the unguided twins; every
+        step denoises the same action through both rows and blends the two
+        velocities as ``(1 - w) * v_unguided + w * v_guided`` inside the
+        captured body, with ``w`` a device scalar copied in per replay.
         """
 
+        nav_cfg = guidance_weight is not None
         key = self._action_graph_key(
             action_shape=tuple(action.shape),
             action_dtype=action.dtype,
@@ -1186,6 +1194,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             positions_shape=tuple(expert_positions.shape),
             attention_mask_shape=tuple(attention_mask.shape),
             inference_steps=inference_steps,
+            nav_cfg=nav_cfg,
         )
         state = self._action_graphs.get(key)
         if state is None:
@@ -1207,7 +1216,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     device=action.device,
                     dtype=torch.long,
                 ),
+                "guidance_weight": guidance_weight.clone() if nav_cfg else None,
             }
+            sample_count = action.shape[0]
 
             def graph_body() -> torch.Tensor:
                 graph_action = state["action"]
@@ -1216,11 +1227,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         (graph_action.shape[0],) + (1,) * (graph_action.ndim - 1),
                         step / inference_steps,
                     )
+                    step_action, step_timestep = graph_action, timestep
+                    if nav_cfg:
+                        # Guided and unguided rows denoise the same action x.
+                        step_action = torch.cat([graph_action, graph_action], dim=0)
+                        step_timestep = torch.cat([timestep, timestep], dim=0)
                     with torch.autocast(
                         device_type="cuda",
                         dtype=self.expert.action_out_proj.weight.dtype,
                     ):
-                        embeddings = self.expert.action_in_proj(graph_action, timestep)
+                        embeddings = self.expert.action_in_proj(step_action, step_timestep)
                     output = expert(
                         inputs_embeds=embeddings.to(self.expert.action_out_proj.weight.dtype),
                         position_ids=state["positions"],
@@ -1235,7 +1251,11 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         state["cache_position"][0],
                     )
                     velocity = self.expert.action_out_proj(output.last_hidden_state[:, -suffix_length:])
-                    graph_action = graph_action + velocity.float().view_as(graph_action) / inference_steps
+                    velocity = velocity.float().view(step_action.shape[0], *graph_action.shape[1:])
+                    if nav_cfg:
+                        weight = state["guidance_weight"]
+                        velocity = (1.0 - weight) * velocity[sample_count:] + weight * velocity[:sample_count]
+                    graph_action = graph_action + velocity / inference_steps
                 return graph_action
 
             warmup_stream = torch.cuda.Stream()
@@ -1266,6 +1286,8 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 dtype=torch.long,
             )
         )
+        if nav_cfg:
+            state["guidance_weight"].copy_(guidance_weight)
         if prefix is not None:
             self._copy_action_prefix(state["cache"], prefix, prefix_length)
         state["graph"].replay()
@@ -1280,12 +1302,15 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         positions_shape: tuple[int, ...],
         attention_mask_shape: tuple[int, ...],
         inference_steps: int,
+        nav_cfg: bool = False,
     ) -> tuple[Any, ...]:
         """Identify one captured action graph by the shapes it was traced with.
 
         ``_sample_actions_batch`` derives the same key from the planned shapes
         before any expert tensor exists, so a known shape can gather its paged
-        prefix directly into the graph's StaticCache.
+        prefix directly into the graph's StaticCache. ``nav_cfg`` separates the
+        CFG body (two cache rows per action row, blended velocities) from a
+        guided-only body with the same tensor shapes.
         """
         return (
             tuple(action_shape),
@@ -1294,6 +1319,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tuple(positions_shape),
             tuple(attention_mask_shape),
             int(inference_steps),
+            bool(nav_cfg),
         )
 
     def _sample_actions_batch(
@@ -1385,16 +1411,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
-        if nav_cfg:
-            # The captured graph replays a fixed guided-only integration, and
-            # CFG doubles the prefix rows and combines two velocities per step,
-            # so navigation takes the eager loop below. It keeps the StaticCache
-            # when one is configured: the compiled expert is traced with static
-            # shapes, and a DynamicCache sized to each prompt made every new
-            # prompt length a recompile (about two minutes per length on H100)
-            # before the recompile limit turned the rest into eager layers. A
-            # StaticCache of the configured length gives one shape per K.
-            manual_action_cudagraph = False
+        # Navigation CFG doubles the cache rows (guided plus unguided twins) and
+        # blends two velocities per step; the captured graph carries that body
+        # too (keyed separately), so navigation replays a graph like guided-only
+        # requests do. It also keeps the StaticCache: the compiled expert is
+        # traced with static shapes, and a DynamicCache sized to each prompt
+        # made every new prompt length a recompile (about two minutes per
+        # length on H100).
         if static_expert_cache and static_cache_max_len is not None:
             # The configured length is the reusable latency profile, not a
             # hard request limit. Longer prompts remain correct and simply
@@ -1413,7 +1436,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if manual_action_cudagraph and static_expert_cache:
             graph_state = self._action_graphs.get(
                 self._action_graph_key(
-                    action_shape=(row_count, *action_dims),
+                    action_shape=(sample_count, *action_dims),
                     action_dtype=torch.float32,
                     device=device,
                     positions_shape=(3, row_count, suffix_length),
@@ -1424,6 +1447,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         static_cache_max_len if static_cache_max_len is not None else prefix_len + suffix_length,
                     ),
                     inference_steps=inference_steps,
+                    nav_cfg=nav_cfg,
                 )
             )
         if graph_state is not None:
@@ -1507,6 +1531,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 inference_steps=inference_steps,
                 suffix_length=suffix_length,
                 static_cache_max_len=static_cache_max_len,
+                guidance_weight=(
+                    torch.tensor(guidance_weight, device=device, dtype=torch.float32) if nav_cfg else None
+                ),
             )
         else:
             assert expert_cache is not None, "eager expert modes require a dense DynamicCache prefix"

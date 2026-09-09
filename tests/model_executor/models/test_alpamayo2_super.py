@@ -2040,39 +2040,20 @@ def test_super_nav_cfg_with_unit_weight_matches_guided_only_run() -> None:
     assert unit_weight["nav_cfg_applied"].item() is True
 
 
-def test_super_nav_cfg_disables_manual_graph_but_keeps_static_cache(monkeypatch) -> None:
+def test_super_nav_cfg_replays_a_blended_graph_over_two_rows_per_sample(monkeypatch) -> None:
     model = _cfg_test_model()
+    graph_calls: list[dict] = []
+
+    def fake_graph(**kwargs):
+        graph_calls.append(kwargs)
+        return torch.zeros_like(kwargs["action"])
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_graph)
     monkeypatch.setattr(
         model,
-        "_run_manual_action_graph",
-        lambda **_kwargs: pytest.fail("CFG must not take the captured graph path"),
+        "_make_static_action_cache",
+        lambda *_args, **_kwargs: pytest.fail("the graph runner owns the StaticCache for CFG"),
     )
-    # CFG keeps the configured StaticCache (one static shape per K for the
-    # compiled expert) and only leaves the captured-graph path.
-    static_calls: list[dict] = []
-
-    def fake_make_static(prefix, *, suffix_length, max_cache_len):
-        # The test model has no HF config, so stand in for the StaticCache with
-        # the same layout: right-padded prefix rows plus room for the suffix.
-        from transformers import StaticCache
-
-        static_calls.append({"suffix_length": suffix_length, "max_cache_len": max_cache_len})
-        fake = object.__new__(StaticCache)
-        layers = []
-        for layer in prefix.layers:
-            total = max_cache_len if max_cache_len is not None else layer.keys.shape[2] + suffix_length
-            pad = total - layer.keys.shape[2]
-            layers.append(
-                SimpleNamespace(
-                    keys=torch.nn.functional.pad(layer.keys, (0, 0, 0, pad)),
-                    values=torch.nn.functional.pad(layer.values, (0, 0, 0, pad)),
-                    cumulative_length=torch.tensor(layer.keys.shape[2]),
-                )
-            )
-        fake.layers = layers
-        return fake
-
-    monkeypatch.setattr(model, "_make_static_action_cache", fake_make_static)
     observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
     extras = [
         {
@@ -2098,7 +2079,16 @@ def test_super_nav_cfg_disables_manual_graph_but_keeps_static_cache(monkeypatch)
     )
 
     assert result["nav_cfg_applied"].item() is True
-    assert static_calls == [{"suffix_length": 2, "max_cache_len": 16}]
+    assert len(graph_calls) == 1
+    call = graph_calls[0]
+    # One action row per sample; cache rows, positions and mask carry the
+    # guided row and its unguided twin; the blend weight rides along as a
+    # device scalar so the captured body can combine the two velocities.
+    assert call["action"].shape[0] == 1
+    assert call["expert_positions"].shape[1] == 2
+    assert call["attention_mask"].shape[0] == 2
+    assert call["guidance_weight"] is not None and float(call["guidance_weight"]) == 2.0
+    assert call["static_cache_max_len"] == 16
     with pytest.raises(ValueError, match="one unguided prefix per guided sample"):
         model._sample_actions_batch(
             caches=[_cfg_test_cache()],
