@@ -72,19 +72,25 @@ def expert_fa3_supports(
 ) -> bool:
     """Return whether one expert invocation may take the FA3 kernel path.
 
-    The validated FA3 shape is a single prefix row (the varlen call carries one
-    device-side sequence length), non-causal, dropout-free half precision on
-    CUDA, with query heads that repeat the KV heads evenly. Anything else keeps
-    the previously validated SDPA behavior.
+    Non-causal, dropout-free half precision on CUDA, with query heads that
+    repeat the KV heads evenly. One prefix row takes the validated single varlen
+    call; several rows (navigation guidance pairs a guided row with its unguided
+    twin) take the two-segment paged call, provided the caller can hand over
+    per-row prefix lengths. Anything else keeps the SDPA behavior.
     """
     return (
-        int(batch_rows) == 1
+        int(batch_rows) >= 1
         and device_type == "cuda"
         and dtype in (torch.float16, torch.bfloat16)
         and not is_causal
         and float(dropout) == 0.0
         and bool(gqa_divisible)
     )
+
+
+# Page size of the paged FA3 call used for multi-row batches; FA3 requires the
+# page size to be a multiple of 256, so the allocated key length must be too.
+EXPERT_FA3_PAGE_SIZE = 256
 
 
 def _expert_fa3_attention_impl(
@@ -141,7 +147,122 @@ def _expert_fa3_attention_fake(
     return query.new_empty((1, query.shape[2], query.shape[1], query.shape[-1]))
 
 
-# CUDA-only: eligibility (device, dtype, one row, non-causal) is decided by
+def _expert_fa3_attention_rows_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Multi-row expert attention over right-padded prefixes plus a shared suffix.
+
+    ``key``/``value`` are ``(rows, kv_heads, allocated, head_dim)`` cache
+    tensors in which row ``r`` holds its valid prefix in ``[0, prefix_lengths[r])``
+    and the current action tokens at ``suffix_positions`` (the same positions
+    for every row), with padding in between and after. FA3's varlen kernel
+    wants each sequence contiguous, so the attention is computed as two
+    segments and merged exactly through the returned log-sum-exps: the prefix
+    segment runs the paged kernel over the rows' page-aligned layout with
+    ``seqused_k`` cutting each row at its own prefix length, and the suffix
+    segment gathers the shared action positions. No prefix copy: the only data
+    movement is the head/sequence transpose FA3 needs (also present in the
+    single-row path) and the gather of the suffix tokens. Returns
+    ``(rows, query_length, query_heads, head_dim)``.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    rows, query_heads, query_length, head_dim = query.shape
+    kv_heads, allocated = key.shape[1], key.shape[2]
+    pages = allocated // EXPERT_FA3_PAGE_SIZE
+    device = query.device
+    q = query.transpose(1, 2).reshape(rows * query_length, query_heads, head_dim)
+    cu_seqlens_q = torch.arange(0, rows * query_length + 1, query_length, device=device, dtype=torch.int32)
+    # Prefix segment: the cache rows are already page-aligned once heads and
+    # sequence are swapped; page p of row r is block r * pages + p.
+    paged_key = key.transpose(1, 2).reshape(rows * pages, EXPERT_FA3_PAGE_SIZE, kv_heads, head_dim)
+    paged_value = value.transpose(1, 2).reshape(rows * pages, EXPERT_FA3_PAGE_SIZE, kv_heads, head_dim)
+    block_table = (
+        torch.arange(rows, device=device, dtype=torch.int32)[:, None] * pages
+        + torch.arange(pages, device=device, dtype=torch.int32)[None, :]
+    )
+    prefix_out, prefix_lse = flash_attn_varlen_func(
+        q,
+        paged_key,
+        paged_value,
+        query_length,
+        cu_seqlens_q,
+        allocated,
+        cu_seqlens_k=None,
+        seqused_k=prefix_lengths.to(dtype=torch.int32),
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+        return_softmax_lse=True,
+    )
+    # Suffix segment: the action tokens of every row, gathered to a contiguous
+    # varlen layout.
+    suffix_key = key.index_select(2, suffix_positions).transpose(1, 2).reshape(rows * query_length, kv_heads, head_dim)
+    suffix_value = (
+        value.index_select(2, suffix_positions).transpose(1, 2).reshape(rows * query_length, kv_heads, head_dim)
+    )
+    suffix_out, suffix_lse = flash_attn_varlen_func(
+        q,
+        suffix_key,
+        suffix_value,
+        query_length,
+        cu_seqlens_q,
+        query_length,
+        cu_seqlens_k=cu_seqlens_q,
+        softmax_scale=softmax_scale,
+        causal=False,
+        fa_version=3,
+        return_softmax_lse=True,
+    )
+    # Exact merge of the two softmax partitions: lse is (query_heads, total_q).
+    prefix_lse = prefix_lse.transpose(0, 1).unsqueeze(-1)
+    suffix_lse = suffix_lse.transpose(0, 1).unsqueeze(-1)
+    peak = torch.maximum(prefix_lse, suffix_lse)
+    prefix_weight = torch.exp(prefix_lse - peak)
+    suffix_weight = torch.exp(suffix_lse - peak)
+    merged = (prefix_out.float() * prefix_weight + suffix_out.float() * suffix_weight) / (prefix_weight + suffix_weight)
+    return merged.to(query.dtype).view(rows, query_length, query_heads, head_dim)
+
+
+def _expert_fa3_attention_rows_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return query.new_empty((query.shape[0], query.shape[2], query.shape[1], query.shape[-1]))
+
+
+expert_fa3_attention_rows = torch.library.custom_op(
+    "alpamayo2_super::expert_fa3_attention_rows",
+    mutates_args=(),
+    device_types="cuda",
+)(_expert_fa3_attention_rows_impl)
+expert_fa3_attention_rows.register_fake(_expert_fa3_attention_rows_fake)
+
+
+def expert_row_prefix_lengths(attention_mask: torch.Tensor, query_length: int) -> torch.Tensor:
+    """Per-row valid prefix lengths from the expert's additive attention mask.
+
+    The mask is ``(rows, 1, query_length, allocated)`` with zeros at attendable
+    positions: each row's right-padded prefix plus the ``query_length`` action
+    positions shared by all rows. Counting the zeros of one query row and
+    removing the action positions yields the prefix length on the device, so
+    the compiled expert traces this without a host synchronization.
+    """
+    attendable = (attention_mask[:, 0, 0, :] == 0).sum(dim=-1)
+    return (attendable - query_length).to(dtype=torch.int32)
+
+
+# CUDA-only: eligibility (device, dtype, non-causal) is decided by
 # ``expert_fa3_supports`` in eager Python before the op is reached.
 expert_fa3_attention = torch.library.custom_op(
     "alpamayo2_super::expert_fa3_attention",
@@ -213,6 +334,37 @@ def alpamayo_flash_attention_3_forward(
     query_length = query.shape[2]
     allocated_key_length = key.shape[2]
     cache_position = kwargs.get("cache_position")
+    softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
+    if query.shape[0] > 1:
+        multi_row_ready = (
+            attention_mask is not None
+            and cache_position is not None
+            and allocated_key_length % EXPERT_FA3_PAGE_SIZE == 0
+            and attention_mask.shape[0] == query.shape[0]
+            and attention_mask.shape[-1] == allocated_key_length
+        )
+        if not multi_row_ready:
+            return sdpa_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                is_causal=is_causal,
+                **kwargs,
+            )
+        output = expert_fa3_attention_rows(
+            query,
+            key,
+            value,
+            expert_row_prefix_lengths(attention_mask, query_length),
+            cache_position.reshape(-1),
+            softmax_scale,
+        )
+        return output, None
+
     if cache_position is None:
         valid_key_length = torch.scalar_tensor(
             allocated_key_length,
@@ -223,7 +375,6 @@ def alpamayo_flash_attention_3_forward(
         valid_key_length = cache_position.reshape(-1)[-1].to(dtype=torch.int32) + 1
     cu_seqlens_q = torch.stack((valid_key_length.new_zeros(()), valid_key_length.new_full((), query_length)))
     cu_seqlens_k = torch.stack((valid_key_length.new_zeros(()), valid_key_length))
-    softmax_scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
     output = expert_fa3_attention(
         query,
         key,
@@ -1449,13 +1600,22 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             dtype=torch.int32,
         )
         # Whether this invocation ran the expert's attention through FA3. The
-        # same predicate gates the kernel, so CFG (two prefix rows) and any
-        # other unsupported shape report 0 even when FA3 is configured.
-        fa3_used = self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3 and expert_fa3_supports(
+        # same predicate gates the kernel; several rows (CFG) additionally need
+        # the page-aligned StaticCache that the two-segment paged call requires,
+        # otherwise the attention wrapper falls back to SDPA and this reports 0.
+        multi_row_fa3_layout = row_count == 1 or (
+            static_expert_cache
+            and static_cache_max_len is not None
+            and static_cache_max_len % EXPERT_FA3_PAGE_SIZE == 0
+        )
+        fa3_supported = expert_fa3_supports(
             batch_rows=row_count,
             dtype=weight_dtype,
             device_type=device.type,
             is_causal=not bool(self.expert.config.expert_non_causal_attention),
+        )
+        fa3_used = (
+            self.expert_attention_backend == EXPERT_ATTENTION_BACKEND_FA3 and multi_row_fa3_layout and fa3_supported
         )
         result["action_expert_attention_fa3"] = torch.full(
             (sample_count,),
