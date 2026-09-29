@@ -1048,6 +1048,10 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # where they are.
         self._paged_expert_kv_enabled = bool(policy_config.get("paged_expert_kv", False))
         self._paged_expert_kv_rows = int(policy_config.get("paged_expert_kv_rows", 8))
+        # Pad page indices, not KV storage, to the engine context capacity.
+        # Prompt-dependent widths otherwise create new Dynamo/CUDA graphs.
+        # Action tokens use separately reserved pages below.
+        self._paged_expert_prefix_capacity = int(vllm_config.model_config.max_model_len)
         self._runner_reserved_blocks: tuple[int, int] = (0, 0)
         self._paged_expert_kv_fallbacks: set[str] = set()
         self.expert = ExpertModel(
@@ -1055,6 +1059,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             dtype=vllm_config.model_config.dtype,
         )
         self._compiled_expert: nn.Module | None = None
+        self._dense_expert_eager_warning_emitted = False
         self._action_graphs: dict[tuple[Any, ...], dict[str, Any]] = {}
         # -1 unknown, 0 uniform-decode steps seen only outside a FULL CUDA
         # graph, 1 a FULL-mode uniform-decode forward was observed (capture).
@@ -1906,6 +1911,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         static_cache_max_len_value = first_extra.get("_static_expert_cache_max_len")
         static_cache_max_len = int(static_cache_max_len_value) if static_cache_max_len_value is not None else None
         manual_action_cudagraph = bool(first_extra.get("_manual_action_cudagraph", False))
+        compile_expert = bool(first_extra.get("_compile_expert", False))
         static_expert_cache = bool(first_extra.get("_static_expert_cache", manual_action_cudagraph))
         # Paged expert KV: the expert attends to the VLM prefix in the engine's
         # paged cache through FA3's paged call and keeps only its own action
@@ -1923,14 +1929,27 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # traced with static shapes, and a DynamicCache sized to each prompt
         # made every new prompt length a recompile (about two minutes per
         # length on H100).
-        if static_expert_cache and static_cache_max_len is not None:
-            # The configured length is the reusable latency profile, not a
-            # hard request limit. Longer prompts remain correct and simply
-            # create a second graph shape.
-            static_cache_max_len = max(
-                static_cache_max_len,
-                prefix_len + suffix_length,
+        if not paged_expert_kv and (compile_expert or manual_action_cudagraph):
+            bounded_dense_shape = (
+                static_expert_cache
+                and static_cache_max_len is not None
+                and prefix_len + suffix_length <= static_cache_max_len
             )
+            if not bounded_dense_shape:
+                # Preserve the warmed dense graph. Unusual valid prefixes use
+                # eager inference instead of growing compiled shapes and their
+                # retained caches until Dynamo's recompile limit kills the engine.
+                compile_expert = False
+                manual_action_cudagraph = False
+                static_expert_cache = False
+                if not self._dense_expert_eager_warning_emitted:
+                    logger.warning(
+                        "Action expert using eager execution for a dense prefix outside the configured "
+                        "static capacity; warmed graph and prefix caching remain enabled"
+                    )
+                    self._dense_expert_eager_warning_emitted = True
+        if static_expert_cache and static_cache_max_len is not None and not paged_expert_kv:
+            static_cache_max_len = max(static_cache_max_len, prefix_len + suffix_length)
 
         # Materialize the VLM prefix. Once the manual graph for this shape
         # exists, the paged blocks are gathered straight into its StaticCache;
@@ -1940,11 +1959,16 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         graph_state: dict[str, Any] | None = None
         paged_context: PagedPrefixContext | None = None
         if paged_expert_kv:
+            if prefix_len > self._paged_expert_prefix_capacity:
+                raise ValueError(
+                    f"Expert prefix length {prefix_len} exceeds engine context capacity "
+                    f"{self._paged_expert_prefix_capacity}"
+                )
             paged_context = self._paged_prefix_context(
                 caches,
                 all_block_tables,
                 all_seq_lens,
-                nominal_length=(static_cache_max_len or (prefix_len + suffix_length)),
+                nominal_length=self._paged_expert_prefix_capacity,
                 suffix_length=suffix_length,
             )
         elif manual_action_cudagraph and static_expert_cache:
@@ -2037,7 +2061,7 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         record_profile_event()
 
         expert = self.expert.expert
-        if bool(first_extra.get("_compile_expert", False)):
+        if compile_expert:
             if self._compiled_expert is None:
                 self._compiled_expert = compile_action_expert(self.expert.expert)
             expert = self._compiled_expert

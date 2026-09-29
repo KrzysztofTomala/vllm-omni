@@ -847,6 +847,7 @@ def _minimal_policy_model() -> Alpamayo2SuperForConditionalGeneration:
     model._logits_index_slot = 0
     model._text_eos_token_ids_device = None
     model._compiled_expert = None
+    model._dense_expert_eager_warning_emitted = False
     model._action_graphs = {}
     model.expert_attention_backend_requested = "sdpa"
     model.expert_attention_backend = "sdpa"
@@ -2240,6 +2241,76 @@ def test_super_manual_graph_requires_dense_prefix_for_new_state() -> None:
         )
 
 
+@pytest.mark.parametrize("with_twins", [False, True])
+@pytest.mark.parametrize("capacity,static_cache", [(16, True), (None, True), (16, False)])
+def test_super_unbounded_dense_shapes_use_eager_with_matching_outputs(
+    monkeypatch, with_twins, capacity, static_cache
+) -> None:
+    model = _cfg_test_model()
+    reference = _cfg_test_model()
+    cached_expert = object()
+    model._compiled_expert = cached_expert
+    retained_graphs = {("retained",): object()}
+    model._action_graphs = retained_graphs.copy()
+    monkeypatch.setattr(
+        alpamayo2_super_module, "compile_action_expert", lambda *a: pytest.fail("compiled an unbounded dense shape")
+    )
+    monkeypatch.setattr(model, "_run_manual_action_graph", lambda **k: pytest.fail("captured an unbounded dense shape"))
+    monkeypatch.setattr(
+        model, "_make_static_action_cache", lambda *a, **k: pytest.fail("allocated an oversized static cache")
+    )
+    cache = torch.arange(128, dtype=torch.float32).reshape(1, 128, 1, 1, 1).repeat(2, 1, 1, 1, 1)
+    for length in range(15, 41):
+        extra = _manual_graph_extras()[0]
+        extra.update(_compile_expert=True, _static_expert_cache=static_cache)
+        if capacity is None:
+            del extra["_static_expert_cache_max_len"]
+        else:
+            extra["_static_expert_cache_max_len"] = capacity
+        kwargs = dict(
+            caches=[cache],
+            block_tables=[torch.arange(length)],
+            seq_lens=[length],
+            positions=[torch.full((3, 1), length)],
+            observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+        )
+        if with_twins:
+            extra["_nav_guidance_weight"] = 2.0
+            kwargs.update(
+                unguided_block_tables=[torch.arange(3)],
+                unguided_seq_lens=[3],
+                unguided_positions=[torch.full((3, 1), 3)],
+            )
+        actual = model._sample_actions_batch(**kwargs, extra_args=[extra])
+        eager_extra = dict(extra, _compile_expert=False, _manual_action_cudagraph=False, _static_expert_cache=False)
+        expected = reference._sample_actions_batch(**kwargs, extra_args=[eager_extra])
+        torch.testing.assert_close(actual["normalized_controls"], expected["normalized_controls"], rtol=0, atol=0)
+    assert model._compiled_expert is cached_expert
+    assert model._action_graphs == retained_graphs
+    assert model._dense_expert_eager_warning_emitted is True
+
+
+def test_super_dense_eager_fallback_preserves_warmed_graph_replay(monkeypatch) -> None:
+    model = _cfg_test_model()
+    state = _fake_action_graph_state()
+    key = model._action_graph_key(
+        action_shape=(1, 2, 1),
+        action_dtype=torch.float32,
+        device=torch.device("cpu"),
+        positions_shape=(3, 1, 2),
+        attention_mask_shape=(1, 1, 2, 16),
+        inference_steps=2,
+    )
+    model._action_graphs = {key: state}
+    # Repeated physical blocks are sufficient for this numerical CPU fixture.
+    _run_manual_graph_sample(model, torch.ones(17, dtype=torch.long), 17)
+    assert state["replays"] == []
+    result = _run_manual_graph_sample(model, torch.tensor([1, 2]), 2)
+    assert state["replays"] == [1]
+    assert model._action_graphs == {key: state}
+    torch.testing.assert_close(result["normalized_controls"], state["output"])
+
+
 def test_super_manual_graph_state_lookup_matches_traced_key() -> None:
     """The planned-shape key used before gathering equals the key traced from real tensors."""
     action = torch.zeros(3, 2, 1)
@@ -2274,8 +2345,10 @@ def test_super_sample_actions_compiles_expert_once_through_helper(monkeypatch) -
         return expert
 
     monkeypatch.setattr(alpamayo2_super_module, "compile_action_expert", fake_compile)
+    monkeypatch.setattr(model, "_run_manual_action_graph", lambda **kwargs: kwargs["action"])
     observations = [{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}]
-    extras = [{"_sampling_seed": 1, "diffusion_steps": 2, "_compile_expert": True}]
+    extras = _manual_graph_extras()
+    extras[0]["_compile_expert"] = True
     kwargs = dict(
         caches=[_cfg_test_cache()],
         block_tables=[torch.tensor([1])],
@@ -3041,6 +3114,7 @@ def _paged_graph_extras(steps: int = 2) -> list[dict]:
 
 def _paged_test_model():
     model = _cfg_test_model()
+    model._paged_expert_prefix_capacity = 16
     model.expert_attention_backend = alpamayo2_super_module.EXPERT_ATTENTION_BACKEND_FA3
     model.expert.action_out_proj = _FakeProjection(dtype=torch.float32)  # matches the float32 test caches
     model._runner_reserved_blocks = (100, 40)
@@ -3050,6 +3124,74 @@ def _paged_test_model():
 def _forbid_prefix_copies(monkeypatch, model) -> None:
     for name in ("_gather_prefix_cache_batch", "_gather_prefix_cache_into_static", "_make_static_action_cache"):
         monkeypatch.setattr(model, name, lambda *_a, _name=name, **_k: pytest.fail(f"{_name} copies the prefix"))
+
+
+@pytest.mark.parametrize("with_twins", [False, True])
+def test_super_paged_prompt_lengths_reuse_one_graph_shape(monkeypatch, with_twins) -> None:
+    model = _paged_test_model()
+    model._paged_expert_prefix_capacity = 64
+    _forbid_prefix_copies(monkeypatch, model)
+    graph_keys = set()
+    captured = {}
+
+    def fake_manual_graph(**kwargs):
+        captured.update(kwargs)
+        graph_keys.add(
+            model._action_graph_key(
+                action_shape=tuple(kwargs["action"].shape),
+                action_dtype=kwargs["action"].dtype,
+                device=kwargs["action"].device,
+                positions_shape=tuple(kwargs["expert_positions"].shape),
+                attention_mask_shape=(),
+                inference_steps=kwargs["inference_steps"],
+                nav_cfg=kwargs["guidance_weight"] is not None,
+                paged_blocks=kwargs["paged"].block_table.shape[1],
+            )
+        )
+        return kwargs["action"]
+
+    monkeypatch.setattr(model, "_run_manual_action_graph", fake_manual_graph)
+    cache = torch.zeros(2, 140, 1, 1, 1)
+    for length in range(1, 65):
+        extras = _paged_graph_extras()
+        kwargs = {}
+        if with_twins:
+            extras[0]["_nav_guidance_weight"] = 2.0
+            kwargs.update(
+                unguided_block_tables=[torch.arange(3)],
+                unguided_seq_lens=[3],
+                unguided_positions=[torch.full((3, 1), 3)],
+            )
+        model._sample_actions_batch(
+            caches=[cache],
+            block_tables=[torch.arange(length)],
+            seq_lens=[length],
+            positions=[torch.full((3, 1), length)],
+            observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+            extra_args=extras,
+            **kwargs,
+        )
+        context = captured["paged"]
+        assert context.block_table.shape == (2 if with_twins else 1, 66)
+        assert context.seqused.tolist() == ([length + 2, 5] if with_twins else [length + 2])
+        assert context.block_table[0, :length].tolist() == list(range(length))
+        assert context.block_table[0, length : length + 2].tolist() == [100, 101]
+    assert len(graph_keys) == 1
+
+
+def test_super_paged_prefix_beyond_engine_capacity_is_rejected(monkeypatch) -> None:
+    model = _paged_test_model()
+    _forbid_prefix_copies(monkeypatch, model)
+    monkeypatch.setattr(model, "_paged_prefix_context", lambda *a, **k: pytest.fail("allocated invalid prefix"))
+    with pytest.raises(ValueError, match="exceeds engine context capacity 16"):
+        model._sample_actions_batch(
+            caches=[_cfg_test_cache()],
+            block_tables=[torch.arange(17)],
+            seq_lens=[17],
+            positions=[torch.full((3, 1), 17)],
+            observations=[{"ego_history_xyz": torch.zeros(4, 3), "ego_history_rot": torch.zeros(4, 3, 3)}],
+            extra_args=_paged_graph_extras(),
+        )
 
 
 def test_super_paged_expert_kv_skips_every_prefix_copy_and_hands_the_graph_a_context(monkeypatch) -> None:
