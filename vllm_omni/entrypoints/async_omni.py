@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+import janus
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -716,6 +717,11 @@ class AsyncOmni(EngineClient, OmniBase):
 
             except asyncio.CancelledError:
                 raise
+            except janus.ShutDown:
+                # The engine closed its output queue during shutdown; there is
+                # nothing left to dispatch and this is not a failure.
+                logger.debug("[%s] final output queue shut down; stopping dispatch.", self._name)
+                return
             except OmniEngineDeadError as e:
                 logger.error("[AsyncOmni] Engine dead: %s", e)
                 for req_state in list(self.request_states.values()):

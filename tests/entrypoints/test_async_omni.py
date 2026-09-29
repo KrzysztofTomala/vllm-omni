@@ -346,3 +346,27 @@ async def test_omni_generate_request_id():
             assert output.request_id != ""
     finally:
         engine.shutdown()
+
+
+@pytest.mark.cpu
+def test_final_output_loop_stops_quietly_when_output_queue_shuts_down(caplog):
+    """Engine shutdown closes the janus output queue; that is not a failure."""
+    import janus
+
+    async def shut_down_queue():
+        raise janus.SyncQueueShutDown()
+
+    async def run():
+        omni = get_async_omni_instance()
+        omni.final_output_task = None
+        omni.engine.try_get_output_async = shut_down_queue
+        queue = asyncio.Queue()
+        omni.request_states = {"req": SimpleNamespace(request_id="req", queue=queue)}
+        AsyncOmni._final_output_handler(omni)
+        await asyncio.wait_for(omni.final_output_task, timeout=5)
+        assert queue.empty()
+
+    with caplog.at_level("DEBUG"):
+        asyncio.run(run())
+    assert "final_output_loop failed" not in caplog.text
+    assert "Traceback" not in caplog.text
