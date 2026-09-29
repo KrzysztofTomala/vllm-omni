@@ -2959,6 +2959,32 @@ def test_suffix_passthrough_cache_hands_states_through_without_storing() -> None
     assert cache.get_mask_sizes(torch.arange(2), 0) == (2, 0)
 
 
+def test_suffix_passthrough_cache_pre_initializes_layers_like_the_first_update() -> None:
+    from transformers import PretrainedConfig
+
+    config = PretrainedConfig(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, head_dim=3)
+    key = torch.randn(3, 2, 4, 3, dtype=torch.bfloat16)
+    lazy = alpamayo2_super_module.SuffixPassthroughCache(config=config, max_cache_len=4)
+    lazy.update(key, -key, 0)
+    lazy.update(key, -key, 1)
+    early = alpamayo2_super_module.SuffixPassthroughCache(
+        config=config, max_cache_len=4, rows=3, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
+    for lazy_layer, early_layer in zip(lazy.layers, early.layers, strict=True):
+        assert early_layer.is_initialized
+        assert early_layer.keys.shape == lazy_layer.keys.shape
+        assert early_layer.values.shape == lazy_layer.values.shape
+        assert early_layer.keys.dtype == lazy_layer.keys.dtype
+        assert early_layer.max_batch_size == lazy_layer.max_batch_size
+        assert early_layer.num_heads == lazy_layer.num_heads
+    out_key, out_value = early.update(key, -key, 0)
+    assert out_key is key
+    assert int(early.get_seq_length()) == int(lazy.get_seq_length()) == 0
+    assert early.get_mask_sizes(torch.arange(4), 0) == lazy.get_mask_sizes(torch.arange(4), 0)
+    with pytest.raises(ValueError, match="rows, dtype and device"):
+        alpamayo2_super_module.SuffixPassthroughCache(config=config, max_cache_len=4, rows=3)
+
+
 def test_expert_fa3_wrapper_writes_the_suffix_and_reads_the_prefix_from_the_paged_cache(monkeypatch) -> None:
     module = alpamayo2_super_module
     rows, heads_q, heads_kv, suffix_length, dim = 2, 4, 2, 4, 1
@@ -3278,7 +3304,7 @@ def test_super_paged_eager_loop_runs_the_expert_inside_the_paged_scope(monkeypat
     relocations: list[int] = []
 
     class _SuffixCache(module.StaticCache):
-        def __init__(self, *, config, max_cache_len):  # noqa: D107 - stand-in, skips the HF constructor
+        def __init__(self, *, config, max_cache_len, **_init):  # noqa: D107 - stand-in, skips the HF constructor
             self.suffix_capacity = max_cache_len
             self.layers = [SimpleNamespace(cumulative_length=torch.tensor([max_cache_len]))]
 
@@ -3347,7 +3373,7 @@ def test_super_paged_graph_state_holds_a_suffix_only_cache(monkeypatch) -> None:
     built: list[int] = []
 
     class _SuffixCache:
-        def __init__(self, *, config, max_cache_len):
+        def __init__(self, *, config, max_cache_len, **_init):
             built.append(max_cache_len)
             self.max_cache_len = max_cache_len
             self.layers = [SimpleNamespace(cumulative_length=torch.tensor([0]))]

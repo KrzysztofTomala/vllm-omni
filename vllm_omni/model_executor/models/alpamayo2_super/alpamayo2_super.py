@@ -451,7 +451,40 @@ class SuffixPassthroughCache(StaticCache):
     engine's reserved pages itself, so HF's cache only has to hand the fresh
     states through; keeping the StaticCache interface leaves the expert's
     mask/position handling unchanged.
+
+    Pass ``rows``, ``dtype`` and ``device`` to initialize the layers up front.
+    Otherwise the first ``update`` initializes them, and a compiled expert
+    first traces that initialization as a separate graph that is used only
+    once (for the first warmup step of each shape) but costs a full extra
+    Dynamo trace and Inductor compile on every start.
     """
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        max_cache_len: int,
+        rows: int | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        super().__init__(config=config, max_cache_len=max_cache_len)
+        if rows is None:
+            return
+        if dtype is None or device is None:
+            raise ValueError("SuffixPassthroughCache pre-initialization needs rows, dtype and device")
+        text_config = config.get_text_config(decoder=True) if hasattr(config, "get_text_config") else config
+        num_heads = int(text_config.num_key_value_heads)
+        head_dim = getattr(text_config, "head_dim", None) or (
+            int(text_config.hidden_size) // int(text_config.num_attention_heads)
+        )
+        self.early_initialization(
+            batch_size=int(rows),
+            num_heads=num_heads,
+            head_dim=int(head_dim),
+            dtype=dtype,
+            device=device,
+        )
 
     def update(
         self,
@@ -1685,7 +1718,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if paged is not None:
                 # The attention wrapper writes the action tokens into the engine's
                 # reserved pages; the HF cache object stores nothing.
-                static_cache = SuffixPassthroughCache(config=self.expert.config.llm_config, max_cache_len=suffix_length)
+                static_cache = SuffixPassthroughCache(
+                    config=self.expert.config.llm_config,
+                    max_cache_len=suffix_length,
+                    rows=int(expert_positions.shape[1]),
+                    dtype=self.expert.action_out_proj.weight.dtype,
+                    device=action.device,
+                )
                 first_position = 0
             else:
                 if prefix is None:
@@ -2044,7 +2083,13 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
         expert_cache: DynamicCache | StaticCache | None = prefix
         expert_cache_position = None
         if paged_expert_kv and not manual_action_cudagraph:
-            expert_cache = SuffixPassthroughCache(config=self.expert.config.llm_config, max_cache_len=suffix_length)
+            expert_cache = SuffixPassthroughCache(
+                config=self.expert.config.llm_config,
+                max_cache_len=suffix_length,
+                rows=row_count,
+                dtype=weight_dtype,
+                device=device,
+            )
             expert_cache_position = torch.arange(suffix_length, device=device, dtype=torch.long)
         elif static_expert_cache and not manual_action_cudagraph:
             expert_cache = self._make_static_action_cache(
