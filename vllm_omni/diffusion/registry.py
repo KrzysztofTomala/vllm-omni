@@ -241,6 +241,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Alpamayo2SuperPipeline": (
+        "alpamayo2_super",
+        "pipeline_alpamayo2_super",
+        "Alpamayo2SuperPipeline",
+    ),
     "Gr00tN1d7Pipeline": (
         "gr00t",
         "pipeline_gr00t",
