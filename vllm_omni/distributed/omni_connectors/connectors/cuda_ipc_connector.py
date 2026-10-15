@@ -95,70 +95,87 @@ def extract_tensors(
     ``OmniSerializer`` decodes to; tuples keep their type.
     """
     tensors: list[torch.Tensor] = []
+    return _extract(obj, tensors, select, ndarrays), tensors
 
-    def take(tensor: torch.Tensor, marker: str) -> dict[str, int] | None:
-        if select is not None and not select(tensor):
-            return None
-        tensors.append(tensor)
-        return {marker: len(tensors) - 1}
 
-    def visit(value: Any) -> Any:
-        if type(value) in _SCALARS:
-            return value
-        if isinstance(value, torch.Tensor):
-            return take(value, _TENSOR) or value
-        if ndarrays and isinstance(value, np.ndarray) and value.dtype.kind not in "OVUS":
-            return take(torch.from_numpy(np.ascontiguousarray(value)), _NDARRAY) or value
-        if isinstance(value, msgspec.Struct):
-            fields = msgspec.structs.asdict(value)
-            visited = visit(fields)
-            return value if visited is fields else visited
-        if isinstance(value, dict):
-            copied = None
-            for key, item in value.items():
-                if type(item) not in _SCALARS and (new := visit(item)) is not item:
-                    copied = copied or dict(value)
-                    copied[key] = new
-            return value if copied is None else copied
-        if isinstance(value, (list, tuple)):
-            items: list[Any] | None = None
-            for index, item in enumerate(value):
-                if type(item) not in _SCALARS and (new := visit(item)) is not item:
-                    items = items or list(value)
-                    items[index] = new
-            if items is None:
-                return value
-            return {_TUPLE: items} if isinstance(value, tuple) else items
+# The codec walks are module-level functions rather than closures: recursive
+# closures form a reference cycle that would keep the payload's tensors (up to
+# gigabytes of GPU memory) alive until the next garbage collection.
+
+
+def _take(
+    tensor: torch.Tensor,
+    marker: str,
+    tensors: list[torch.Tensor],
+    select: Callable[[torch.Tensor], bool] | None,
+) -> dict[str, int] | None:
+    if select is not None and not select(tensor):
+        return None
+    tensors.append(tensor)
+    return {marker: len(tensors) - 1}
+
+
+def _extract(
+    value: Any,
+    tensors: list[torch.Tensor],
+    select: Callable[[torch.Tensor], bool] | None,
+    ndarrays: bool,
+) -> Any:
+    if type(value) in _SCALARS:
         return value
-
-    return visit(obj), tensors
+    if isinstance(value, torch.Tensor):
+        return _take(value, _TENSOR, tensors, select) or value
+    if ndarrays and isinstance(value, np.ndarray) and value.dtype.kind not in "OVUS":
+        return _take(torch.from_numpy(np.ascontiguousarray(value)), _NDARRAY, tensors, select) or value
+    if isinstance(value, msgspec.Struct):
+        fields = msgspec.structs.asdict(value)
+        visited = _extract(fields, tensors, select, ndarrays)
+        return value if visited is fields else visited
+    if isinstance(value, dict):
+        copied = None
+        for key, item in value.items():
+            if type(item) not in _SCALARS and (new := _extract(item, tensors, select, ndarrays)) is not item:
+                copied = copied or dict(value)
+                copied[key] = new
+        return value if copied is None else copied
+    if isinstance(value, (list, tuple)):
+        items: list[Any] | None = None
+        for index, item in enumerate(value):
+            if type(item) not in _SCALARS and (new := _extract(item, tensors, select, ndarrays)) is not item:
+                items = items or list(value)
+                items[index] = new
+        if items is None:
+            return value
+        return {_TUPLE: items} if isinstance(value, tuple) else items
+    return value
 
 
 def restore_tensors(skeleton: Any, tensors: Sequence[torch.Tensor]) -> Any:
     """Inverse of :func:`extract_tensors`; fills containers in place."""
+    return _restore_leaf(skeleton, tensors) if tensors else skeleton
 
-    def leaf(value: Any) -> Any:
-        if isinstance(value, dict) and len(value) == 1:
-            if _TENSOR in value:
-                return tensors[value[_TENSOR]]
-            if _NDARRAY in value:
-                return tensors[value[_NDARRAY]].cpu().numpy()
-            if _TUPLE in value:
-                return tuple(leaf(item) for item in value[_TUPLE])
-        return visit(value)
 
-    def visit(value: Any) -> Any:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if type(item) not in _SCALARS:
-                    value[key] = leaf(item)
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                if type(item) not in _SCALARS:
-                    value[index] = leaf(item)
-        return value
+def _restore_leaf(value: Any, tensors: Sequence[torch.Tensor]) -> Any:
+    if isinstance(value, dict) and len(value) == 1:
+        if _TENSOR in value:
+            return tensors[value[_TENSOR]]
+        if _NDARRAY in value:
+            return tensors[value[_NDARRAY]].cpu().numpy()
+        if _TUPLE in value:
+            return tuple(_restore_leaf(item, tensors) for item in value[_TUPLE])
+    return _restore_containers(value, tensors)
 
-    return leaf(skeleton) if tensors else skeleton
+
+def _restore_containers(value: Any, tensors: Sequence[torch.Tensor]) -> Any:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if type(item) not in _SCALARS:
+                value[key] = _restore_leaf(item, tensors)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            if type(item) not in _SCALARS:
+                value[index] = _restore_leaf(item, tensors)
+    return value
 
 
 # ── Transport snapshot ────────────────────────────────────────────────
@@ -571,13 +588,13 @@ class CudaIpcConnector(SharedMemoryConnector):
         self._drop_exports(request_id, consumed=not os.path.exists(f"/dev/shm/{request_id}"))
         super().cleanup(request_id)
 
-    def reap_consumed(self) -> None:
+    def reap_consumed(self, *, max_keys: int = 64) -> None:
         # Exports whose segment the receiver already unlinked found a reader.
         with self._exports_lock:
             claimed = [key for key in self._exports if not os.path.exists(f"/dev/shm/{key}")]
         for key in claimed:
             self._drop_exports(key, consumed=True)
-        super().reap_consumed()
+        super().reap_consumed(max_keys=max_keys)
 
     # ------------------------------------------------------------------ #
 

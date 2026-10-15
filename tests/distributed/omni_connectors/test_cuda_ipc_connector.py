@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CudaIpcConnector: handle ownership on CPU through fake exports, real IPC on GPU."""
 
+import gc
 import glob
 import multiprocessing as mp
 import os
 import signal
 import time
 import uuid
+import weakref
 from multiprocessing import shared_memory as shm_pkg
 
 import numpy as np
@@ -69,6 +71,23 @@ def producer():
 
 def _payload() -> dict:
     return {"hidden": torch.randn(64, 64), "pair": (torch.ones(512), "tag"), "small": torch.arange(4)}
+
+
+@pytest.mark.cpu
+def test_tensor_codec_does_not_keep_tensors_alive():
+    # Transferred tensors can be large (a KV prefix is ~0.8 GB); they must be
+    # freed when the last reference goes, not at the next garbage collection.
+    tensor = torch.ones(512)
+    ref = weakref.ref(tensor)
+    gc.disable()
+    try:
+        skeleton, tensors = extract_tensors({"pair": (tensor, "tag")})
+        restored = restore_tensors(skeleton, tensors)
+        assert restored["pair"][0] is tensor
+        del tensor, tensors, restored, skeleton
+        assert ref() is None
+    finally:
+        gc.enable()
 
 
 @pytest.mark.cpu
