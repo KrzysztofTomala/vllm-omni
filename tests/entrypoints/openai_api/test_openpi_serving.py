@@ -534,3 +534,50 @@ def test_drop_session_calls_dreamzero_close_hook():
     serving.drop_session("rollout-1")
 
     assert closed == ["rollout-1"]
+
+
+def test_policy_server_config_reads_engine_hf_config():
+    policy_config = {"action_horizon": 64}
+    hf_config = SimpleNamespace(policy_server_config=policy_config)
+    engine_client = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    assert serving.policy_server_config.to_dict() == policy_config
+    assert serving.request_adapter is None
+
+
+class RecordingRequestAdapter:
+    def __init__(self, model_config):
+        self.model_config = model_config
+
+    def build_request(self, obs, *, request_id, session_id, reset):
+        return openpi_serving.OpenPIEngineRequest(
+            prompt={"prompt_token_ids": [1, 2]},
+            sampling_params=("ar-params", obs["value"], session_id, reset),
+            request_id=request_id,
+        )
+
+
+def test_request_adapter_builds_engine_requests():
+    policy_config = {"request_adapter": f"{__name__}:RecordingRequestAdapter"}
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(policy_server_config=policy_config))
+
+    class FakeEngineClient:
+        def __init__(self):
+            self.model_config = model_config
+
+        async def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            yield SimpleNamespace(multimodal_output={"actions": [[1.0, 2.0, 3.0]]})
+
+    engine_client = FakeEngineClient()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+    assert serving.request_adapter.model_config is model_config
+
+    actions = asyncio.run(serving.infer({"value": 7}, session_id="session-a", reset=True))
+
+    np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+    assert engine_client.generate_kwargs["prompt"] == {"prompt_token_ids": [1, 2]}
+    assert engine_client.generate_kwargs["sampling_params_list"] == [("ar-params", 7, "session-a", True)]
+    assert engine_client.generate_kwargs["request_id"] == "robot-session-a-0"
