@@ -152,8 +152,9 @@ plausible distance ahead of the ego vehicle for the scene (meters, x forward).
 - Memory usage: about 67 GiB of BF16 weights for stage 0, which uses
   `gpu_memory_utilization: 0.6` including its KV cache; stage 1 holds the
   2.4B-parameter expert and the prefixes of its current batch.
-- KV handoff: the deploy config uses `SharedMemoryConnector`, which stages each
-  request's KV prefix (about 0.8 GB for 3k tokens) through host memory.
+- KV handoff: the deploy config uses `CudaIpcConnector`, which moves each
+  request's KV prefix (about 0.8 GB for 3k tokens) GPU to GPU. Both stages
+  must see the same GPU.
 - Known limitations: the navigation-instruction (classifier-free guidance) and
   text-task modes of the reference implementation are not supported.
 

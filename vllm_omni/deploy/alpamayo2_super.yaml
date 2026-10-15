@@ -1,6 +1,7 @@
 # Alpamayo 2 Super on one H200 (BF16): Qwen3-VL reasoning (stage 0) hands each
 # request's KV prefix to the trajectory expert (stage 1), which runs the
-# requests that reach it together as one batch.
+# requests that reach it together as one batch. The KV prefix moves GPU to GPU
+# over CUDA IPC.
 async_chunk: false
 dtype: bfloat16
 
@@ -18,7 +19,7 @@ stages:
     gpu_memory_utilization: 0.6
     enforce_eager: true
     output_connectors:
-      to_stage_1: shared_memory_connector
+      to_stage_1: cuda_ipc_connector
     default_sampling_params:
       temperature: 0.6
       top_p: 0.98
@@ -45,8 +46,8 @@ stages:
       # Builds the reasoning stage's prompt from each OpenPI observation.
       openpi_prompt_builder: vllm_omni.model_executor.models.alpamayo2_super.openpi.Alpamayo2SuperOpenPIPrompt
     input_connectors:
-      from_stage_0: shared_memory_connector
+      from_stage_0: cuda_ipc_connector
 
 connectors:
-  shared_memory_connector:
-    name: SharedMemoryConnector
+  cuda_ipc_connector:
+    name: CudaIpcConnector
