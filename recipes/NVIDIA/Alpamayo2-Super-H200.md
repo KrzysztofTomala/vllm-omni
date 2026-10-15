@@ -8,7 +8,7 @@
 - Vendor: NVIDIA
 - Model: `nvidia/Alpamayo2-Super`
 - Task: Ego trajectory prediction with chain-of-thought reasoning
-- Mode: Offline inference (`Omni`)
+- Mode: Online serving (OpenPI WebSocket) and offline inference (`Omni`)
 - Hardware: 1x NVIDIA H200 NVL 141 GB
 - Maintainer: Community
 
@@ -37,6 +37,7 @@ the request with `<|traj_future_end|>`.
 - Model card: <https://huggingface.co/nvidia/Alpamayo2-Super>
 - Reference implementation and data loader: <https://github.com/NVlabs/alpamayo2>
 - Dataset: <https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles>
+- OpenPI protocol: [`docs/serving/openpi_api.md`](../../docs/serving/openpi_api.md)
 - Model: [`vllm_omni/model_executor/models/alpamayo2_super`](../../vllm_omni/model_executor/models/alpamayo2_super)
 - Tests: [`tests/model_executor/models/test_alpamayo2_super.py`](../../tests/model_executor/models/test_alpamayo2_super.py)
 
@@ -77,6 +78,52 @@ history_rot = scene["ego_history_rot"].reshape(16, 3, 3)
 ```
 
 The package is only used to load data; the model runs entirely in vLLM-Omni.
+
+### Online serving
+
+```bash
+vllm serve nvidia/Alpamayo2-Super --omni --host 127.0.0.1 --port 8000
+```
+
+Connect to `ws://127.0.0.1:8000/v1/realtime/robot/openpi`. The first frame is
+the handshake (`action_horizon: 64`, `action_dt: 0.1`). Each observation is a
+dict with `image_frames`, `camera_indices`, `ego_history_xyz`,
+`ego_history_rot`, and an optional integer `seed`; the reply is the `(64, 3)`
+trajectory. Send frames at the model's input size: the server would resize
+larger frames to the same size, and uncompressed 1080p frames exceed the
+WebSocket frame limit.
+
+```python
+import asyncio
+
+import torch
+import websockets
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+from vllm_omni.entrypoints.openpi.connection import _pack, _unpack
+
+height, width = smart_resize(*frames.shape[-2:], factor=32, min_pixels=163840, max_pixels=196608)
+small = torch.nn.functional.interpolate(
+    frames.flatten(0, 1).float(), size=(height, width), mode="bicubic", antialias=True
+).round().clamp(0, 255).to(torch.uint8).unflatten(0, frames.shape[:2])
+observation = {
+    "image_frames": small.numpy(),
+    "camera_indices": scene["camera_indices"].numpy(),
+    "ego_history_xyz": history_xyz.numpy(),
+    "ego_history_rot": history_rot.numpy(),
+    "seed": 42,
+}
+
+
+async def main():
+    async with websockets.connect("ws://127.0.0.1:8000/v1/realtime/robot/openpi", max_size=None) as ws:
+        print(_unpack(await ws.recv()))  # handshake
+        await ws.send(_pack(observation))
+        print(_unpack(await ws.recv())[-1])  # position 6.4 s ahead
+
+
+asyncio.run(main())
+```
 
 ### Offline inference
 
@@ -143,7 +190,8 @@ vehicle for the scene (meters, x forward).
 - Multiple trajectories: each request returns one trajectory, so sampling K
   trajectories takes K requests. They run one after another and reuse the
   cached image and prompt prefill, so latency grows linearly with K.
-- Known limitations: one request at a time; the navigation-instruction
+- Known limitations: one request at a time; the OpenPI reply carries the
+  trajectory but not the reasoning text; the navigation-instruction
   (classifier-free guidance) and text-task modes of the reference
   implementation are not supported.
 
@@ -152,7 +200,7 @@ vehicle for the scene (meters, x forward).
 | Feature | Status |
 | --- | --- |
 | Offline inference | Supported |
-| Online serving | Not supported |
+| Online serving | Supported ([OpenPI WebSocket](../../docs/serving/openpi_api.md)) |
 | Tensor parallelism | Not supported (TP=1) |
 | CUDA graphs | Not supported (eager) |
 | Quantization | Not supported (BF16) |

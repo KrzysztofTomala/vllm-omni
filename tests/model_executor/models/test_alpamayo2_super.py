@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -13,6 +14,7 @@ from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.model_executor.models.alpamayo2_super import Alpamayo2SuperConfig
+from vllm_omni.model_executor.models.alpamayo2_super import openpi as alpamayo_openpi
 from vllm_omni.model_executor.models.alpamayo2_super.action_expert import (
     UnicycleAccelCurvatureActionSpace,
     _velocity_from_history,
@@ -186,3 +188,34 @@ def test_compute_logits_masks_trajectory_vocab_and_forces_end(monkeypatch):
     # State is consumed: the next step only applies the vocabulary mask.
     logits = model.compute_logits(torch.zeros(3, 4))
     assert not torch.isinf(logits[0, TEXT_EOS])
+
+
+def test_openpi_adapter_builds_trajectory_request(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def fake_prompt(tokenizer, config, *, frames, camera_indices, ego_history_xyz):
+        calls.update(frames=frames.shape, cameras=camera_indices, history=ego_history_xyz.shape)
+        return [1, 2, 3]
+
+    monkeypatch.setattr(alpamayo_openpi, "build_trajectory_prompt", fake_prompt)
+    adapter = alpamayo_openpi.Alpamayo2SuperOpenPIAdapter.__new__(alpamayo_openpi.Alpamayo2SuperOpenPIAdapter)
+    adapter.config = SimpleNamespace(traj_ids={"future_end": FUTURE_END})
+    adapter.tokenizer = None
+    obs = {
+        "image_frames": np.zeros((2, 4, 3, 8, 8), dtype=np.uint8),
+        "camera_indices": np.array([1, 6]),
+        "ego_history_xyz": np.zeros((16, 3)),
+        "ego_history_rot": np.tile(np.eye(3), (16, 1, 1)),
+        "seed": 5,
+        "sampling_params": {"diffusion_steps": 4},
+    }
+    request = adapter.build_request(obs, request_id="robot-a-0", session_id="a", reset=True)
+
+    assert calls == {"frames": (2, 4, 3, 8, 8), "cameras": [1, 6], "history": (16, 3)}
+    assert request.request_id == "robot-a-0"
+    assert request.prompt["prompt_token_ids"] == [1, 2, 3]
+    assert len(request.prompt["multi_modal_data"]["image"]) == 8
+    params = request.sampling_params
+    assert params.seed == 5 and params.stop_token_ids == [FUTURE_END]
+    assert params.extra_args["action_seed"] == 5 and params.extra_args["diffusion_steps"] == 4
+    assert np.asarray(params.extra_args["robot_obs"]["ego_history_rot"]).shape == (16, 3, 3)

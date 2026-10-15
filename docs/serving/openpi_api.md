@@ -34,7 +34,8 @@ the stage's `hf_overrides` and names a model-owned `request_adapter`
 its `build_request(obs, *, request_id, session_id, reset)` returns an
 `OpenPIEngineRequest` (prompt, sampling parameters, request id). As for
 diffusion policies, the reply is the final output's
-`multimodal_output["actions"]`.
+`multimodal_output["actions"]`. Alpamayo 2 Super uses this path; see
+`vllm_omni/deploy/alpamayo2_super.yaml`.
 
 ## DreamZero Quick Start
 

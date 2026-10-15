@@ -14,3 +14,13 @@ stages:
       video: 0
     gpu_memory_utilization: 0.9
     enforce_eager: true
+    hf_overrides:
+      # OpenPI handshake for /v1/realtime/robot/openpi, sent verbatim to clients.
+      policy_server_config:
+        request_adapter: vllm_omni.model_executor.models.alpamayo2_super.openpi:Alpamayo2SuperOpenPIAdapter
+        needs_session_id: false
+        frames_per_camera: 4
+        history_steps: 16
+        action_horizon: 64
+        action_dt: 0.1
+        action_space: ego_trajectory_xyz
