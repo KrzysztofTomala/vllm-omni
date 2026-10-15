@@ -9,6 +9,7 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -61,6 +62,15 @@ class PolicyServerConfig:
         return _to_builtin_container(self.values)
 
 
+@dataclass(frozen=True)
+class OpenPIEngineRequest:
+    """Engine request built by a model-owned OpenPI request adapter."""
+
+    prompt: Any
+    sampling_params: Any
+    request_id: str
+
+
 class ServingRealtimeRobotOpenPI:
     """Robot policy serving layer for OpenPI protocol.
 
@@ -75,6 +85,7 @@ class ServingRealtimeRobotOpenPI:
         self.engine_client = engine_client
         self.model_name = model_name
         self.policy_server_config = self._get_policy_server_config(engine_client)
+        self.request_adapter = self._load_request_adapter(engine_client, self.policy_server_config)
         self._request_counter = count()
 
     @classmethod
@@ -122,7 +133,25 @@ class ServingRealtimeRobotOpenPI:
 
         if model_config is None:
             model_config = getattr(engine_client, "model_config", None)
+            # Autoregressive policies carry it in the HF config (deploy hf_overrides).
+            model_config = getattr(model_config, "hf_config", model_config)
         return PolicyServerConfig.from_model_config(model_config)
+
+    @staticmethod
+    def _load_request_adapter(engine_client: Any, policy_server_config: PolicyServerConfig) -> Any:
+        """Instantiate the adapter named by ``policy_server_config["request_adapter"]``.
+
+        The adapter (``module:Class``, constructed with the engine's model
+        config) turns an observation into an ``OpenPIEngineRequest``. It lets
+        policies served by an autoregressive stage own their prompt
+        construction; without one, requests go to the diffusion stage.
+        """
+        path = policy_server_config.values.get("request_adapter")
+        if path is None:
+            return None
+        module_name, _, class_name = str(path).partition(":")
+        adapter_cls = getattr(importlib.import_module(module_name), class_name)
+        return adapter_cls(engine_client.model_config)
 
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
@@ -173,6 +202,10 @@ class ServingRealtimeRobotOpenPI:
 
     def build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
         """Build an engine request from raw robot obs."""
+        if self.request_adapter is not None:
+            return self.request_adapter.build_request(
+                obs, request_id=self._next_request_id(session_id), session_id=session_id, reset=reset
+            )
         return self._build_request(obs, session_id=session_id, reset=reset)
 
     def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:

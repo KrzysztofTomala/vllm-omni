@@ -9,8 +9,8 @@ event schema. It uses binary MessagePack frames with NumPy extensions.
 
 ## Availability
 
-The endpoint is available only when the loaded diffusion policy configuration
-contains `policy_server_config`. The server sends that model-specific
+The endpoint is available only when the loaded policy configuration contains
+`policy_server_config`. The server sends that model-specific
 configuration to the client as the first binary frame.
 
 For example, DreamZero declares:
@@ -27,6 +27,14 @@ policy_server_config:
 
 Without this configuration, the WebSocket returns `Robot policy not available`
 and closes.
+
+A policy served by an autoregressive stage declares `policy_server_config` in
+the stage's `hf_overrides` and names a model-owned `request_adapter`
+(`module:Class`). The adapter is constructed with the stage's model config;
+its `build_request(obs, *, request_id, session_id, reset)` returns an
+`OpenPIEngineRequest` (prompt, sampling parameters, request id). As for
+diffusion policies, the reply is the final output's
+`multimodal_output["actions"]`.
 
 ## DreamZero Quick Start
 
