@@ -1,0 +1,16 @@
+# Alpamayo 2 Super: Qwen3-VL reasoning and the in-model trajectory expert on
+# one GPU (BF16, one request at a time).
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    # Seven cameras x four frames plus reasoning fit in 6k tokens.
+    max_model_len: 6144
+    limit_mm_per_prompt:
+      image: 28
+      video: 0
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
