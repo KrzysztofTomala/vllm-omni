@@ -2402,6 +2402,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if isinstance(global_id, list) and global_id:
                 global_id = global_id[0]
             if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
+                global_id = global_id.decode("utf-8")
+            global_id = str(global_id)
+            # Children of a SamplingParams.n > 1 request ("{index}_{parent}")
+            # share the parent's global id; each must transfer its own KV.
+            if req_id != global_id and req_id.endswith(f"_{global_id}"):
+                return req_id
+            return global_id
         return req_id

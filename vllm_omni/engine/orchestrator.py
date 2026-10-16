@@ -1951,6 +1951,26 @@ class OrchestratorBase:
                 ]
             )
 
+    @staticmethod
+    def _diffusion_params_for_samples(source_params: Any, params: Any) -> Any:
+        """Match ``num_outputs_per_prompt`` to the samples of an n > 1 source stage.
+
+        Each sample transferred its own KV; the diffusion stage receives all of
+        them for this request and produces one output per sample.
+        """
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        num_samples = int(getattr(source_params, "n", 1) or 1)
+        if num_samples <= 1 or not isinstance(params, OmniDiffusionSamplingParams):
+            return params
+        if params.num_outputs_per_prompt == num_samples:
+            return params
+        import copy
+
+        params = copy.deepcopy(params)
+        params.num_outputs_per_prompt = num_samples
+        return params
+
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
         companion_request_ids = self._cfg_tracker.get_companion_request_ids(request_id)
@@ -2744,7 +2764,10 @@ class OrchestratorBase:
                     req_state,
                     diffusion_prompt,
                     submit_kwargs=submit_kwargs,
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    params_override=self._diffusion_params_for_samples(
+                        req_state.sampling_params_list[src_stage_id],
+                        self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    ),
                 )
             self._on_stage_submitted(
                 next_logical,
