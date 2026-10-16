@@ -28,6 +28,19 @@ policy_server_config:
 Without this configuration, the WebSocket returns `Robot policy not available`
 and closes.
 
+### Multi-stage policies
+
+A policy can run as several stages, for example an autoregressive stage that
+reasons before a diffusion stage that acts. The diffusion stage declares
+`policy_server_config` as above and receives the observation; every other
+stage gets its deploy `default_sampling_params`, and an observation `seed`
+applies to all stages. When the first stage needs a prompt built from the
+observation (token ids, images), the diffusion stage's `model_config` also
+names `openpi_prompt_builder`: a class constructed with the engine's vLLM
+`ModelConfig` and the `policy_server_config` values, whose
+`build_prompt(obs)` returns that prompt. It is not sent to clients. The reply
+is the actions of the stage that returns them.
+
 ## DreamZero Quick Start
 
 Start the bundled DreamZero deployment:
