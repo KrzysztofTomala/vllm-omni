@@ -298,3 +298,21 @@ def test_openpi_prompt_builds_reasoning_prompt(monkeypatch):
     assert calls == {"frames": (2, 4, 3, 8, 8), "cameras": [1, 6], "history": (16, 3)}
     assert prompt["prompt_token_ids"] == [1, 2, 3]
     assert len(prompt["multi_modal_data"]["image"]) == 8
+
+
+def test_expert_samples_one_trajectory_per_reasoning_sample():
+    # A reasoning request with n = 2 hands over one prefix per sample; sample i
+    # draws its noise from seed + i, like separate requests with those seeds.
+    pipeline = _make_pipeline()
+    first, second = _expert_request(5, 7), _expert_request(9, 8)
+    sampled = _expert_request(5, 7)
+    sampled.sampling_params.past_key_values = [
+        first.sampling_params.past_key_values,
+        second.sampling_params.past_key_values,
+    ]
+    sampled.sampling_params.kv_metadata = [first.sampling_params.kv_metadata, second.sampling_params.kv_metadata]
+    (output,) = pipeline(SimpleNamespace(requests=[sampled], num_reqs=1))
+    assert output.output[ACTIONS_KEY].shape == (2, 64, 3)
+    for sample, (prefix_len, seed) in enumerate([(5, 7), (9, 8)]):
+        (alone,) = pipeline(SimpleNamespace(requests=[_expert_request(prefix_len, seed)], num_reqs=1))
+        torch.testing.assert_close(output.output[ACTIONS_KEY][sample], alone.output[ACTIONS_KEY], rtol=1e-4, atol=1e-4)

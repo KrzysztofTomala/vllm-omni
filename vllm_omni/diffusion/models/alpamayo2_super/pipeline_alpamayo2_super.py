@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -52,6 +53,17 @@ def _expert_shards(model_path: str) -> list[str | None]:
     with open(index_path, encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
     return sorted({file for name, file in weight_map.items() if name.startswith(_WEIGHT_PREFIX)})
+
+
+@dataclass
+class _Row:
+    """One trajectory to sample: a request, or one sample of an n-sample request."""
+
+    index: int  # position of the request in the batch
+    request: OmniDiffusionRequest
+    kv: Any
+    metadata: Mapping[str, Any]
+    sample: int
 
 
 class Alpamayo2SuperPipeline(nn.Module):
@@ -102,7 +114,7 @@ class Alpamayo2SuperPipeline(nn.Module):
     def forward(self, req: DiffusionRequestBatch, **kwargs: Any) -> list[DiffusionOutput]:
         del kwargs
         outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
-        groups: dict[int, list[int]] = {}
+        groups: dict[int, list[_Row]] = {}
         for index, request in enumerate(req.requests):
             params = request.sampling_params
             if params.past_key_values is None:
@@ -115,53 +127,66 @@ class Alpamayo2SuperPipeline(nn.Module):
             if not 1 <= steps <= _MAX_STEPS:
                 outputs[index] = DiffusionOutput(error=f"num_inference_steps must be between 1 and {_MAX_STEPS}")
                 continue
-            groups.setdefault(steps, []).append(index)
-        for steps, indices in groups.items():
-            trajectories = self._sample([req.requests[index] for index in indices], steps)
-            for index, (xyz, rot) in zip(indices, trajectories, strict=True):
+            # A request whose reasoning stage sampled n sequences carries one prefix per sample.
+            if isinstance(params.past_key_values, list):
+                rows = [
+                    _Row(index, request, kv, metadata, sample)
+                    for sample, (kv, metadata) in enumerate(
+                        zip(params.past_key_values, params.kv_metadata, strict=True)
+                    )
+                ]
+            else:
+                rows = [_Row(index, request, params.past_key_values, params.kv_metadata, 0)]
+            groups.setdefault(steps, []).extend(rows)
+        for steps, rows in groups.items():
+            trajectories = self._sample(rows, steps)
+            by_request: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+            for row, trajectory in zip(rows, trajectories, strict=True):
+                by_request.setdefault(row.index, []).append(trajectory)
+            for index, samples in by_request.items():
+                if isinstance(req.requests[index].sampling_params.past_key_values, list):
+                    xyz, rot = torch.stack([t[0] for t in samples]), torch.stack([t[1] for t in samples])
+                else:
+                    xyz, rot = samples[0]
                 outputs[index] = DiffusionOutput(output={ACTIONS_KEY: xyz, ROTATIONS_KEY: rot})
         # The reasoning stage shares the GPU and stages each KV handoff outside
         # its own memory budget; return the freed prefixes.
         torch.accelerator.empty_cache()
         return outputs
 
-    def _batched_prefix(self, requests: list[OmniDiffusionRequest]) -> tuple[DynamicCache, torch.Tensor, int]:
-        """Right-pad the requests' prefixes into one cache; returns it, the lengths and the padded length."""
+    def _batched_prefix(self, rows: list[_Row]) -> tuple[DynamicCache, torch.Tensor, int]:
+        """Right-pad the rows' prefixes into one cache; returns it, the lengths and the padded length."""
         lengths = []
-        for request in requests:
-            metadata = request.sampling_params.kv_metadata or {}
-            prefix_len = int(metadata["prefix_len"])
-            if int(metadata.get("seq_len", prefix_len)) != prefix_len:
-                raise RuntimeError(f"KV transfer covers {metadata.get('seq_len')} tokens, expected {prefix_len}")
+        for row in rows:
+            prefix_len = int(row.metadata["prefix_len"])
+            if int(row.metadata.get("seq_len", prefix_len)) != prefix_len:
+                raise RuntimeError(f"KV transfer covers {row.metadata.get('seq_len')} tokens, expected {prefix_len}")
             lengths.append(prefix_len)
         padded_len = max(lengths)
-        received = [request.sampling_params.past_key_values for request in requests]
         cache = DynamicCache()
-        for layer in range(len(received[0].key_cache)):
+        for layer in range(len(rows[0].kv.key_cache)):
             # Received per layer as [seq_len, kv_heads, head_dim]; the expert's
             # Hugging Face attention takes [batch, kv_heads, seq_len, head_dim].
-            heads, head_dim = received[0].key_cache[layer].shape[1:]
-            dtype = received[0].key_cache[layer].dtype
-            key = torch.zeros(len(requests), heads, padded_len, head_dim, dtype=dtype, device=self.device)
+            heads, head_dim = rows[0].kv.key_cache[layer].shape[1:]
+            dtype = rows[0].kv.key_cache[layer].dtype
+            key = torch.zeros(len(rows), heads, padded_len, head_dim, dtype=dtype, device=self.device)
             value = torch.zeros_like(key)
-            for row, (kv, length) in enumerate(zip(received, lengths, strict=True)):
-                key[row, :, :length] = kv.key_cache[layer][:length].transpose(0, 1)
-                value[row, :, :length] = kv.value_cache[layer][:length].transpose(0, 1)
-                kv.key_cache[layer] = kv.value_cache[layer] = None  # release as we copy
+            for position, (row, length) in enumerate(zip(rows, lengths, strict=True)):
+                key[position, :, :length] = row.kv.key_cache[layer][:length].transpose(0, 1)
+                value[position, :, :length] = row.kv.value_cache[layer][:length].transpose(0, 1)
+                row.kv.key_cache[layer] = row.kv.value_cache[layer] = None  # release as we copy
             cache.update(key, value, layer)
         return cache, torch.tensor(lengths, device=self.device), padded_len
 
-    def _sample(self, requests: list[OmniDiffusionRequest], num_steps: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Flow-matching (Euler) sampling of one trajectory per request."""
+    def _sample(self, rows: list[_Row], num_steps: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Flow-matching (Euler) sampling of one trajectory per row."""
         expert = self.expert
         device = self.device
-        batch = len(requests)
+        batch = len(rows)
         num_waypoints, action_dim = expert.action_space.get_action_space_dims()
-        prefix, lengths, padded_len = self._batched_prefix(requests)
+        prefix, lengths, padded_len = self._batched_prefix(rows)
 
-        trigger = torch.tensor(
-            [request.sampling_params.kv_metadata["trigger_position"] for request in requests], device=device
-        )  # [batch, 3]
+        trigger = torch.tensor([row.metadata["trigger_position"] for row in rows], device=device)  # [batch, 3]
         position_ids = (trigger.T[:, :, None] + 1 + torch.arange(num_waypoints, device=device)).long()
         dtype = expert.action_out_proj.weight.dtype
         # Waypoints attend to their own prefix and to each other; padding is masked.
@@ -169,12 +194,9 @@ class Alpamayo2SuperPipeline(nn.Module):
         padding = torch.arange(padded_len, device=device)[None, :] >= lengths[:, None]
         attention_mask[:, 0, :, :padded_len].masked_fill_(padding[:, None, :], torch.finfo(dtype).min)
 
-        # Per-request noise, so a request's trajectory does not depend on its batch.
+        # Per-row noise, so a trajectory does not depend on its batch.
         action = torch.cat(
-            [
-                torch.randn(1, num_waypoints, action_dim, device=device, generator=self._generator(request))
-                for request in requests
-            ]
+            [torch.randn(1, num_waypoints, action_dim, device=device, generator=self._generator(row)) for row in rows]
         )
         time_steps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         for i in range(num_steps):
@@ -191,17 +213,17 @@ class Alpamayo2SuperPipeline(nn.Module):
             # A (1, 1, 1) step keeps the update in float32, as in the reference.
             action = action + (time_steps[i + 1] - time_steps[i]).view(1, 1, 1) * velocity
 
-        history_xyz = torch.stack([self._history(request, "ego_history_xyz") for request in requests])
-        history_rot = torch.stack([self._history(request, "ego_history_rot") for request in requests])
+        history_xyz = torch.stack([self._history(row.request, "ego_history_xyz") for row in rows])
+        history_rot = torch.stack([self._history(row.request, "ego_history_rot") for row in rows])
         trajectory_xyz, trajectory_rot = expert.action_space.action_to_traj(action, history_xyz, history_rot)
-        return [(trajectory_xyz[row].cpu(), trajectory_rot[row].cpu()) for row in range(batch)]
+        return [(trajectory_xyz[position].cpu(), trajectory_rot[position].cpu()) for position in range(batch)]
 
-    def _generator(self, request: OmniDiffusionRequest) -> torch.Generator:
-        params = request.sampling_params
-        if isinstance(params.generator, torch.Generator):
+    def _generator(self, row: _Row) -> torch.Generator:
+        params = row.request.sampling_params
+        if row.sample == 0 and isinstance(params.generator, torch.Generator):
             return params.generator
-        # Engine requests always carry a seed; it fixes the expert's noise.
-        return torch.Generator(device=self.device).manual_seed(int(params.seed))
+        # Engine requests always carry a seed; sample i of an n-sample request uses seed + i.
+        return torch.Generator(device=self.device).manual_seed(int(params.seed) + row.sample)
 
     def _history(self, request: OmniDiffusionRequest, key: str) -> torch.Tensor:
         observation: Mapping[str, Any] = (request.sampling_params.extra_args or {})["robot_obs"]
