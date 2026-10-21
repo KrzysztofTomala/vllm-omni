@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Alpamayo 2 Super expert stage: flow-matching trajectory sampling over the reasoning KV.
 
-The reasoning stage (``Alpamayo2SuperForConditionalGeneration``) hands over
+The reasoning stage (``Alpamayo2SuperPolicyForConditionalGeneration``) hands over
 each request's KV prefix, up to and including ``<|traj_future_start|>``, with
 the prefix length and that token's M-RoPE position as KV-transfer metadata.
 This pipeline samples one trajectory per request and runs every request of a
@@ -105,10 +105,20 @@ class Alpamayo2SuperPipeline(nn.Module):
                 else:
                     outputs[index] = DiffusionOutput(error="Alpamayo 2 Super expert stage received no KV prefix.")
                 continue
-            if "prefix_len" not in (params.kv_metadata or {}):
+            metadata = params.kv_metadata or {}
+            if "prefix_len" not in metadata:
                 outputs[index] = DiffusionOutput(
                     error="Reasoning ended without <|traj_future_start|> (for example at max_tokens); no trajectory."
                 )
+                continue
+            prefix_len = int(metadata["prefix_len"])
+            if int(metadata.get("seq_len", prefix_len)) != prefix_len:
+                outputs[index] = DiffusionOutput(
+                    error=f"KV transfer covers {metadata.get('seq_len')} tokens, expected {prefix_len}."
+                )
+                continue
+            if "robot_obs" not in (params.extra_args or {}):
+                outputs[index] = DiffusionOutput(error="Alpamayo 2 Super expert stage needs extra_args['robot_obs'].")
                 continue
             steps = params.num_inference_steps or _DEFAULT_STEPS
             if steps < 1:
@@ -127,13 +137,8 @@ class Alpamayo2SuperPipeline(nn.Module):
 
     def _batched_prefix(self, requests: list[OmniDiffusionRequest]) -> tuple[DynamicCache, torch.Tensor, int]:
         """Right-pad the requests' prefixes into one cache; returns it, the lengths and the padded length."""
-        lengths = []
-        for request in requests:
-            metadata = request.sampling_params.kv_metadata or {}
-            prefix_len = int(metadata["prefix_len"])
-            if int(metadata.get("seq_len", prefix_len)) != prefix_len:
-                raise RuntimeError(f"KV transfer covers {metadata.get('seq_len')} tokens, expected {prefix_len}")
-            lengths.append(prefix_len)
+        # forward() has checked that each transfer covers exactly its prefix.
+        lengths = [int(request.sampling_params.kv_metadata["prefix_len"]) for request in requests]
         padded_len = max(lengths)
         received = [request.sampling_params.past_key_values for request in requests]
         cache = DynamicCache()
@@ -200,8 +205,15 @@ class Alpamayo2SuperPipeline(nn.Module):
         params = request.sampling_params
         if isinstance(params.generator, torch.Generator):
             return params.generator
-        # Engine requests always carry a seed; it fixes the expert's noise.
-        return torch.Generator(device=self.device).manual_seed(int(params.seed))
+        if isinstance(params.generator, list) and params.generator:
+            return params.generator[0]  # one request per OmniDiffusionRequest
+        generator = torch.Generator(device=self.device)
+        # The seed fixes the expert's noise; without one, draw a fresh random seed.
+        if params.seed is None:
+            generator.seed()
+        else:
+            generator.manual_seed(int(params.seed))
+        return generator
 
     def _history(self, request: OmniDiffusionRequest, key: str) -> torch.Tensor:
         observation: Mapping[str, Any] = (request.sampling_params.extra_args or {})["robot_obs"]

@@ -11,7 +11,9 @@ from vllm_omni.config.stage_config import (
 ALPAMAYO2_SUPER_PIPELINE = PipelineConfig(
     model_type="alpamayo2_super",
     default_deploy_config_name="alpamayo2_super.yaml",
-    model_arch="Alpamayo2Super",
+    # Not the checkpoint's own architecture name (Alpamayo2Super): vLLM-Omni registers its models
+    # into vLLM's global registry, and this reasoning stage only serves trajectory requests.
+    model_arch="Alpamayo2SuperPolicy",
     stages=(
         StagePipelineConfig(
             stage_id=0,

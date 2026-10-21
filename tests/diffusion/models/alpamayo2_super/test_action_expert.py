@@ -143,3 +143,36 @@ def test_expert_rejects_invalid_steps():
     request.sampling_params.num_inference_steps = -1
     (output,) = _run(pipeline, request)
     assert "num_inference_steps" in output.error
+
+
+def test_expert_kv_length_mismatch_fails_only_that_request():
+    pipeline = _make_pipeline()
+    mismatched = _expert_request(5, 1)
+    mismatched.sampling_params.kv_metadata["seq_len"] = 4
+    failed, served = _run(pipeline, mismatched, _expert_request(9, 2))
+    assert "KV transfer covers 4 tokens, expected 5" in failed.error
+    assert served.error is None and served.output[ACTIONS_KEY].shape == (64, 3)
+
+
+def test_expert_reports_missing_robot_obs_and_serves_the_rest():
+    pipeline = _make_pipeline()
+    no_history = _expert_request(5, 1)
+    no_history.sampling_params.extra_args = {}
+    failed, served = _run(pipeline, no_history, _expert_request(9, 2))
+    assert "robot_obs" in failed.error
+    assert served.error is None and served.output[ACTIONS_KEY].shape == (64, 3)
+
+
+def test_expert_without_seed_or_with_generator_list():
+    pipeline = _make_pipeline()
+    unseeded = _expert_request(5, 1)
+    unseeded.sampling_params.seed = None
+    (output,) = _run(pipeline, unseeded)
+    assert output.error is None and output.output[ACTIONS_KEY].isfinite().all()
+
+    listed = _expert_request(5, 1)
+    listed.sampling_params.seed = None
+    listed.sampling_params.generator = [torch.Generator().manual_seed(1)]
+    (from_list,) = _run(pipeline, listed)
+    (seeded,) = _run(pipeline, _expert_request(5, 1))
+    torch.testing.assert_close(from_list.output[ACTIONS_KEY], seeded.output[ACTIONS_KEY])

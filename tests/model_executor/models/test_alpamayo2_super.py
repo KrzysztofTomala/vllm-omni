@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -16,7 +18,7 @@ from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 from vllm_omni.model_executor.models.alpamayo2_super import Alpamayo2SuperConfig
 from vllm_omni.model_executor.models.alpamayo2_super import openpi as alpamayo_openpi
 from vllm_omni.model_executor.models.alpamayo2_super.alpamayo2_super import (
-    Alpamayo2SuperForConditionalGeneration,
+    Alpamayo2SuperPolicyForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.alpamayo2_super.processing import (
     SPECIAL_TOKENS,
@@ -53,7 +55,7 @@ def test_registered_as_reasoning_and_expert_stages():
     assert reasoning.omni_kv_config == {"need_send_cache": True}
     assert expert.execution_type == StageExecutionType.DIFFUSION and expert.input_sources == (0,)
     assert expert.omni_kv_config == {"need_recv_cache": True} and expert.final_output
-    assert _OMNI_MODELS["Alpamayo2Super"][2] == "Alpamayo2SuperForConditionalGeneration"
+    assert _OMNI_MODELS["Alpamayo2SuperPolicy"][2] == "Alpamayo2SuperPolicyForConditionalGeneration"
     assert _DIFFUSION_MODELS[expert.model_arch][2] == "Alpamayo2SuperPipeline"
 
 
@@ -86,8 +88,8 @@ def test_trajectory_messages_follow_released_prompt():
         build_trajectory_messages([["a"], ["b"]], [6, 1], config)
 
 
-def _make_model() -> Alpamayo2SuperForConditionalGeneration:
-    model = Alpamayo2SuperForConditionalGeneration.__new__(Alpamayo2SuperForConditionalGeneration)
+def _make_model() -> Alpamayo2SuperPolicyForConditionalGeneration:
+    model = Alpamayo2SuperPolicyForConditionalGeneration.__new__(Alpamayo2SuperPolicyForConditionalGeneration)
     nn.Module.__init__(model)
     model.future_start_id = FUTURE_START
     model.future_end_id = FUTURE_END
@@ -139,6 +141,12 @@ def test_requests_that_leave_the_batch_are_forgotten():
     for _ in range(65):
         _step(model, [6], ["c"], [50], [1])
     assert "aborted" not in model._recent_steps and "c" in model._recent_steps
+
+
+def test_speculative_decoding_is_rejected():
+    model = Alpamayo2SuperPolicyForConditionalGeneration.__new__(Alpamayo2SuperPolicyForConditionalGeneration)
+    with pytest.raises(ValueError, match="speculative decoding"):
+        model.__init__(vllm_config=SimpleNamespace(speculative_config=object()))
 
 
 def test_compute_logits_masks_trajectory_vocab_and_forces_end(monkeypatch):

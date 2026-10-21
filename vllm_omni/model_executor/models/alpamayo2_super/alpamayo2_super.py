@@ -53,7 +53,7 @@ class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
     info=Alpamayo2SuperProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class Alpamayo2SuperPolicyForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Reasoning stage of the Alpamayo 2 Super policy.
 
     Every request is a trajectory request: it must end with
@@ -62,6 +62,9 @@ class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if vllm_config.speculative_config is not None:
+            # compute_logits forces <|traj_future_end|> on one logits row per request.
+            raise ValueError("Alpamayo 2 Super's reasoning stage does not support speculative decoding.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
         self.future_start_id = int(config.traj_ids["future_start"])
