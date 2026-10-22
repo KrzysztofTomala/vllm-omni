@@ -82,6 +82,7 @@ def _make_pipeline() -> Alpamayo2SuperPipeline:
     pipeline = Alpamayo2SuperPipeline.__new__(Alpamayo2SuperPipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
+    pipeline.history_steps = 16
     pipeline.expert = Alpamayo2SuperActionExpert(_TINY_EXPERT).eval()
     return pipeline
 
@@ -176,3 +177,67 @@ def test_expert_without_seed_or_with_generator_list():
     (from_list,) = _run(pipeline, listed)
     (seeded,) = _run(pipeline, _expert_request(5, 1))
     torch.testing.assert_close(from_list.output[ACTIONS_KEY], seeded.output[ACTIONS_KEY])
+
+
+def _set_history(request: OmniDiffusionRequest, key: str, value) -> OmniDiffusionRequest:
+    observation = request.sampling_params.extra_args["robot_obs"]
+    if value is None:
+        del observation[key]
+    else:
+        observation[key] = value
+    return request
+
+
+@pytest.mark.parametrize(
+    "key, value, message",
+    [
+        ("ego_history_rot", None, "missing or not numeric"),
+        ("ego_history_xyz", [[0.0, 0.0, 0.0]] * 15, "must have shape (16, 3)"),
+        ("ego_history_rot", [[1.0, 0.0, 0.0]] * 16, "must have shape (16, 3, 3)"),
+        ("ego_history_xyz", "not a history", "missing or not numeric"),
+        ("ego_history_xyz", [[float("nan"), 0.0, 0.0]] * 16, "non-finite"),
+    ],
+)
+def test_expert_rejects_malformed_history_and_serves_the_rest(key, value, message):
+    pipeline = _make_pipeline()
+    malformed = _set_history(_expert_request(5, 1), key, value)
+    failed, served = _run(pipeline, malformed, _expert_request(9, 2))
+    assert key in failed.error and message in failed.error
+    assert served.error is None and served.output[ACTIONS_KEY].shape == (64, 3)
+
+
+def test_expert_accepts_history_with_a_leading_batch_dimension():
+    pipeline = _make_pipeline()
+    request = _expert_request(5, 1)
+    observation = request.sampling_params.extra_args["robot_obs"]
+    batched = _expert_request(5, 1)
+    batched.sampling_params.extra_args["robot_obs"] = {key: [value] for key, value in observation.items()}
+    (plain,) = _run(pipeline, request)
+    (with_batch_dim,) = _run(pipeline, batched)
+    torch.testing.assert_close(with_batch_dim.output[ACTIONS_KEY], plain.output[ACTIONS_KEY])
+
+
+def test_pipeline_reads_config_and_weights_at_the_configured_revision(monkeypatch):
+    from vllm_omni.diffusion.models.alpamayo2_super import pipeline_alpamayo2_super as module
+
+    calls = []
+
+    def from_pretrained(model, revision=None):
+        calls.append(("config", model, revision))
+        return SimpleNamespace(expert_config=_TINY_EXPERT, tokens_per_history_traj=45)
+
+    def get_hf_file_to_dict(name, model, revision):
+        calls.append(("index", model, revision))
+        return {"weight_map": {"expert.a": "model-00014.safetensors", "vlm.b": "model-00001.safetensors"}}
+
+    monkeypatch.setattr(module.Alpamayo2SuperConfig, "from_pretrained", from_pretrained)
+    monkeypatch.setattr(module, "get_hf_file_to_dict", get_hf_file_to_dict)
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+
+    pipeline = Alpamayo2SuperPipeline(od_config=SimpleNamespace(model="repo", revision="pinned", dtype=torch.float32))
+
+    assert calls == [("config", "repo", "pinned"), ("index", "repo", "pinned")]
+    assert [(source.revision, source.allow_patterns_overrides) for source in pipeline.weights_sources] == [
+        ("pinned", ["model-00014.safetensors"])
+    ]
+    assert pipeline.history_steps == 16

@@ -64,7 +64,9 @@ class Alpamayo2SuperPipeline(nn.Module):
         super().__init__()
         self.od_config = od_config
         self.device = get_local_device()
-        config = Alpamayo2SuperConfig.from_pretrained(od_config.model)
+        config = Alpamayo2SuperConfig.from_pretrained(od_config.model, revision=od_config.revision)
+        # The prompt encodes the history as T - 1 steps of 3 coordinates.
+        self.history_steps = config.tokens_per_history_traj // 3 + 1
         # Built in the serving dtype (the deploy config's, BF16 for "auto").
         with set_default_torch_dtype(od_config.dtype):
             self.expert = Alpamayo2SuperActionExpert(config.expert_config)
@@ -96,6 +98,7 @@ class Alpamayo2SuperPipeline(nn.Module):
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
         groups: dict[int, list[int]] = {}
+        histories: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for index, request in enumerate(req.requests):
             params = request.sampling_params
             if params.past_key_values is None:
@@ -117,8 +120,10 @@ class Alpamayo2SuperPipeline(nn.Module):
                     error=f"KV transfer covers {metadata.get('seq_len')} tokens, expected {prefix_len}."
                 )
                 continue
-            if "robot_obs" not in (params.extra_args or {}):
-                outputs[index] = DiffusionOutput(error="Alpamayo 2 Super expert stage needs extra_args['robot_obs'].")
+            try:
+                histories[index] = self._history(params.extra_args)
+            except ValueError as exc:
+                outputs[index] = DiffusionOutput(error=str(exc))
                 continue
             steps = params.num_inference_steps or _DEFAULT_STEPS
             if steps < 1:
@@ -126,7 +131,9 @@ class Alpamayo2SuperPipeline(nn.Module):
                 continue
             groups.setdefault(steps, []).append(index)
         for steps, indices in groups.items():
-            trajectories = self._sample([req.requests[index] for index in indices], steps)
+            trajectories = self._sample(
+                [req.requests[index] for index in indices], [histories[index] for index in indices], steps
+            )
             for index, xyz in zip(indices, trajectories, strict=True):
                 outputs[index] = DiffusionOutput(output={ACTIONS_KEY: xyz})
         # The received prefixes are freed now but stay reserved by this process's
@@ -156,7 +163,12 @@ class Alpamayo2SuperPipeline(nn.Module):
             cache.update(key, value, layer)
         return cache, torch.tensor(lengths, device=self.device), padded_len
 
-    def _sample(self, requests: list[OmniDiffusionRequest], num_steps: int) -> list[torch.Tensor]:
+    def _sample(
+        self,
+        requests: list[OmniDiffusionRequest],
+        histories: list[tuple[torch.Tensor, torch.Tensor]],
+        num_steps: int,
+    ) -> list[torch.Tensor]:
         """Flow-matching (Euler) sampling of one trajectory per request."""
         expert = self.expert
         device = self.device
@@ -196,8 +208,8 @@ class Alpamayo2SuperPipeline(nn.Module):
             # A (1, 1, 1) step keeps the update in float32, as in the reference.
             action = action + (time_steps[i + 1] - time_steps[i]).view(1, 1, 1) * velocity
 
-        history_xyz = torch.stack([self._history(request, "ego_history_xyz") for request in requests])
-        history_rot = torch.stack([self._history(request, "ego_history_rot") for request in requests])
+        history_xyz = torch.stack([xyz for xyz, _ in histories])
+        history_rot = torch.stack([rot for _, rot in histories])
         trajectory_xyz, _ = expert.action_space.action_to_traj(action, history_xyz, history_rot)
         return list(trajectory_xyz.cpu().unbind(0))
 
@@ -215,8 +227,30 @@ class Alpamayo2SuperPipeline(nn.Module):
             generator.manual_seed(int(params.seed))
         return generator
 
-    def _history(self, request: OmniDiffusionRequest, key: str) -> torch.Tensor:
-        observation: Mapping[str, Any] = (request.sampling_params.extra_args or {})["robot_obs"]
-        history = torch.as_tensor(observation[key], device=self.device, dtype=torch.float32)
-        # (T, 3) positions or (T, 3, 3) rotations, with any leading batch dims of size 1 dropped.
-        return history.reshape(-1, *history.shape[-1:]) if key == "ego_history_xyz" else history.reshape(-1, 3, 3)
+    def _history(self, extra_args: Mapping[str, Any] | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """The request's ego history as ``(T, 3)`` positions and ``(T, 3, 3)`` rotations.
+
+        Raises ``ValueError`` for a missing or malformed history, so that only
+        this request fails.
+        """
+        observation = (extra_args or {}).get("robot_obs")
+        if not isinstance(observation, Mapping):
+            raise ValueError("Alpamayo 2 Super expert stage needs extra_args['robot_obs'].")
+        histories = []
+        for key, shape in (
+            ("ego_history_xyz", (self.history_steps, 3)),
+            ("ego_history_rot", (self.history_steps, 3, 3)),
+        ):
+            try:
+                history = torch.as_tensor(observation[key], dtype=torch.float32)
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise ValueError(f"robot_obs[{key!r}] is missing or not numeric.") from exc
+            # Leading batch dims of size 1 are dropped.
+            while history.dim() > len(shape) and history.shape[0] == 1:
+                history = history[0]
+            if tuple(history.shape) != shape:
+                raise ValueError(f"robot_obs[{key!r}] must have shape {shape}, got {tuple(history.shape)}.")
+            if not torch.isfinite(history).all():
+                raise ValueError(f"robot_obs[{key!r}] has non-finite values.")
+            histories.append(history.to(self.device))
+        return histories[0], histories[1]
