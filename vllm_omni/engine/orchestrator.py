@@ -3566,6 +3566,16 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
 
+        # An LLM stage returns its n samples as one output; later stages cannot take one input per sample.
+        if final_stage_id != stage_id and (getattr(sampling_params_list[stage_id], "n", 1) or 1) > 1:
+            await self._fail_request_client_error(
+                request_id,
+                stage_id,
+                f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
+                f"to stage {final_stage_id}",
+            )
+            return
+
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
             "prompt_type=%s original_prompt_type=%s final_stage=%s "

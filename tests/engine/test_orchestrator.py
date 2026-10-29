@@ -3453,3 +3453,128 @@ async def test_publish_stage_post_warmup_memory_records_initialized_replica():
         StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=13),
         engine_idx=4,
     )
+
+
+def _parallel_sample_request(n: int) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id="req",
+        external_req_id="req",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(n=n, seed=7, max_tokens=4),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n", [1, 3])
+async def test_stage_pool_fans_out_parallel_samples(n: int) -> None:
+    client = FakeStageClient()
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, client, output_processor=processor)
+    request = _parallel_sample_request(n)
+    state = OrchestratorRequestState(request_id="req", sampling_params_list=[request.sampling_params], final_stage_id=0)
+
+    assert await pool.submit_initial("req", state, request) == 0
+
+    sent = [args[0] for args in client.add_request_calls]
+    registered = [kwargs for _args, kwargs in processor.add_request_calls]
+    if n == 1:
+        assert sent == [request]
+        assert registered[0]["parent_req"] is None
+        return
+    assert [child.request_id for child in sent] == ["0_req", "1_req", "2_req"]
+    assert [child.external_req_id for child in sent] == ["req"] * n
+    assert [child.sampling_params.n for child in sent] == [1] * n
+    assert [child.sampling_params.seed for child in sent] == [7, 8, 9]
+    assert [kwargs["request"] for kwargs in registered] == sent
+    assert [kwargs["request_index"] for kwargs in registered] == [0, 1, 2]
+    parent = registered[0]["parent_req"]
+    assert parent.request_id == "req" and all(kwargs["parent_req"] is parent for kwargs in registered)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_aborts_parent_when_a_sample_fails_to_submit(mocker) -> None:
+    class FailingSecondSendClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            if self.add_request_calls:
+                raise RuntimeError("engine rejected sample")
+            await super().add_request_async(*args, **kwargs)
+
+    class RollbackOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.removed: list[str] = []
+
+        def remove_request(self, request_id: str) -> None:
+            self.removed.append(request_id)
+
+    client = FailingSecondSendClient()
+    processor = RollbackOutputProcessor()
+    pool = StagePool(0, client, output_processor=processor)
+    abort = mocker.patch.object(pool, "abort_requests", new_callable=mocker.AsyncMock)
+    request = _parallel_sample_request(3)
+    state = OrchestratorRequestState(request_id="req", sampling_params_list=[request.sampling_params], final_stage_id=0)
+
+    with pytest.raises(RuntimeError, match="engine rejected sample"):
+        await pool.submit_initial("req", state, request)
+
+    # Every sample was registered before sending, so aborting the parent reaches the one already sent.
+    assert [args[0].request_id for args in client.add_request_calls] == ["0_req"]
+    abort.assert_awaited_once_with(["req"])
+    assert processor.removed == ["0_req", "1_req", "2_req"]
+    assert pool.get_bound_replica_id("req") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("n", "stages", "final_stage_id", "accepted"),
+    [
+        (2, ["llm"], 0, True),
+        (2, ["llm", "llm"], 0, True),
+        (1, ["llm", "llm"], 1, True),
+        (2, ["llm", "llm"], 1, False),
+        (2, ["llm", "diffusion"], 1, False),
+    ],
+)
+async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
+    mocker, n: int, stages: list[str], final_stage_id: int, accepted: bool
+) -> None:
+    pools = [StagePool(index, FakeStageClient(stage_type=kind)) for index, kind in enumerate(stages)]
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+    dispatch = mocker.patch.object(pools[0], "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=SimpleNamespace(sampling_params=SamplingParams(n=n)),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[SamplingParams(n=n), *(SamplingParams() for _ in stages[1:])],
+            final_stage_id=final_stage_id,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+
+    if accepted:
+        fail.assert_not_awaited()
+        dispatch.assert_awaited_once()
+    else:
+        dispatch.assert_not_awaited()
+        fail.assert_awaited_once()
+        assert fail.await_args.args[:2] == ("req", 0)
+        assert "n > 1 is supported only" in fail.await_args.args[2]
+        assert "req" not in orchestrator.request_states
