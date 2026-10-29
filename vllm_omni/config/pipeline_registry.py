@@ -34,8 +34,8 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
-from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
+from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
