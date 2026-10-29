@@ -477,10 +477,10 @@ _NO_CACHE_ACCELERATION = {
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
+    "Pi05Pipeline",
     # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
     # transferred KV prefix, with no DiT block list.
     "Alpamayo2SuperPipeline",
-    "Pi05Pipeline",
     # SAM3 is a single forward pass with no denoising steps to cache.
     "Sam3Model",
     "Sam3VideoModel",
