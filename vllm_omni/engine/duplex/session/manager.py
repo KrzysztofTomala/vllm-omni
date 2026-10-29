@@ -59,6 +59,7 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfi
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
+from vllm_omni.inputs.data import disable_watermarking
 
 if TYPE_CHECKING:
     import janus
@@ -281,10 +282,9 @@ class DuplexSessionManager:
 
         Backpressure contract shared with the runner: a ``Commit`` that passes
         admission holds one pending-turn reservation and an ``AppendAudio``
-        holds its wire-size byte reservation until the runner dequeues the
-        command (the runner then re-reserves the decoded size around its PCM
-        reservation), so the mailbox never holds more bytes than the session
-        limit even while the worker is busy.
+        holds its admitted byte reservation through decoding and VAD. The
+        runner then replaces it with the decoded PCM reservation without an
+        intervening await, keeping pending audio charged while it is busy.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -323,7 +323,7 @@ class DuplexSessionManager:
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
             pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
-            if not session.reserve_input_bytes(pending_bytes, limit=limit):
+            if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,
                     [
@@ -494,6 +494,8 @@ class DuplexSessionManager:
             raise TypeError("duplex plugin must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex plugin must return one sampling parameter per stage")
+        if not session.config.watermarking:
+            configured = tuple(disable_watermarking(configured))
         return configured
 
     @staticmethod

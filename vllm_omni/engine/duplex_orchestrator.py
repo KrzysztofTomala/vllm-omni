@@ -32,6 +32,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageRequestContext,
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
+    duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
@@ -210,6 +211,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
+        # A codec segment stop is not the utterance. Leave RequestOutput.finished
+        # for the real stop (is_segment_finished is false on that poll).
+        if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
+            output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,
@@ -271,9 +276,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request
+        close_session = (
+            not duplex_is_auxiliary_request(req_id)
+            and self.plugin.capabilities(
+                max_sessions=self.duplex_session_config.max_sessions
+            ).supports_core_resumable_request
+        )
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
             runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
