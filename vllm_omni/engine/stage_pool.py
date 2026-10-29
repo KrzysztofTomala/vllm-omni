@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -15,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
@@ -1134,20 +1136,41 @@ class StagePool:
         if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         self.maybe_update_watermarking_state(request_id, params)
+        # SamplingParams.n > 1 fans out into child requests, as in vLLM's AsyncLLM.
+        # Children keep the parent's external id, so aborting request_id reaches all.
+        engine_requests = [request]
+        parent_request = None
+        if (getattr(params, "n", 1) or 1) > 1:
+            parent_request = ParentRequest(request)
+            engine_requests = []
+            for index in range(params.n):
+                child_request_id, child_params = parent_request.get_child_info(index)
+                child_request = copy(request)
+                child_request.request_id = child_request_id
+                child_request.sampling_params = child_params
+                engine_requests.append(child_request)
+        added: list[str] = []
         try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
+            for index, engine_request in enumerate(engine_requests):
+                self.output_processor.add_request(
+                    request=engine_request,
+                    prompt=prompt_text,
+                    parent_req=parent_request,
+                    request_index=index,
+                    queue=None,
+                )
+                added.append(engine_request.request_id)
         except Exception:
             self.release_binding(request_id)
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                for added_request_id in added:
+                    rollback(added_request_id)
             raise
 
         try:
-            await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+            for engine_request in engine_requests:
+                await self._llm_client(replica_id).add_request_async(engine_request, **submit_kwargs)
         except BaseException:
             # Sending can fail or be cancelled after the engine accepted the
             # request. Abort while its replica binding is still available.
@@ -1166,15 +1189,16 @@ class StagePool:
                 self.release_binding(request_id)
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
-                    try:
-                        rollback(request_id)
-                    except Exception as rollback_error:
-                        logger.warning(
-                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                            request_id,
-                            self.stage_id,
-                            rollback_error,
-                        )
+                    for added_request_id in added:
+                        try:
+                            rollback(added_request_id)
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                                added_request_id,
+                                self.stage_id,
+                                rollback_error,
+                            )
             raise
         return replica_id
 

@@ -1655,6 +1655,11 @@ class OmniKVTransferManager:
         Returns:
             True if primary KV cache was received successfully.
         """
+        sampling_params = getattr(req, "sampling_params", None)
+        num_samples = int(getattr(sampling_params, "num_outputs_per_prompt", 1) or 1)
+        if num_samples > 1 and getattr(sampling_params, "cfg_kv_request_ids", None) is None:
+            return self._receive_sample_kv_caches(req, num_samples, target_device)
+
         primary_ok = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
@@ -1675,6 +1680,34 @@ class OmniKVTransferManager:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
         return primary_ok
+
+    def _receive_sample_kv_caches(self, req: Any, num_samples: int, target_device: torch.device | None) -> bool:
+        """Receive the KV of each sample of an n > 1 source request.
+
+        Sample ``i`` transferred its KV as vLLM's child request ``f"{i}_{request_id}"``.
+        ``past_key_values`` and ``kv_metadata`` become lists in sample order.
+        """
+        from types import SimpleNamespace
+
+        kv_sender_info = getattr(req, "kv_sender_info", None)
+        if kv_sender_info:
+            self.update_sender_info(kv_sender_info, sender_stage_id=self.recv_stages[0])
+        request_id = self._resolve_request_id(req)
+        caches: list[Any] = []
+        metadata: list[Any] = []
+        for index in range(num_samples):
+            data, _ = self.receive_kv_cache_for_request(f"{index}_{request_id}", target_device)
+            if not data or "layer_blocks" not in data:
+                logger.error("Missing KV cache for sample %d of request %s", index, request_id)
+                return False
+            caches.append(SimpleNamespace(**data["layer_blocks"]))
+            metadata.append(data.get("metadata"))
+        req.past_key_values = caches
+        req.kv_metadata = metadata
+        if getattr(req, "sampling_params", None) is not None:
+            req.sampling_params.past_key_values = caches
+            req.sampling_params.kv_metadata = metadata
+        return True
 
     def _extract_primary_kv_obj(self, kv_payload: dict[str, Any]) -> Any | None:
         """Return the primary KV object (``SimpleNamespace(key_cache, value_cache)``)."""

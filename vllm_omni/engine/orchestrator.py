@@ -2067,6 +2067,24 @@ class OrchestratorBase:
                 ]
             )
 
+    @staticmethod
+    def _diffusion_params_for_samples(source_params: Any, params: Any) -> Any:
+        """Match ``num_outputs_per_prompt`` to the samples of an n > 1 source stage.
+
+        Each sample transferred its own KV; the diffusion stage receives all of
+        them for this request and produces one output per sample.
+        """
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        num_samples = int(getattr(source_params, "n", 1) or 1)
+        if num_samples <= 1 or not isinstance(params, OmniDiffusionSamplingParams):
+            return params
+        import copy
+
+        params = copy.deepcopy(params)
+        params.num_outputs_per_prompt = num_samples
+        return params
+
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
         companion_request_ids = self._cfg_tracker.get_companion_request_ids(request_id)
@@ -2883,7 +2901,10 @@ class OrchestratorBase:
                     req_state,
                     diffusion_prompt,
                     submit_kwargs=submit_kwargs,
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    params_override=self._diffusion_params_for_samples(
+                        req_state.sampling_params_list[src_stage_id],
+                        self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    ),
                     **route_kwargs,
                 )
             self._on_stage_submitted(
@@ -3533,6 +3554,27 @@ class Orchestrator(OrchestratorBase):
                 return stage_id
         return None
 
+    def _unsupported_parallel_samples_reason(self, entry_stage_id: int, final_stage_id: int) -> str | None:
+        """Why ``n > 1`` cannot run from ``entry_stage_id`` to ``final_stage_id``, or None if it can.
+
+        An LLM stage serves its samples as one output. Later stages see them only
+        when an AR stage sends each sample's KV cache to a diffusion stage.
+        """
+        if final_stage_id == entry_stage_id:
+            return None
+        source = self.stage_pools[entry_stage_id]
+        target = self.stage_pools[entry_stage_id + 1]
+        vllm_config = getattr(source, "stage_vllm_config", None)
+        omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
+        sends_kv = isinstance(omni_kv_config, dict) and bool(omni_kv_config.get("need_send_cache", False))
+        native_kv = getattr(getattr(vllm_config, "kv_transfer_config", None), "kv_role", None) == "kv_producer"
+        if final_stage_id == entry_stage_id + 1 and target.stage_type == "diffusion" and sends_kv and not native_kv:
+            return None
+        return (
+            f"n > 1 is not supported by this pipeline: stage {entry_stage_id + 1} cannot receive one input "
+            f"per sample from stage {entry_stage_id}; use n=1, or request stage {entry_stage_id} output only"
+        )
+
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = msg.entry_stage_id
@@ -3564,6 +3606,12 @@ class Orchestrator(OrchestratorBase):
                     "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
                     "for that stage",
                 )
+                return
+
+        if stage_id < len(sampling_params_list) and (getattr(sampling_params_list[stage_id], "n", 1) or 1) > 1:
+            reason = self._unsupported_parallel_samples_reason(stage_id, final_stage_id)
+            if reason is not None:
+                await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 
         logger.debug(
