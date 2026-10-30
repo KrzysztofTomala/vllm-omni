@@ -538,6 +538,12 @@ class StagePool:
         self._request_bindings[request_id] = replica_id
         return replica_id
 
+    def parallel_sample_parent_id(self, request_id: str) -> str | None:
+        """The id of the n > 1 request whose sample (child request) is ``request_id``, else None."""
+        request_states = getattr(self._output_processor, "request_states", None) or {}
+        parent = getattr(request_states.get(request_id), "parent_req", None)
+        return None if parent is None else parent.external_req_id
+
     def get_bound_replica_id(self, request_id: str) -> int | None:
         """Return the currently bound replica id for *request_id* if present.
 
@@ -1071,10 +1077,13 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
+    def watermarks(self, params: OmniSamplingParams | PoolingParams) -> bool:
+        """Whether this stage watermarks the outputs of a request with these params."""
+        return bool(self._watermarkers) and not isinstance(params, PoolingParams) and params.watermarking is not False
+
     def maybe_update_watermarking_state(self, request_id: str, params: OmniSamplingParams | PoolingParams) -> None:
-        should_watermark = not isinstance(params, PoolingParams) and params.watermarking is not False
         if self._watermarkers:
-            self._request_watermarking[request_id] = should_watermark
+            self._request_watermarking[request_id] = self.watermarks(params)
 
     # ---- Stage-local admission ----
 
