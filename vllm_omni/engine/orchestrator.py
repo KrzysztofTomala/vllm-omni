@@ -3589,7 +3589,7 @@ class Orchestrator(OrchestratorBase):
                     f"to stage {final_stage_id}"
                 )
             # Output watermarking tracks the request, not its samples.
-            elif self.stage_pools[stage_id].watermarks(entry_params):
+            elif self.stage_pools[stage_id].will_watermark(entry_params):
                 reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
             if reason is not None:
                 await self._fail_request_client_error(request_id, stage_id, reason)

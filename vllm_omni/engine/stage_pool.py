@@ -1077,13 +1077,13 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
-    def watermarks(self, params: OmniSamplingParams | PoolingParams) -> bool:
+    def will_watermark(self, params: OmniSamplingParams | PoolingParams) -> bool:
         """Whether this stage watermarks the outputs of a request with these params."""
         return bool(self._watermarkers) and not isinstance(params, PoolingParams) and params.watermarking is not False
 
     def maybe_update_watermarking_state(self, request_id: str, params: OmniSamplingParams | PoolingParams) -> None:
         if self._watermarkers:
-            self._request_watermarking[request_id] = self.watermarks(params)
+            self._request_watermarking[request_id] = self.will_watermark(params)
 
     # ---- Stage-local admission ----
 
