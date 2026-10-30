@@ -3588,6 +3588,9 @@ class Orchestrator(OrchestratorBase):
                     f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
                     f"to stage {final_stage_id}"
                 )
+            # Streaming-input errors take the segment path, which does not resolve samples to their request.
+            elif getattr(prompt, "resumable", False):
+                reason = "n > 1 is not supported for streaming (resumable) input"
             # Output watermarking tracks the request, not its samples.
             elif self.stage_pools[stage_id].will_watermark(entry_params):
                 reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"

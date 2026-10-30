@@ -3579,17 +3579,19 @@ async def test_failed_parallel_sample_fails_its_parent_once(cache_miss: bool) ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("n", "stages", "final_stage_id", "accepted"),
+    ("n", "stages", "final_stage_id", "resumable", "accepted"),
     [
-        (2, ["llm"], 0, True),
-        (2, ["llm", "llm"], 0, True),
-        (1, ["llm", "llm"], 1, True),
-        (2, ["llm", "llm"], 1, False),
-        (2, ["llm", "diffusion"], 1, False),
+        (2, ["llm"], 0, False, True),
+        (2, ["llm", "llm"], 0, False, True),
+        (1, ["llm", "llm"], 1, False, True),
+        (2, ["llm", "llm"], 1, False, False),
+        (2, ["llm", "diffusion"], 1, False, False),
+        (1, ["llm"], 0, True, True),
+        (2, ["llm"], 0, True, False),
     ],
 )
 async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
-    mocker, n: int, stages: list[str], final_stage_id: int, accepted: bool
+    mocker, n: int, stages: list[str], final_stage_id: int, resumable: bool, accepted: bool
 ) -> None:
     pools = [StagePool(index, FakeStageClient(stage_type=kind)) for index, kind in enumerate(stages)]
     orchestrator = Orchestrator(
@@ -3605,7 +3607,7 @@ async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
         StageSubmissionMessage(
             type="add_request",
             request_id="req",
-            prompt=SimpleNamespace(sampling_params=SamplingParams(n=n)),
+            prompt=SimpleNamespace(sampling_params=SamplingParams(n=n), resumable=resumable),
             original_prompt={},
             output_prompt_text=None,
             sampling_params_list=[SamplingParams(n=n), *(SamplingParams() for _ in stages[1:])],
@@ -3623,7 +3625,8 @@ async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
         dispatch.assert_not_awaited()
         fail.assert_awaited_once()
         assert fail.await_args.args[:2] == ("req", 0)
-        assert "n > 1 is supported only" in fail.await_args.args[2]
+        expected = "not supported for streaming (resumable) input" if resumable else "n > 1 is supported only"
+        assert expected in fail.await_args.args[2]
         assert "req" not in orchestrator.request_states
 
 
