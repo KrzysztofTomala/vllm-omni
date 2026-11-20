@@ -370,6 +370,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "guidance_scale": None,
         "guidance_scale_provided": False,
         "generator": None,
+        "latents": None,
         "seed": 123,
         "num_outputs_per_prompt": 1,
         "frame_rate": None,
@@ -1373,6 +1374,72 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
 
     torch.testing.assert_close(first, second)
     assert not torch.equal(first, different_seed)
+
+
+def _run_request_latents_video(pipeline, *, seed: int = 123, latents: torch.Tensor | None = None, **prompt_fields):
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0,
+        use_dynamic_shifting=False,
+        prediction_type="flow_prediction",
+    )
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    request = make_request_batch(
+        {"prompt": "A test video.", "modalities": ["video"], **prompt_fields},
+        make_sampling_params(
+            seed=seed,
+            latents=latents,
+            guidance_scale=1.0,
+            guidance_scale_provided=True,
+            num_inference_steps=4,
+            num_frames=5,
+            height=16,
+            width=16,
+            extra_args={"flow_shift": 3.0},
+        ),
+    )
+    return pipeline.forward(request).media.video.tensor
+
+
+def test_request_latents_replace_the_random_draw(make_cosmos3_pipeline) -> None:
+    """``sampling_params.latents`` is the initial noise: the seed stops mattering."""
+    from diffusers.utils.torch_utils import randn_tensor
+
+    pipeline = make_cosmos3_pipeline()
+    shape = (1, 2, 2, 2, 2)  # [1, C, (5 - 1) // 4 + 1, 16 // 8, 16 // 8]
+    noise = randn_tensor(shape, generator=torch.Generator().manual_seed(123), dtype=torch.float32)
+    supplied = noise.clone()
+
+    seeded = _run_request_latents_video(pipeline, seed=123)
+    from_latents = _run_request_latents_video(pipeline, seed=456, latents=supplied)
+    without_batch_dim = _run_request_latents_video(pipeline, seed=789, latents=supplied[0])
+    other_noise = _run_request_latents_video(pipeline, seed=123, latents=torch.zeros(shape))
+
+    # Supplying the noise the seed would have drawn reproduces the seeded run.
+    torch.testing.assert_close(from_latents, seeded)
+    torch.testing.assert_close(without_batch_dim, seeded)
+    assert not torch.equal(other_noise, seeded)
+    # The caller's tensor is not modified.
+    torch.testing.assert_close(supplied, noise)
+
+
+def test_request_latents_reject_wrong_shape(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    with pytest.raises(ValueError, match="latents shape mismatch"):
+        _run_request_latents_video(pipeline, latents=torch.zeros(1, 2, 3, 2, 2))
+
+
+def test_request_latents_reject_modes_with_extra_noise_draws(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._is_sound_request = lambda *args, **kwargs: True
+    pipeline.transformer.sound_gen = True
+
+    with pytest.raises(ValueError, match="does not support sampling_params.latents for sound generation"):
+        _run_request_latents_video(pipeline, latents=torch.zeros(1, 2, 2, 2, 2))
 
 
 def test_distilled_set_timesteps_uses_fixed_sigma_schedule(make_cosmos3_pipeline) -> None:
@@ -3601,7 +3668,8 @@ class TestForwardRouting:
             }
             return _ids(2), _mask(), _ids(1), _mask()
 
-        def fake_prepare(height, width, num_frames, generator):
+        def fake_prepare(height, width, num_frames, generator, latents=None):
+            assert latents is None
             captured["prepare_calls"].append((height, width, num_frames, generator.initial_seed()))
             return torch.zeros(1, 2, 1, 1, 1)
 
@@ -3682,9 +3750,9 @@ class TestForwardRouting:
         events: list[Any] = []
         real_prepare = type(pipeline)._prepare_latents.__get__(pipeline)
 
-        def prepare(height, width, num_frames, generator):
+        def prepare(height, width, num_frames, generator, latents=None):
             events.append("prepare")
-            return real_prepare(height, width, num_frames, generator)
+            return real_prepare(height, width, num_frames, generator, latents=latents)
 
         def diffuse(**kwargs):
             latents = kwargs["latents"]

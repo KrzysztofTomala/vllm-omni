@@ -2507,12 +2507,47 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Latent preparation --------------------------------------------------
 
+    def _initial_video_noise(
+        self,
+        shape: tuple[int, ...],
+        generator: torch.Generator,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the initial video noise, drawn from ``generator`` or supplied by the request.
+
+        ``latents`` is ``sampling_params.latents``: caller-supplied initial noise
+        in the normalized latent space, shaped ``[1, C, T_lat, H_lat, W_lat]``
+        (the batch dimension may be omitted). It replaces the random draw only;
+        conditioning frames are still written over it by the caller. This makes
+        a request reproducible across implementations whose random number
+        generators differ, which a shared seed cannot do.
+        """
+        if latents is None:
+            return randn_tensor(shape, generator=generator, device=self.device, dtype=self.sampling_dtype)
+        if not isinstance(latents, torch.Tensor):
+            raise ValueError(f"Cosmos3 sampling_params.latents must be a torch.Tensor, got {type(latents).__name__}.")
+        if latents.ndim == len(shape) - 1:
+            latents = latents.unsqueeze(0)
+        if tuple(latents.shape) != tuple(shape):
+            raise ValueError(
+                "Cosmos3 sampling_params.latents shape mismatch: "
+                f"got {tuple(latents.shape)}, expected {tuple(shape)} for this request."
+            )
+        # Copy: latent preparation writes conditioning frames in place.
+        return latents.to(device=self.device, dtype=self.sampling_dtype, copy=True)
+
+    @staticmethod
+    def _reject_request_latents(sp: OmniDiffusionSamplingParams, what: str) -> None:
+        if sp.latents is not None:
+            raise ValueError(f"Cosmos3 does not support sampling_params.latents for {what}.")
+
     def _prepare_latents(
         self,
         height: int,
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_channels_latents = self.transformer.latent_channel_size
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
@@ -2523,7 +2558,7 @@ class Cosmos3OmniDiffusersPipeline(
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
-        return randn_tensor(shape, generator=generator, device=self.device, dtype=self.sampling_dtype)
+        return self._initial_video_noise(shape, generator, latents)
 
     def _prepare_sound_latents(
         self,
@@ -2840,6 +2875,7 @@ class Cosmos3OmniDiffusersPipeline(
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare initial latents with frame 0 conditioned on the input image.
 
@@ -2853,12 +2889,7 @@ class Cosmos3OmniDiffusersPipeline(
         H_lat = height // self.vae_scale_factor_spatial
         W_lat = width // self.vae_scale_factor_spatial
 
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_video_noise((1, C, T_lat, H_lat, W_lat), generator, latents)
 
         image_latent = self._encode_conditioning_image_latent(image_tensor)
         latents = noise
@@ -2876,6 +2907,7 @@ class Cosmos3OmniDiffusersPipeline(
         num_frames: int,
         generator: torch.Generator,
         condition_frame_indexes_vision: Iterable[int] | int | str | None = None,
+        latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare V2V latents with explicit clean conditioned latent frames."""
         del height, width
@@ -2898,12 +2930,7 @@ class Cosmos3OmniDiffusersPipeline(
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
 
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.sampling_dtype,
-        )
+        noise = self._initial_video_noise((1, C, T_lat, H_lat, W_lat), generator, latents)
         condition_pixel_frames = condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :condition_pixel_frames]
         if condition_video.shape[2] < condition_pixel_frames:
@@ -4206,6 +4233,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
+            self._reject_request_latents(sp, "action policy requests")
             return self._forward_robolab_policy(
                 sp,
                 robolab_inputs,
@@ -4284,6 +4312,7 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 transfer inference accepts video inputs or control_path values, not images.")
             if transfer_video_tensor is None and video_tensor is not None:
                 transfer_video_tensor = video_tensor
+            self._reject_request_latents(sp, "transfer requests")
             return self._forward_transfer(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -4418,6 +4447,18 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        # Caller-supplied initial noise covers the single video-latent draw of
+        # T2I / T2V / I2V / V2V. Modes that draw more noise (action, sound,
+        # several images per prompt) are rejected rather than silently mixing
+        # supplied and random noise.
+        request_latents = sp.latents
+        if action_enabled:
+            self._reject_request_latents(sp, "action generation")
+        if sound_enabled:
+            self._reject_request_latents(sp, "sound generation")
+        if is_t2i and batch_size > 1:
+            self._reject_request_latents(sp, "num_outputs_per_prompt > 1")
+
         # --- Format prompts & tokenize (B=1; shared by every T2I output when
         # num_outputs_per_prompt > 1) ---
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
@@ -4508,6 +4549,7 @@ class Cosmos3OmniDiffusersPipeline(
                 num_frames,
                 generator,
                 condition_frame_indexes_vision,
+                latents=request_latents,
             )
             image_latent = None
         elif image_tensor is not None and not is_t2i:
@@ -4517,10 +4559,11 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
+                latents=request_latents,
             )
             condition_latents = None
         else:
-            latents = self._prepare_latents(height, width, num_frames, generator)
+            latents = self._prepare_latents(height, width, num_frames, generator, latents=request_latents)
             velocity_mask = None
             image_latent = None
             condition_latents = None
